@@ -914,6 +914,7 @@
 
       const agentSelect = $('#agentSelectInput');
       const modelInput = $('#modelConfigInput');
+      const effortSelect = $('#effortSelectInput');
       const agentBadge = $('#agentSourceBadge');
       try {
         const aRes = await fetch('/api/github/agent-config');
@@ -921,8 +922,9 @@
         if (aRes.ok && aData.ok) {
           if (agentSelect && aData.agent) agentSelect.value = aData.agent;
           if (modelInput) modelInput.value = aData.model || '';
+          if (effortSelect) effortSelect.value = aData.effort || '';
           if (agentBadge) {
-            agentBadge.textContent = `agent: ${aData.source || 'auto'} · model: ${aData.model || 'default'}`;
+            agentBadge.textContent = `agent: ${aData.agent || 'auto'} · model: ${aData.model || 'default'} · effort: ${aData.effort || 'default'}`;
           }
         }
       } catch (e) {}
@@ -999,21 +1001,26 @@
     $('#saveAgentConfigBtn')?.addEventListener('click', async () => {
       const agentVal = ($('#agentSelectInput')?.value || '').trim();
       const modelVal = ($('#modelConfigInput')?.value || '').trim();
+      const effortVal = ($('#effortSelectInput')?.value || '').trim();
       const statusEl = $('#loadPrStatus');
       const agentBadge = $('#agentSourceBadge');
       try {
         const res = await fetch('/api/github/agent-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent: agentVal, model: modelVal || 'default' })
+          body: JSON.stringify({
+            agent: agentVal,
+            model: modelVal || 'default',
+            effort: effortVal || 'default'
+          })
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save agent & model config');
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save agent, model & effort config');
         if (agentBadge) {
-          agentBadge.textContent = `agent: ${data.agent} · model: ${data.model || 'default'}`;
+          agentBadge.textContent = `agent: ${data.agent} · model: ${data.model || 'default'} · effort: ${data.effort || 'default'}`;
         }
         if (statusEl) {
-          statusEl.textContent = `✓ Saved default agent "${data.agent}" and model "${data.model || 'harness default'}" to ${data.saved?.configPath || '.crvrc.json'}`;
+          statusEl.textContent = `✓ Saved default agent "${data.agent}", model "${data.model || 'default'}", effort "${data.effort || 'default'}" to ${data.saved?.configPath || '.crvrc.json'}`;
         }
       } catch (err) {
         if (statusEl) statusEl.textContent = `⚠ ${err.message}`;

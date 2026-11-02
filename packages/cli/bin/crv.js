@@ -31,8 +31,9 @@ USAGE:
   crv review [findings.json | report.html] [options]    Open Workbench on a saved findings.json or HTML report
   crv export-html [findings.json] --out <file.html>     Compile a standalone 4-Layer HTML review artifact
   crv repo [owner/repo] [--global]                      Inspect or set the default GitHub repository
-  crv agent [agy|claude|gemini|codex] [-m <model>] [-g] Inspect or set the default AI agent harness & model
+  crv agent [agy|claude|gemini|codex] [-m <model>] [-g] Inspect or set the default AI agent harness, model & effort
   crv model [model-name | default] [--global]           Inspect or set the default model (e.g. claude-opus-4-6)
+  crv effort [low|medium|high|xhigh|max|default] [-g]   Inspect or set the default reasoning effort
   crv install-skill [--global | --dir <path>]           Install the 13-lens crv-code-review AI skill
   crv demo [options]                                    Launch Workbench with bundled demo fixture
 
@@ -259,21 +260,23 @@ function main() {
     return;
   }
 
-  if (cmd === 'agent' || cmd === 'model') {
+  if (cmd === 'agent' || cmd === 'model' || cmd === 'effort') {
     const isModelCmd = cmd === 'model';
-    const targetAgent = isModelCmd ? flags.agent : flags.reportPath || flags.agent;
+    const isEffortCmd = cmd === 'effort';
+    const targetAgent = isModelCmd || isEffortCmd ? flags.agent : flags.reportPath || flags.agent;
     const targetModel = isModelCmd ? flags.reportPath || flags.model : flags.model;
+    const targetEffort = isEffortCmd ? flags.reportPath || flags.effort : flags.effort;
 
-    if (targetAgent || targetModel !== null || flags.effort !== null) {
+    if (targetAgent || targetModel !== null || targetEffort !== null) {
       const saved = saveDefaultAgentConfig(targetAgent, {
         global: flags.global,
         model: targetModel,
-        effort: flags.effort
+        effort: targetEffort
       });
       console.log(`✓ Saved AI configuration to ${saved.configPath}:`);
-      if (saved.agent) console.log(`  Agent harness: ${saved.agent} (${saved.name})`);
-      console.log(`  Default model: ${saved.model || '(harness default)'}`);
-      if (saved.effort) console.log(`  Default effort: ${saved.effort}`);
+      if (saved.agent) console.log(`  Agent harness:  ${saved.agent} (${saved.name})`);
+      console.log(`  Default model:  ${saved.model || '(harness default)'}`);
+      console.log(`  Default effort: ${saved.effort || '(harness default)'}`);
       return;
     }
 
@@ -290,9 +293,9 @@ function main() {
     console.log(
       `Active AI Model:     ${resolved.model || '(harness default)'} (source: ${resolved.modelSource})`
     );
-    if (resolved.effort) {
-      console.log(`Reasoning Effort:    ${resolved.effort} (source: ${resolved.effortSource})`);
-    }
+    console.log(
+      `Reasoning Effort:    ${resolved.effort || '(harness default)'} (source: ${resolved.effortSource})`
+    );
     if (resolved.available.length) {
       console.log(
         `Available Harnesses: ${resolved.available
