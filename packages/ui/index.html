@@ -137,6 +137,28 @@
         </div>
       </div>
 
+      <div style="margin-bottom:12px;padding:10px 12px;border-radius:6px;background:var(--surface);border:1px solid var(--rule);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+          <label for="agentSelectInput" style="font-weight:700;font-size:12px;">
+            Default AI Agent Harness &amp; Model:
+          </label>
+          <span id="agentSourceBadge" class="chip" style="font:500 10.5px var(--mono);">source: auto</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <select id="agentSelectInput" style="padding:6px 10px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--bg);color:var(--ink);font:600 12.5px var(--mono);">
+            <option value="agy">agy (Antigravity CLI)</option>
+            <option value="claude">claude (Claude Code CLI)</option>
+            <option value="gemini">gemini (Gemini CLI)</option>
+            <option value="codex">codex (Codex CLI)</option>
+          </select>
+          <input id="modelConfigInput" type="text" placeholder="Model (e.g. claude-opus-4-6, sonnet, gemini-2.5-pro, or blank for default)" style="flex:1;min-width:220px;padding:6px 10px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--bg);color:var(--ink);font:500 12.5px var(--mono);">
+          <button type="button" class="btn" id="saveAgentConfigBtn" title="Save default agent harness &amp; model to .crvrc.json">Save Agent &amp; Model</button>
+        </div>
+        <div style="margin-top:4px;font-size:11px;color:var(--muted);">
+          CLI equivalent: <code>crv agent agy -m claude-opus-4-6 --global</code> or per-run <code>crv pr 1230 --analyze --agent agy -m claude-opus-4-6</code>.
+        </div>
+      </div>
+
       <div style="margin-bottom:14px;">
         <label for="prSearchInput" style="display:block;font-weight:600;font-size:12px;margin-bottom:6px;">
           Load any GitHub PR (PR number in target repo, <code>owner/repo#number</code>, or full GitHub URL):

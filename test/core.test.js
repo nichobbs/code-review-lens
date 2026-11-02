@@ -20,7 +20,9 @@ const {
   compileFindingsToWorkbenchReport,
   parseGitHubRepoSlug,
   resolveRepoConfig,
-  saveDefaultRepoConfig
+  saveDefaultRepoConfig,
+  resolveAgentConfig,
+  saveDefaultAgentConfig
 } = require('../packages/core');
 
 const { loadReportFile, buildStandaloneHtml } = require('../packages/cli/server');
@@ -329,4 +331,43 @@ test('Generic repo-config resolution chain (CLI/UI -> env -> .env -> .crvrc.json
   const installedCore = path.join(skillDestRoot, 'crv-code-review', 'scripts', 'lib', 'core', 'index.js');
   assert.ok(fs.existsSync(installedPrep));
   assert.ok(fs.existsSync(installedCore));
+
+  // 8. Agent harness & model resolution chain + CLI argument construction
+  const savedAgent = saveDefaultAgentConfig('agy', {
+    cwd: tmpRepoDir,
+    model: 'claude-opus-4-6',
+    effort: 'high'
+  });
+  assert.equal(savedAgent.agent, 'agy');
+  assert.equal(savedAgent.model, 'claude-opus-4-6');
+  assert.equal(savedAgent.effort, 'high');
+
+  const resolvedFromFile = resolveAgentConfig({ cwd: tmpRepoDir, env: {} });
+  assert.equal(resolvedFromFile.agent, 'agy');
+  assert.equal(resolvedFromFile.model, 'claude-opus-4-6');
+  assert.equal(resolvedFromFile.effort, 'high');
+
+  const agyInteractiveArgs = resolvedFromFile.spec.buildInteractiveArgs('Prompt', '/skills', {
+    model: resolvedFromFile.model,
+    effort: resolvedFromFile.effort
+  });
+  assert.deepEqual(agyInteractiveArgs, [
+    '--add-dir',
+    '/skills',
+    '--model',
+    'claude-opus-4-6',
+    '--effort',
+    'high',
+    '-i',
+    'Prompt'
+  ]);
+
+  const resolvedOverride = resolveAgentConfig({
+    cwd: tmpRepoDir,
+    explicitAgent: 'claude',
+    explicitModel: 'sonnet',
+    env: { CRV_MODEL: 'opus' }
+  });
+  assert.equal(resolvedOverride.agent, 'claude');
+  assert.equal(resolvedOverride.model, 'sonnet');
 });

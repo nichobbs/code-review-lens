@@ -27,17 +27,20 @@ crv v${pkg.version} — Human-in-the-loop Agentic PR Review Workbench (Code ReVi
 
 USAGE:
   crv pr <number | owner/repo#number | url> [options]   Fetch & decompose any live GitHub PR into 4 Layers
-  crv analyze <pr> [--agent agy|claude] [--headless]    Stage PR diff & invoke AI agent CLI (agy/claude) with crv-code-review
+  crv analyze <pr> [--agent agy|claude] [-m <model>]    Stage PR diff & invoke AI agent CLI with crv-code-review
   crv review [findings.json | report.html] [options]    Open Workbench on a saved findings.json or HTML report
   crv export-html [findings.json] --out <file.html>     Compile a standalone 4-Layer HTML review artifact
   crv repo [owner/repo] [--global]                      Inspect or set the default GitHub repository
-  crv agent [agy|claude|gemini|codex] [--global]        Inspect or set the default AI agent CLI
+  crv agent [agy|claude|gemini|codex] [-m <model>] [-g] Inspect or set the default AI agent harness & model
+  crv model [model-name | default] [--global]           Inspect or set the default model (e.g. claude-opus-4-6)
   crv install-skill [--global | --dir <path>]           Install the 13-lens crv-code-review AI skill
   crv demo [options]                                    Launch Workbench with bundled demo fixture
 
 OPTIONS:
   --repo <owner/repo>     Override target GitHub repository for this command
-  --agent <name>          AI agent CLI to use for --analyze (agy, claude, gemini, codex)
+  --agent <name>          AI agent CLI harness to use (agy, claude, gemini, codex)
+  -m, --model <model>     Model to pass to the AI agent CLI (e.g. claude-opus-4-6, sonnet, gemini-2.5-pro)
+  --effort <level>        Reasoning effort for agy/claude (low, medium, high, xhigh, max)
   --analyze               Run the full 13-lens AI agent review before opening the Workbench
   --headless              Run the AI agent non-interactively (-p mode) when analyzing
   --diff <diff.patch>     Attach unified diff file to extract inline code slices & Layer 4 Test Matrix
@@ -46,7 +49,7 @@ OPTIONS:
   --publish               Enable live GitHub PR review publishing from the Workbench UI
   --port <number>         Preferred local server port (default: 4320; auto-increments if busy)
   --no-open               Do not automatically open the Workbench URL in your browser
-  -g, --global            Save repo/agent config to ~/.config/crv/config.json or install skill globally
+  -g, --global            Save repo/agent/model config to ~/.config/crv/config.json or install skill globally
   -v, --version           Print version
   -h, --help              Print this help message
 
@@ -72,6 +75,8 @@ function parseArgs(argv) {
     version: false,
     repo: null,
     agent: null,
+    model: null,
+    effort: null,
     skillDir: null,
     reportPath: null,
     diffPath: null,
@@ -93,6 +98,8 @@ function parseArgs(argv) {
     else if (a === '--port' && args[i + 1]) flags.port = Number(args[++i]);
     else if ((a === '--repo' || a === '-R') && args[i + 1]) flags.repo = args[++i];
     else if (a === '--agent' && args[i + 1]) flags.agent = args[++i];
+    else if ((a === '--model' || a === '-m') && args[i + 1]) flags.model = args[++i];
+    else if (a === '--effort' && args[i + 1]) flags.effort = args[++i];
     else if (a === '--dir' && args[i + 1]) flags.skillDir = args[++i];
     else if (a === '--report' && args[i + 1]) flags.reportPath = args[++i];
     else if (a === '--diff' && args[i + 1]) flags.diffPath = args[++i];
@@ -176,7 +183,11 @@ function listenWithFallback(server, startPort, maxAttempts = 10, onListening) {
 
 function runAgentAnalysisOnPr(targetPr, flags) {
   const resolvedRepo = resolveRepoConfig({ explicitRepo: flags.repo });
-  const agentCfg = resolveAgentConfig({ explicitAgent: flags.agent });
+  const agentCfg = resolveAgentConfig({
+    explicitAgent: flags.agent,
+    explicitModel: flags.model,
+    explicitEffort: flags.effort
+  });
 
   if (!agentCfg.spec) {
     throw new Error(
@@ -212,15 +223,20 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     pr: prNum,
     scratchDir,
     skillDir,
-    headless: flags.headless
+    headless: flags.headless,
+    agentName: agentCfg.spec.name,
+    modelName: agentCfg.model || undefined
   });
 
+  const modelOpts = { model: agentCfg.model, effort: agentCfg.effort };
   const agentArgs = flags.headless
-    ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir)
-    : agentCfg.spec.buildInteractiveArgs(prompt, skillDir);
+    ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir, modelOpts)
+    : agentCfg.spec.buildInteractiveArgs(prompt, skillDir, modelOpts);
 
+  const modelBadge = agentCfg.model ? `, model: ${agentCfg.model}` : '';
+  const effortBadge = agentCfg.effort ? `, effort: ${agentCfg.effort}` : '';
   console.log(
-    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}) to run 13-lens crv-code-review skill...\n`
+    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 13-lens crv-code-review skill...\n`
   );
   spawnSync(agentCfg.spec.bin, agentArgs, { stdio: 'inherit' });
 }
@@ -243,20 +259,46 @@ function main() {
     return;
   }
 
-  if (cmd === 'agent') {
-    if (flags.reportPath) {
-      const saved = saveDefaultAgentConfig(flags.reportPath, { global: flags.global });
-      console.log(`✓ Saved default AI agent "${saved.agent}" (${saved.name}) to ${saved.configPath}`);
+  if (cmd === 'agent' || cmd === 'model') {
+    const isModelCmd = cmd === 'model';
+    const targetAgent = isModelCmd ? flags.agent : flags.reportPath || flags.agent;
+    const targetModel = isModelCmd ? flags.reportPath || flags.model : flags.model;
+
+    if (targetAgent || targetModel !== null || flags.effort !== null) {
+      const saved = saveDefaultAgentConfig(targetAgent, {
+        global: flags.global,
+        model: targetModel,
+        effort: flags.effort
+      });
+      console.log(`✓ Saved AI configuration to ${saved.configPath}:`);
+      if (saved.agent) console.log(`  Agent harness: ${saved.agent} (${saved.name})`);
+      console.log(`  Default model: ${saved.model || '(harness default)'}`);
+      if (saved.effort) console.log(`  Default effort: ${saved.effort}`);
       return;
     }
-    const resolved = resolveAgentConfig({ explicitAgent: flags.agent });
+
+    const resolved = resolveAgentConfig({
+      explicitAgent: flags.agent,
+      explicitModel: flags.model,
+      explicitEffort: flags.effort
+    });
     console.log(
       resolved.agent
         ? `Active AI Agent CLI: ${resolved.agent} — ${resolved.spec.name} (source: ${resolved.source})`
         : 'No AI agent CLI detected on PATH.'
     );
+    console.log(
+      `Active AI Model:     ${resolved.model || '(harness default)'} (source: ${resolved.modelSource})`
+    );
+    if (resolved.effort) {
+      console.log(`Reasoning Effort:    ${resolved.effort} (source: ${resolved.effortSource})`);
+    }
     if (resolved.available.length) {
-      console.log(`Available on PATH:   ${resolved.available.map((a) => `${a.id} (${a.name})`).join(', ')}`);
+      console.log(
+        `Available Harnesses: ${resolved.available
+          .map((a) => `${a.id} [examples: ${(a.exampleModels || []).join(', ')}]`)
+          .join(' | ')}`
+      );
     }
     return;
   }

@@ -904,13 +904,28 @@
           if (repoInput && !repoInput.value) repoInput.value = data.repo || report?.REVIEW?.repo || '';
           if (sourceBadge) sourceBadge.textContent = `source: ${data.source || 'none'}`;
           if (repoLabel) repoLabel.textContent = (repoInput && repoInput.value) || data.repo || 'default repo';
-          return;
+        }
+      } catch (e) {
+        const fallbackRepo = report?.REVIEW?.repo || '';
+        if (repoInput && !repoInput.value) repoInput.value = fallbackRepo;
+        if (sourceBadge) sourceBadge.textContent = fallbackRepo ? 'source: active report' : 'source: unset';
+        if (repoLabel) repoLabel.textContent = fallbackRepo || 'target repo';
+      }
+
+      const agentSelect = $('#agentSelectInput');
+      const modelInput = $('#modelConfigInput');
+      const agentBadge = $('#agentSourceBadge');
+      try {
+        const aRes = await fetch('/api/github/agent-config');
+        const aData = await aRes.json();
+        if (aRes.ok && aData.ok) {
+          if (agentSelect && aData.agent) agentSelect.value = aData.agent;
+          if (modelInput) modelInput.value = aData.model || '';
+          if (agentBadge) {
+            agentBadge.textContent = `agent: ${aData.source || 'auto'} · model: ${aData.model || 'default'}`;
+          }
         }
       } catch (e) {}
-      const fallbackRepo = report?.REVIEW?.repo || '';
-      if (repoInput && !repoInput.value) repoInput.value = fallbackRepo;
-      if (sourceBadge) sourceBadge.textContent = fallbackRepo ? 'source: active report' : 'source: unset';
-      if (repoLabel) repoLabel.textContent = fallbackRepo || 'target repo';
     }
 
     async function populateRecentPrs(explicitRepoOverride) {
@@ -976,6 +991,30 @@
         if (sourceBadge) sourceBadge.textContent = `source: .crvrc.json`;
         if (statusEl) statusEl.textContent = `✓ Saved default repo ${data.repo} to ${data.savedTo}`;
         populateRecentPrs(data.repo);
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `⚠ ${err.message}`;
+      }
+    });
+
+    $('#saveAgentConfigBtn')?.addEventListener('click', async () => {
+      const agentVal = ($('#agentSelectInput')?.value || '').trim();
+      const modelVal = ($('#modelConfigInput')?.value || '').trim();
+      const statusEl = $('#loadPrStatus');
+      const agentBadge = $('#agentSourceBadge');
+      try {
+        const res = await fetch('/api/github/agent-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent: agentVal, model: modelVal || 'default' })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save agent & model config');
+        if (agentBadge) {
+          agentBadge.textContent = `agent: ${data.agent} · model: ${data.model || 'default'}`;
+        }
+        if (statusEl) {
+          statusEl.textContent = `✓ Saved default agent "${data.agent}" and model "${data.model || 'harness default'}" to ${data.saved?.configPath || '.crvrc.json'}`;
+        }
       } catch (err) {
         if (statusEl) statusEl.textContent = `⚠ ${err.message}`;
       }

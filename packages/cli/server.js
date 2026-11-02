@@ -13,7 +13,9 @@ const {
   checkFindingsShape,
   compileFindingsToWorkbenchReport,
   resolveRepoConfig,
-  saveDefaultRepoConfig
+  saveDefaultRepoConfig,
+  resolveAgentConfig,
+  saveDefaultAgentConfig
 } = require('../core');
 
 const UI_DIR = path.resolve(__dirname, '../ui');
@@ -425,6 +427,49 @@ function createWorkbenchServer(options = {}) {
       });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, ...resolved }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/github/agent-config') {
+      const resolved = resolveAgentConfig();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          agent: resolved.agent,
+          agentName: resolved.spec ? resolved.spec.name : null,
+          source: resolved.source,
+          model: resolved.model,
+          modelSource: resolved.modelSource,
+          effort: resolved.effort,
+          effortSource: resolved.effortSource,
+          available: resolved.available
+        })
+      );
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/github/agent-config') {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        try {
+          const { agent, model, effort, global: isGlobal } = JSON.parse(body || '{}');
+          const saved = saveDefaultAgentConfig(agent, {
+            global: Boolean(isGlobal),
+            model,
+            effort
+          });
+          const resolved = resolveAgentConfig();
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, saved, ...resolved }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      });
       return;
     }
 
