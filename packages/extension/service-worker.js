@@ -27,6 +27,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           [prKey]: {
             repo: message.repo,
             pr: message.pr,
+            title: message.title || '',
+            url: message.url || '',
+            baseBranch: message.baseBranch || '',
+            headBranch: message.headBranch || '',
             meta: message.meta || null,
             findings: message.findings || [],
             updatedAt: new Date().toISOString()

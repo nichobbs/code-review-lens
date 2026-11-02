@@ -1,9 +1,23 @@
 (function () {
   'use strict';
 
+  try {
+    const meta = document.querySelector('meta[name="color-scheme"]');
+    if (meta) {
+      meta.content = localStorage.getItem('color-scheme') ?? 'light dark';
+    }
+  } catch (e) {}
+
   const OV = '__overview__';
   const CONTRACTS_VIEW = '__contracts__';
   const TESTS_VIEW = '__tests__';
+  const IS_EXTENSION_PAGE =
+    typeof window !== 'undefined' && window.location?.protocol === 'chrome-extension:';
+  const API_BASE = IS_EXTENSION_PAGE ? 'http://127.0.0.1:4320' : '';
+
+  function apiUrl(route) {
+    return `${API_BASE}${route}`;
+  }
 
   let report = window.__CRV_INITIAL_REPORT__ || null;
   let activeLayer = 'findings'; // 'overview' | 'findings' | 'contracts' | 'tests'
@@ -761,10 +775,139 @@
     renderPane();
   }
 
+  function buildStandaloneExtensionReport(prData) {
+    if (!prData || (!prData.repo && !prData.pr)) return null;
+    const findings = Array.isArray(prData.findings) ? prData.findings : [];
+    const mappedData = findings.map((f, index) => ({
+      id: f.id || `F${index + 1}`,
+      sev: f.sev || 'medium',
+      lens: f.lens || 'published-thread',
+      verify: f.verify || 'verified',
+      suggestedTriage: f.action === 'block' ? 'block' : f.action === 'dismiss' ? 'dismiss' : 'comment',
+      title: f.title || `${f.id || 'Finding'} (${f.loc || 'inline comment'})`,
+      loc: f.loc || '',
+      impact: f.impact || (f.body ? `<p>${escapeHtml(f.body)}</p>` : '<p>Published PR review thread discovered on GitHub.</p>'),
+      fix: f.fix || '',
+      reasoning: f.reasoning || ''
+    }));
+
+    const prTitle = prData.title
+      ? `PR #${prData.pr} — ${prData.title}`
+      : `PR #${prData.pr} (${prData.repo})`;
+    const prUrl = prData.url || `https://github.com/${prData.repo}/pull/${prData.pr}`;
+
+    return {
+      KEY: `crv-ext-${prData.repo}-${prData.pr}`,
+      PR: {
+        url: prUrl,
+        label: `${prData.repo}#${prData.pr}`
+      },
+      XMETA: {
+        title: prTitle,
+        sub: `Standalone Extension Mode · ${prData.repo}#${prData.pr}`,
+        branch:
+          prData.headBranch && prData.baseBranch
+            ? `${prData.headBranch} → ${prData.baseBranch}`
+            : ''
+      },
+      REVIEW: {
+        repo: prData.repo,
+        pr: prData.pr,
+        head: prData.meta?.head || findings[0]?.head || ''
+      },
+      SUMMARY: {
+        overview: mappedData.length
+          ? `<p>Loaded <strong>${mappedData.length}</strong> published <code>crv-finding</code> review thread(s) directly from the active GitHub Pull Request tab in standalone browser mode.</p><p>To decompose full diffs or run the 13-lens AI review agent, run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> or import a <code>report.json</code> file using <strong>📂 Import JSON</strong> above.</p>`
+          : `<p>Connected to <strong>${escapeHtml(prData.repo)}#${escapeHtml(String(prData.pr))}</strong> in standalone Chrome Extension mode (local CLI server is offline).</p><p>Run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> in your terminal or click <strong>📂 Import JSON</strong> in the top bar to load a compiled review report.</p>`
+      },
+      DATA: mappedData,
+      LAYERS: {
+        contracts: [],
+        flows: [],
+        testMatrix: []
+      }
+    };
+  }
+
+  async function loadExtensionStoredReport() {
+    if (typeof chrome === 'undefined' || !chrome.storage?.local) return null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const requestedKey = params.get('prKey');
+      const { lastActivePrKey } = await chrome.storage.local.get('lastActivePrKey');
+      const targetKey = requestedKey || lastActivePrKey;
+      if (!targetKey) return null;
+      const stored = await chrome.storage.local.get(targetKey);
+      const prData = stored?.[targetKey];
+      return buildStandaloneExtensionReport(prData);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function normalizeImportedJson(parsed) {
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Invalid JSON report file');
+    }
+    if (Array.isArray(parsed.DATA)) {
+      return parsed;
+    }
+    if (Array.isArray(parsed.issues)) {
+      const meta = parsed.meta || {};
+      const data = parsed.issues.map((issue, idx) => ({
+        id: issue.id || `F${idx + 1}`,
+        sev: issue.severity || issue.sev || 'medium',
+        lens: issue.lens || 'general',
+        verify: issue.verification || issue.verify || 'verified',
+        suggestedTriage:
+          (issue.severity || issue.sev) === 'high' ? 'block' : 'comment',
+        title: issue.title || `Issue ${idx + 1}`,
+        loc: issue.location || issue.loc || '',
+        impact: issue.impact || issue.description || '',
+        fix: issue.fix || issue.recommendation || '',
+        reasoning: issue.reasoning || '',
+        diff: issue.diff || '',
+        diagram: issue.diagram || ''
+      }));
+      return {
+        KEY: meta.key || `crv-import-${meta.pr || Date.now()}`,
+        PR: {
+          url: meta.url || '',
+          label: meta.repo && meta.pr ? `${meta.repo}#${meta.pr}` : 'Imported Report'
+        },
+        XMETA: {
+          title: meta.title || 'Imported Findings Report',
+          sub: meta.subtitle || ''
+        },
+        REVIEW: {
+          repo: meta.repo || '',
+          pr: meta.pr || 0,
+          head: meta.head || ''
+        },
+        SUMMARY: {
+          overview: parsed.summary?.overview || '<p>Imported from <code>findings.json</code>.</p>'
+        },
+        DATA: data,
+        LAYERS: parsed.layers || { contracts: [], flows: [], testMatrix: [] }
+      };
+    }
+    throw new Error('JSON file must contain either a Workbench "DATA" array or a findings "issues" array.');
+  }
+
   async function init() {
+    const preferExtensionStorage =
+      IS_EXTENSION_PAGE && new URLSearchParams(window.location.search).get('mode') === 'standalone';
+
+    if (!report && preferExtensionStorage) {
+      report = await loadExtensionStoredReport();
+    }
+
     if (!report) {
       try {
-        const res = await fetch('/api/report');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1500);
+        const res = await fetch(apiUrl('/api/report'), { signal: controller.signal });
+        clearTimeout(timer);
         if (res.ok) {
           report = await res.json();
           ghConnected = true;
@@ -772,11 +915,45 @@
       } catch (e) {}
     }
 
+    if (!report && IS_EXTENSION_PAGE) {
+      report = await loadExtensionStoredReport();
+    }
+
+    currentId = report?.DATA?.[0]?.id || OV;
+    if (!report?.DATA?.length) {
+      activeLayer = 'overview';
+    }
+
     loadTriage();
     renderHeader();
     renderRack();
     renderPane();
     setupDialogAndTheme();
+
+    const importBtn = $('#importReportBtn');
+    const importInput = $('#importReportInput');
+    if (importBtn && importInput) {
+      importBtn.addEventListener('click', () => importInput.click());
+      importInput.addEventListener('change', async () => {
+        const file = importInput.files?.[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const parsed = JSON.parse(text);
+          report = normalizeImportedJson(parsed);
+          currentId = report?.DATA?.[0]?.id || OV;
+          activeLayer = report?.DATA?.length ? 'findings' : 'overview';
+          loadTriage();
+          renderHeader();
+          renderRack();
+          renderPane();
+        } catch (err) {
+          alert(`Could not import JSON report: ${err.message}`);
+        } finally {
+          importInput.value = '';
+        }
+      });
+    }
 
     $('#layerNav')?.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-layer]');
@@ -857,7 +1034,7 @@
       if (!prInput) return;
       try {
         if (statusEl) statusEl.textContent = `Fetching PR ${prInput} & decomposing 4 Layers via gh...`;
-        const res = await fetch('/api/github/load-pr', {
+        const res = await fetch(apiUrl('/api/github/load-pr'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prInput, repo: explicitRepo || undefined })
@@ -898,7 +1075,7 @@
       const sourceBadge = $('#repoSourceBadge');
       const repoLabel = $('#recentPrsRepoLabel');
       try {
-        const res = await fetch('/api/github/repo-config');
+        const res = await fetch(apiUrl('/api/github/repo-config'));
         const data = await res.json();
         if (res.ok && data.ok) {
           if (repoInput && !repoInput.value) repoInput.value = data.repo || report?.REVIEW?.repo || '';
@@ -917,7 +1094,7 @@
       const effortSelect = $('#effortSelectInput');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const aRes = await fetch('/api/github/agent-config');
+        const aRes = await fetch(apiUrl('/api/github/agent-config'));
         const aData = await aRes.json();
         if (aRes.ok && aData.ok) {
           if (agentSelect && aData.agent) agentSelect.value = aData.agent;
@@ -939,7 +1116,9 @@
       try {
         const repoParam = (explicitRepoOverride ?? $('#repoConfigInput')?.value ?? '').trim();
         listEl.innerHTML = `<div style="font-size:12px;color:var(--muted);">Loading recent PRs from GitHub via gh cli...</div>`;
-        const url = repoParam ? `/api/github/list-prs?repo=${encodeURIComponent(repoParam)}` : '/api/github/list-prs';
+        const url = repoParam
+          ? apiUrl(`/api/github/list-prs?repo=${encodeURIComponent(repoParam)}`)
+          : apiUrl('/api/github/list-prs');
         const res = await fetch(url);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Unavailable');
@@ -983,7 +1162,7 @@
       const sourceBadge = $('#repoSourceBadge');
       if (!repoVal) return;
       try {
-        const res = await fetch('/api/github/repo-config', {
+        const res = await fetch(apiUrl('/api/github/repo-config'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ repo: repoVal })
@@ -1005,7 +1184,7 @@
       const statusEl = $('#loadPrStatus');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const res = await fetch('/api/github/agent-config', {
+        const res = await fetch(apiUrl('/api/github/agent-config'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1085,7 +1264,7 @@
       const payload = buildGitHubPreviewPayload();
       try {
         statusEl.textContent = 'Publishing review to GitHub via local gh bridge...';
-        const res = await fetch('/api/github/submit-review', {
+        const res = await fetch(apiUrl('/api/github/submit-review'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

@@ -25,7 +25,13 @@ const {
   saveDefaultAgentConfig
 } = require('../packages/core');
 
-const { loadReportFile, buildStandaloneHtml } = require('../packages/cli/server');
+const {
+  loadReportFile,
+  buildStandaloneHtml,
+  createWorkbenchServer,
+  isAllowedCorsOrigin
+} = require('../packages/cli/server');
+const { syncExtensionWorkbench } = require('../scripts/sync-extension-workbench');
 const { execFileSync } = require('node:child_process');
 const os = require('node:os');
 
@@ -370,4 +376,66 @@ test('Generic repo-config resolution chain (CLI/UI -> env -> .env -> .crvrc.json
   });
   assert.equal(resolvedOverride.agent, 'claude');
   assert.equal(resolvedOverride.model, 'sonnet');
+});
+
+test('Chrome Extension standalone workbench bundle, MV3 CSP compliance, and local server CORS / health API', async () => {
+  // 1. CORS allowlist allows chrome-extension:// and localhost, blocks arbitrary origins
+  assert.equal(isAllowedCorsOrigin('chrome-extension://abcdefghijklmnopabcdefghijklmnop'), true);
+  assert.equal(isAllowedCorsOrigin('http://127.0.0.1:4320'), true);
+  assert.equal(isAllowedCorsOrigin('http://localhost:4320'), true);
+  assert.equal(isAllowedCorsOrigin('https://evil.example.com'), false);
+  assert.equal(isAllowedCorsOrigin('chrome-extension://invalid-id'), false);
+
+  // 2. Bundled extension workbench sync & MV3 CSP compliance (no inline <script> tags)
+  const syncRes = syncExtensionWorkbench();
+  for (const fileName of syncRes.files) {
+    assert.ok(fs.existsSync(path.join(syncRes.targetDir, fileName)));
+  }
+  const extIndexHtml = fs.readFileSync(path.join(syncRes.targetDir, 'index.html'), 'utf8');
+  assert.doesNotMatch(extIndexHtml, /<script>\s*\S/);
+  assert.match(extIndexHtml, /<script src="\.\/workbench\.js"><\/script>/);
+
+  // 3. Verify /api/health endpoint & CORS headers on createWorkbenchServer
+  const { server } = createWorkbenchServer();
+  const invokeServer = (method, url, origin) => {
+    let statusCode = 200;
+    const headers = {};
+    let body = '';
+    const req = {
+      method,
+      url,
+      headers: { host: '127.0.0.1:4320', ...(origin ? { origin } : {}) }
+    };
+    const res = {
+      setHeader(k, v) {
+        headers[k.toLowerCase()] = v;
+      },
+      writeHead(code, hdrs = {}) {
+        statusCode = code;
+        for (const [k, v] of Object.entries(hdrs)) {
+          headers[k.toLowerCase()] = v;
+        }
+      },
+      end(chunk = '') {
+        body += chunk;
+      }
+    };
+    server.emit('request', req, res);
+    return { statusCode, headers, body };
+  };
+
+  const extOrigin = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
+  const healthRes = invokeServer('GET', '/api/health', extOrigin);
+  assert.equal(healthRes.statusCode, 200);
+  assert.equal(healthRes.headers['access-control-allow-origin'], extOrigin);
+  const parsedHealth = JSON.parse(healthRes.body);
+  assert.equal(parsedHealth.ok, true);
+  assert.equal(parsedHealth.status, 'online');
+
+  const preflightRes = invokeServer('OPTIONS', '/api/github/load-pr', extOrigin);
+  assert.equal(preflightRes.statusCode, 204);
+  assert.equal(preflightRes.headers['access-control-allow-origin'], extOrigin);
+
+  const evilRes = invokeServer('GET', '/api/health', 'https://evil.example.com');
+  assert.equal(evilRes.headers['access-control-allow-origin'], undefined);
 });
