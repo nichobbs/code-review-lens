@@ -1,0 +1,30 @@
+{
+  "name": "code-review-lens",
+  "version": "0.1.0",
+  "description": "Human-in-the-loop Agentic PR Review Workbench (crv — Code ReView CLI + 13-Lens Skill + GitHub Comments DB + Chrome Extension)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nichobbs/code-review-lens.git"
+  },
+  "bin": {
+    "crv": "./packages/cli/bin/crv.js",
+    "gh-crv": "./gh-crv/gh-crv"
+  },
+  "files": [
+    "gh-crv/",
+    "packages/",
+    ".agents/skills/crv-code-review/",
+    "fixtures/"
+  ],
+  "scripts": {
+    "start": "node ./packages/cli/bin/crv.js demo",
+    "demo": "node ./packages/cli/bin/crv.js demo",
+    "review": "node ./packages/cli/bin/crv.js review",
+    "export-html": "node ./packages/cli/bin/crv.js export-html",
+    "install-skill": "node ./packages/cli/bin/crv.js install-skill",
+    "test": "node --test ./test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

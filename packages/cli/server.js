@@ -1,0 +1,575 @@
+'use strict';
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const vm = require('vm');
+const {
+  hydrateFromGitHubComments,
+  parseUnifiedDiff,
+  extractDiffSlice,
+  buildLayersFromParsedDiff,
+  checkFindingsShape,
+  compileFindingsToWorkbenchReport,
+  resolveRepoConfig,
+  saveDefaultRepoConfig
+} = require('../core');
+
+const UI_DIR = path.resolve(__dirname, '../ui');
+const DEFAULT_FIXTURE = path.resolve(__dirname, '../../fixtures/pr1230-report.json');
+
+/**
+ * Extracts a report object from a Workbench `.json`, a raw `tu-code-review` `findings.json`,
+ * or a `tu-code-review` `.html` file.
+ */
+function loadReportFile(filePath, options = {}) {
+  const resolved = path.resolve(filePath || DEFAULT_FIXTURE);
+  const content = fs.readFileSync(resolved, 'utf8');
+  if (resolved.endsWith('.json')) {
+    const parsed = JSON.parse(content);
+    if (parsed && Array.isArray(parsed.issues) && !Array.isArray(parsed.DATA)) {
+      let diffText = options.diffText || '';
+      if (!diffText && options.diffPath && fs.existsSync(options.diffPath)) {
+        diffText = fs.readFileSync(options.diffPath, 'utf8');
+      } else if (!diffText) {
+        const siblingDiff = path.join(path.dirname(resolved), 'diff.patch');
+        if (fs.existsSync(siblingDiff)) {
+          diffText = fs.readFileSync(siblingDiff, 'utf8');
+        }
+      }
+      const warnings = checkFindingsShape(parsed);
+      if (warnings.length) {
+        console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
+      }
+      return compileFindingsToWorkbenchReport(parsed, { diffText, outPath: options.outPath });
+    }
+    return parsed;
+  }
+  // Check if HTML has embedded <script id="crv-findings"> or window.__CRV_INITIAL_REPORT__
+  const initMatch = /window\.__CRV_INITIAL_REPORT__\s*=\s*(\{[\s\S]*?\});\s*<\/script>/.exec(content);
+  if (initMatch) {
+    return JSON.parse(initMatch[1]);
+  }
+  // Parse tu-code-review single-file HTML report
+  const lines = content.split('\n');
+  const dataLineIdx = lines.findIndex((l) => l.startsWith('const DATA=['));
+  if (dataLineIdx === -1) {
+    throw new Error(`Could not find const DATA=[...] in ${resolved}`);
+  }
+  const scriptBlock = lines.slice(dataLineIdx, dataLineIdx + 2).join('\n');
+  const sandbox = {};
+  vm.runInNewContext(
+    scriptBlock +
+      '\n;globalThis.__out = { DATA, SEV, ORDER, KEY, SUMMARY, STAT, REV, PR, XMETA, REVIEW, LENSES };',
+    sandbox
+  );
+  return sandbox.__out;
+}
+
+/**
+ * Calls `gh api` safely via spawnSync (no shell interpolation).
+ */
+function runGhApi(args, inputStr) {
+  const res = spawnSync('gh', ['api', ...args], {
+    input: inputStr,
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024
+  });
+  if (res.status !== 0) {
+    throw new Error((res.stderr || res.stdout || 'gh api failed').trim());
+  }
+  return res.stdout;
+}
+
+function formatMissingRepoError(prNum) {
+  const prExample = prNum || 1230;
+  return [
+    `No GitHub repository could be detected for PR #${prExample} (current directory is not a git repository and no default repo is configured).`,
+    '',
+    'How to fix this (choose any option):',
+    `  1. Set a default repo for this directory:   crv repo <owner/repo>`,
+    `  2. Set a global default repo for your user: crv repo <owner/repo> --global`,
+    `  3. Pass the repo on the command line:       crv pr ${prExample} --repo <owner/repo>`,
+    `  4. Use the shorthand or full GitHub URL:    crv pr <owner/repo>#${prExample}`,
+    `  5. Set an environment variable:             export CRV_DEFAULT_REPO=<owner/repo>`
+  ].join('\n');
+}
+
+function formatGhError(rawErr, repo, prNum) {
+  const msg = String(rawErr || '').trim();
+  if (/not a git repository/i.test(msg)) {
+    return formatMissingRepoError(prNum);
+  }
+  if (/Could not resolve to a PullRequest/i.test(msg) || /no pull requests found/i.test(msg)) {
+    return [
+      `Pull Request #${prNum} was not found in repository "${repo}".`,
+      '',
+      'How to fix this:',
+      `  • Check the PR number or pass a different repository: crv pr ${prNum} --repo <owner/repo>`,
+      `  • Or change your default repository:                  crv repo <owner/repo>`
+    ].join('\n');
+  }
+  if (/auth login/i.test(msg) || /HTTP 401/i.test(msg)) {
+    return `${msg}\n\nHow to fix this:\n  • Authenticate GitHub CLI by running: gh auth login`;
+  }
+  return msg;
+}
+
+/**
+ * Lists recent PRs from a GitHub repository via `gh pr list`.
+ */
+function listRecentPrs(explicitRepo, limit = 10) {
+  const resolved = resolveRepoConfig({ explicitRepo });
+  if (!resolved.repo) {
+    throw new Error(
+      'No default repository configured. Enter "owner/repo" above and click "Save as Default", or run "crv repo <owner/repo>" in your terminal.'
+    );
+  }
+  const repoArgs = ['--repo', resolved.repo];
+  const res = spawnSync(
+    'gh',
+    [
+      'pr',
+      'list',
+      ...repoArgs,
+      '--state',
+      'all',
+      '--limit',
+      String(limit),
+      '--json',
+      'number,title,state,author,updatedAt,url'
+    ],
+    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
+  );
+  if (res.status !== 0) {
+    throw new Error(formatGhError(res.stderr || res.stdout || 'gh pr list failed', resolved.repo));
+  }
+  return JSON.parse(res.stdout || '[]');
+}
+
+/**
+ * Loads any PR live from GitHub (`gh pr view` + `gh pr diff` + `gh api` comments),
+ * combining existing `.crv-skills/crv-code-review/<pr>/findings.json` (if present) or
+ * generating an immediate 4-Layer decomposition + automated test/thread findings.
+ */
+function loadLivePrFromGitHub(prInput, explicitRepo) {
+  const raw = String(prInput || '').trim();
+  let repo = null;
+  let prNumber = raw;
+
+  const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i.exec(raw);
+  const shortMatch = /^([^/]+\/[^#]+)#(\d+)$/.exec(raw);
+  if (urlMatch) {
+    repo = urlMatch[1];
+    prNumber = urlMatch[2];
+  } else if (shortMatch) {
+    repo = shortMatch[1];
+    prNumber = shortMatch[2];
+  } else {
+    prNumber = raw.replace(/^#/, '');
+    repo = resolveRepoConfig({ explicitRepo }).repo;
+  }
+
+  const prNumInt = Number(prNumber);
+  if (!prNumInt) {
+    throw new Error(
+      `Invalid PR identifier "${prInput}". Expected a PR number (e.g. 1230), owner/repo#number, or full GitHub PR URL.`
+    );
+  }
+
+  if (!repo) {
+    throw new Error(formatMissingRepoError(prNumInt));
+  }
+
+  const repoArgs = ['--repo', repo];
+
+  const metaRes = spawnSync(
+    'gh',
+    [
+      'pr',
+      'view',
+      String(prNumInt),
+      ...repoArgs,
+      '--json',
+      'number,title,body,url,state,baseRefName,baseRefOid,headRefName,headRefOid,additions,deletions,changedFiles'
+    ],
+    { encoding: 'utf8', maxBuffer: 15 * 1024 * 1024 }
+  );
+  if (metaRes.status !== 0) {
+    throw new Error(formatGhError(metaRes.stderr || metaRes.stdout || `Failed to view PR #${prNumInt}`, repo, prNumInt));
+  }
+  const prMeta = JSON.parse(metaRes.stdout);
+  if (!repo && prMeta.url) {
+    const m = /github\.com\/([^/]+\/[^/]+)\/pull\//i.exec(prMeta.url);
+    if (m) repo = m[1];
+  }
+
+  const diffRes = spawnSync('gh', ['pr', 'diff', String(prNumInt), ...(repo ? ['--repo', repo] : [])], {
+    encoding: 'utf8',
+    maxBuffer: 25 * 1024 * 1024
+  });
+  const diffText = diffRes.status === 0 ? diffRes.stdout || '' : '';
+
+  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json
+  const scratchCandidates = [
+    path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`),
+    path.resolve(process.cwd(), `.tu-skills/tu-code-review/${prNumInt}/findings.json`)
+  ];
+  const scratchFindingsPath = scratchCandidates.find((p) => fs.existsSync(p));
+  if (scratchFindingsPath) {
+    const findingsJson = JSON.parse(fs.readFileSync(scratchFindingsPath, 'utf8'));
+    const compiled = compileFindingsToWorkbenchReport(findingsJson, { diffText });
+    syncReportWithGitHub(compiled);
+    return compiled;
+  }
+
+  // If loading the bundled demo fixture PR and its repo matches, enrich and return it
+  if (fs.existsSync(DEFAULT_FIXTURE)) {
+    const fixtureReport = loadReportFile(DEFAULT_FIXTURE);
+    if (
+      fixtureReport?.REVIEW?.pr === prNumInt &&
+      String(fixtureReport?.REVIEW?.repo || '').toLowerCase() === String(repo || '').toLowerCase()
+    ) {
+      syncReportWithGitHub(fixtureReport);
+      return fixtureReport;
+    }
+  }
+
+  // Otherwise construct an immediate 4-Layer Live Decomposition from the diff + existing GitHub review comments
+  const parsedFiles = parseUnifiedDiff(diffText);
+  const autoIssues = [];
+
+  // Pull existing review comments so human/Copilot comments appear immediately as interactive strips
+  let hydrated = { overviewMeta: null, findingThreads: {}, generalComments: [] };
+  try {
+    const issueComments = JSON.parse(runGhApi([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate']) || '[]');
+    const reviewComments = JSON.parse(runGhApi([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate']) || '[]');
+    hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+  } catch (e) {}
+
+  let threadIdx = 1;
+  for (const gc of hydrated.generalComments || []) {
+    if (!gc.path) continue;
+    const loc = `${gc.path}:${gc.line || 1}`;
+    autoIssues.push({
+      id: `GH${threadIdx++}`,
+      sev: 'medium',
+      cat: 'github-thread',
+      verify: 'CONFIRMED',
+      earlier: [{ who: gc.author, loc, url: gc.url }],
+      loc,
+      title: `Existing GitHub thread by @${gc.author} on ${path.basename(gc.path)}`,
+      impact: `**Breaks:** Existing review thread raised on GitHub by \`@${gc.author}\`.\n\n**Because:** ${(gc.body || '').replace(/\s+/g, ' ').slice(0, 260)}\n\n**Reach:** Inline thread at \`${loc}\`.`,
+      fix: `**Do:** Inspect thread at \`${loc}\` or run the 13-lens \`crv-code-review\` agent skill for full verification.\n\n**Check:** Resolve thread on GitHub once addressed.`
+    });
+  }
+
+  // Flag any hollow or mock-only tests automatically from Layer 4
+  const preLayers = buildLayersFromParsedDiff(parsedFiles, []);
+  let testIdx = 1;
+  for (const tm of preLayers.testMatrix) {
+    for (const c of tm.cases) {
+      if (c.hollow || c.mockOnly) {
+        const loc = `${tm.file}:1`;
+        autoIssues.push({
+          id: `T${testIdx++}`,
+          sev: 'low',
+          cat: 'tests',
+          verify: 'CONFIRMED',
+          loc,
+          title: `${c.hollow ? 'Zero-assertion (hollow)' : 'Mock-only'} test: "${c.behavior.slice(0, 55)}"`,
+          impact: `**Breaks:** Test case \`${c.behavior}\` in \`${tm.file}\` ${c.hollow ? 'contains 0 assertions' : 'only asserts mock calls (toHaveBeenCalled*)'}.\n\n**Because:** Automated Layer 4 Behavioral Test Matrix scan detected \`assertions: ${c.assertions}\`.\n\n**Reach:** Suite \`${tm.suite}\`.`,
+          fix: `**Do:** Assert the returned value or state transition rather than ${c.hollow ? 'ignoring the result' : 'only checking mock invocation'}.\n\n**Check:** Reverting the production branch in the tested module causes this test to fail.`
+        });
+      }
+    }
+  }
+
+  const mermaidSummary = [
+    'flowchart LR',
+    `  subgraph PR["PR #${prNumInt} (${parsedFiles.length} files)"]`,
+    `    C["Contracts & Schemas (${preLayers.contracts.length})"]`,
+    `    F["Production Flows (${preLayers.flows.length} groups)"]`,
+    `    T["Behavioral Test Matrix (${preLayers.testMatrix.length} files)"]`,
+    '  end',
+    '  C --> F --> T'
+  ].join('\n');
+
+  const syntheticFindings = {
+    meta: {
+      title: `PR #${prNumInt}: ${prMeta.title}`,
+      subtitle: `${prMeta.changedFiles || parsedFiles.length} files, +${prMeta.additions || 0} -${prMeta.deletions || 0}`,
+      prUrl: prMeta.url,
+      headCommit: prMeta.headRefOid,
+      storageKey: `${repo.replace('/', '-')}-pr${prNumInt}`,
+      review: {
+        repo,
+        pr: prNumInt,
+        base: prMeta.baseRefOid,
+        head: prMeta.headRefOid,
+        agent: 'CRV Live Diff Analyzer',
+        model: '4-Layer Pre-Scan (Run crv-code-review skill for full 13-lens deep review)',
+        lenses: ['contract-classifier', 'flow-grouper', 'test-matrix']
+      },
+      summary: [
+        `**What it does.** Live 4-Layer decomposition for \`${repo}#${prNumInt}\` (${prMeta.headRefName} → ${prMeta.baseRefName}).`,
+        '```mermaid\n' + mermaidSummary + '\n```',
+        (prMeta.body || '').trim()
+          ? `### Author PR Description\n\n${prMeta.body.trim().slice(0, 1200)}`
+          : '',
+        `**Coverage.** Pre-scanned ${parsedFiles.length} changed files into ${preLayers.contracts.length} contract file(s), ${preLayers.flows.length} production flow group(s), and ${preLayers.testMatrix.length} test file(s). Ask Antigravity in chat: \`Review ${prMeta.url} with crv-code-review\` to run the full 13-lens + verifier agent analysis.`
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      summaryPoints: [
+        `contracts: ${preLayers.contracts.length} contract/schema file(s) detected`,
+        `flows: ${preLayers.flows.length} production flow group(s) detected`,
+        `tests: ${preLayers.testMatrix.length} test file(s) collapsed into Behavioral Test Matrix`,
+        `github-threads: ${autoIssues.length} pre-scan item(s) surfaced`
+      ]
+    },
+    issues: autoIssues
+  };
+
+  const compiled = compileFindingsToWorkbenchReport(syntheticFindings, { diffText });
+  compiled.GITHUB_STATE = hydrated;
+  return compiled;
+}
+/**
+ * Enriches a report with live diff slices & existing GitHub PR comments using `gh`.
+ */
+function syncReportWithGitHub(report) {
+  const repo = report?.REVIEW?.repo;
+  const pr = report?.REVIEW?.pr;
+  if (!repo || !pr) return { synced: false, reason: 'Missing repo or PR number in report.REVIEW' };
+
+  try {
+    const issueCommentsRaw = runGhApi([`repos/${repo}/issues/${pr}/comments`, '--paginate']);
+    const reviewCommentsRaw = runGhApi([`repos/${repo}/pulls/${pr}/comments`, '--paginate']);
+    const issueComments = JSON.parse(issueCommentsRaw || '[]');
+    const reviewComments = JSON.parse(reviewCommentsRaw || '[]');
+    const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+
+    const diffRes = spawnSync('gh', ['pr', 'diff', String(pr), '--repo', repo], {
+      encoding: 'utf8',
+      maxBuffer: 25 * 1024 * 1024
+    });
+    if (diffRes.status === 0 && diffRes.stdout) {
+      const parsedFiles = parseUnifiedDiff(diffRes.stdout);
+      for (const finding of report.DATA || []) {
+        if (!finding.diffSlice && finding.loc) {
+          finding.diffSlice = extractDiffSlice(parsedFiles, finding.loc);
+        }
+      }
+    }
+
+    report.GITHUB_STATE = hydrated;
+    return { synced: true, hydrated };
+  } catch (err) {
+    return { synced: false, reason: err.message };
+  }
+}
+
+/**
+ * Builds a single-file standalone HTML version of the upgraded 4-Layer Workbench.
+ */
+function buildStandaloneHtml(report) {
+  const css = fs.readFileSync(path.join(UI_DIR, 'workbench.css'), 'utf8');
+  const mermaidJs = fs.readFileSync(path.join(UI_DIR, 'vendor/mermaid.min.js'), 'utf8');
+  const workbenchJs = fs.readFileSync(path.join(UI_DIR, 'workbench.js'), 'utf8');
+  const template = fs.readFileSync(path.join(UI_DIR, 'index.html'), 'utf8');
+
+  const safeJson = JSON.stringify(report).replace(/<\/script/gi, '<\\/script');
+  const rawFindingsPayload = report.rawFindings || {
+    meta: {
+      title: report.XMETA?.title || '',
+      subtitle: report.XMETA?.subtitle || '',
+      prUrl: report.PR?.url || report.SUMMARY?.prUrl || '',
+      headCommit: report.PR?.head || report.SUMMARY?.headCommit || '',
+      storageKey: report.KEY || '',
+      review: report.REVIEW || {},
+      summaryPoints: report.SUMMARY?.points || []
+    },
+    issues: report.DATA || []
+  };
+  const safeRawFindings = JSON.stringify(rawFindingsPayload).replace(/<\/script/gi, '<\\/script');
+
+  return template
+    .replace('<link rel="stylesheet" href="./workbench.css">', `<style>\n${css}\n</style>`)
+    .replace(
+      '<script src="./vendor/mermaid.min.js"></script>',
+      `<script type="application/json" id="crv-findings">${safeRawFindings}</script>\n<script>window.__CRV_INITIAL_REPORT__ = ${safeJson};</script>\n<script>\n${mermaidJs}\n</script>`
+    )
+    .replace('<script src="./workbench.js"></script>', `<script>\n${workbenchJs}\n</script>`);
+}
+
+function createWorkbenchServer(options = {}) {
+  let report = options.report || loadReportFile(options.reportPath);
+  const allowLivePublish = Boolean(options.publish);
+  const lastSubmittedPath = path.resolve(__dirname, '../../fixtures/last-submitted-review.json');
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+    if (req.method === 'GET' && url.pathname === '/api/report') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(report));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/github/repo-config') {
+      const resolved = resolveRepoConfig({
+        explicitRepo: url.searchParams.get('repo') || options.explicitRepo,
+        reportRepo: report?.REVIEW?.repo
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, ...resolved }));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/github/repo-config') {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        try {
+          const { repo, global: isGlobal } = JSON.parse(body || '{}');
+          const saved = saveDefaultRepoConfig(repo, { global: Boolean(isGlobal) });
+          const resolved = resolveRepoConfig({ reportRepo: report?.REVIEW?.repo });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, saved, ...resolved }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/github/list-prs') {
+      const resolved = resolveRepoConfig({
+        explicitRepo: url.searchParams.get('repo') || options.explicitRepo,
+        reportRepo: report?.REVIEW?.repo
+      });
+      if (!resolved.repo) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error:
+              'No default repository configured. Set one above, run inside a git repo, set CRV_DEFAULT_REPO, or run "crv repo owner/name".'
+          })
+        );
+        return;
+      }
+      try {
+        const prs = listRecentPrs(resolved.repo, 10);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, repo: resolved.repo, source: resolved.source, prs }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/github/load-pr') {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        try {
+          const { prInput, repo } = JSON.parse(body || '{}');
+          const resolved = resolveRepoConfig({
+            explicitRepo: repo || options.explicitRepo,
+            reportRepo: report?.REVIEW?.repo
+          });
+          report = loadLivePrFromGitHub(prInput, resolved.repo);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, report, resolvedRepo: report?.REVIEW?.repo || resolved.repo }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/github/sync') {
+      const result = syncReportWithGitHub(report);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/github/submit-review') {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        try {
+          const { repo, pr, payload } = JSON.parse(body || '{}');
+          fs.writeFileSync(
+            lastSubmittedPath,
+            JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload }, null, 2)
+          );
+
+          if (allowLivePublish && repo && pr) {
+            const out = runGhApi(
+              ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+              JSON.stringify(payload)
+            );
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, mode: 'gh-api-live', response: JSON.parse(out) }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                mode: 'dry-run (saved to fixtures/last-submitted-review.json; pass --publish for live GitHub POST)',
+                savedTo: lastSubmittedPath
+              })
+            );
+          }
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      });
+      return;
+    }
+
+    // Static UI assets
+    let filePath = path.join(UI_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
+    if (!filePath.startsWith(UI_DIR) || !fs.existsSync(filePath)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+      return;
+    }
+
+    const ext = path.extname(filePath);
+    const mimeTypes = {
+      '.html': 'text/html; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.js': 'application/javascript; charset=utf-8',
+      '.json': 'application/json; charset=utf-8'
+    };
+    res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  return { server, report };
+}
+
+module.exports = {
+  loadReportFile,
+  listRecentPrs,
+  loadLivePrFromGitHub,
+  syncReportWithGitHub,
+  buildStandaloneHtml,
+  createWorkbenchServer
+};

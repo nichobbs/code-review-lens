@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Agentic PR Review Workbench — Side Panel</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#FFFFFF, #0B0F16);
+      --well: light-dark(#F6F7F8, #161C27);
+      --rule: light-dark(#E3E6E8, #232B3A);
+      --ink: light-dark(#131E29, #E6ECF2);
+      --muted: light-dark(#6D7979, #7C8898);
+      --accent: #0F8171;
+    }
+    body {
+      margin: 0;
+      padding: 14px;
+      font: 400 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    .card {
+      padding: 12px;
+      border-radius: 7px;
+      border: 1px solid var(--rule);
+      background: var(--well);
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 14px;
+      margin: 0 0 6px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn.secondary {
+      background: transparent;
+      color: var(--ink);
+      border-color: var(--rule);
+    }
+    .finding-item {
+      padding: 8px 10px;
+      border-radius: 5px;
+      border: 1px solid var(--rule);
+      background: var(--bg);
+      margin-top: 8px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🛡️ Agentic PR Review Workbench</h1>
+    <div id="prStatus" style="color:var(--muted);font-size:12px;margin-bottom:10px;">
+      Checking active GitHub PR tab...
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button type="button" class="btn" id="openFullWorkbenchBtn">Open 4-Layer Workbench</button>
+      <button type="button" class="btn secondary" id="rescanTabBtn">Rescan PR Comments</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>GitHub Comment Backing Store (<code>crv-finding</code>)</strong>
+    <div id="findingsList" style="margin-top:6px;color:var(--muted);font-size:12px;">
+      No published findings detected on this page yet.
+    </div>
+  </div>
+
+  <script src="./sidepanel.js"></script>
+</body>
+</html>

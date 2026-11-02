@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    try {
+      document.querySelector('meta[name="color-scheme"]').content =
+        localStorage.getItem("color-scheme") ?? "light dark";
+    } catch (e) {}
+  </script>
+  <title>Agentic PR Review Workbench</title>
+  <link rel="stylesheet" href="./workbench.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="bar">
+      <span class="brand-badge">CRV WORKBENCH</span>
+      <h1 id="prTitle">Loading PR Review...</h1>
+      <span id="prLinkHolder"></span>
+      <button type="button" class="btn" id="openSwitchPrBtn" title="Switch to another PR or re-run analysis">
+        🔀 Switch PR / Re-run
+      </button>
+      <div class="spacer"></div>
+      <div class="triage-summary-pills" id="triageSummaryPills"></div>
+      <button type="button" class="btn" id="copyAgentPromptBtn" title="Copy curated findings as a Coding Agent prompt">
+        Copy Agent Prompt
+      </button>
+      <button type="button" class="btn gh-submit" id="openGhModalBtn">
+        Publish to GitHub
+      </button>
+      <button type="button" class="btn" id="themeToggleBtn" aria-label="Toggle color scheme" title="Toggle light/dark theme">
+        ◐ Theme
+      </button>
+    </header>
+
+    <aside class="rackcol" aria-label="4-Layer PR Navigation and Findings">
+      <nav class="layer-nav" id="layerNav" aria-label="PR Review Layers"></nav>
+      <div class="rackhead">
+        <div class="tabs" id="tabs" role="tablist"></div>
+      </div>
+      <div class="filters" id="filters" aria-label="Filter by severity"></div>
+      <div class="racks" id="racks"></div>
+    </aside>
+
+    <main class="pane">
+      <div class="panescroll" id="pane" tabindex="-1"></div>
+      <footer class="dock">
+        <div>
+          <span>Shortcuts: <kbd class="kbd">j</kbd>/<kbd class="kbd">k</kbd> navigate · <kbd class="kbd">b</kbd> Block · <kbd class="kbd">m</kbd> Comment · <kbd class="kbd">x</kbd> Dismiss</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button type="button" class="btn" id="prevBtn">← Previous</button>
+          <button type="button" class="btn" id="nextBtn">Next →</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Native modal dialog with light-dismiss (closedby="any") -->
+  <dialog id="ghReviewDialog" closedby="any" aria-labelledby="ghReviewTitle">
+    <div class="dlg-head">
+      <h2 id="ghReviewTitle">Publish Curated Review to GitHub PR Comments</h2>
+      <form method="dialog">
+        <button type="submit" class="btn" aria-label="Close modal">✕ Close</button>
+      </form>
+    </div>
+    <div class="dlg-body">
+      <p style="margin:0 0 8px;color:var(--ink-2);font-size:13px;">
+        Only findings triaged as <strong>🚫 Block</strong> or <strong>💬 Comment</strong> are posted as inline GitHub PR review threads (with embedded <code>&lt;!-- crv-finding --&gt;</code> metadata so team replies sync back). Dismissed findings stay silent.
+      </p>
+      <div id="ghModalStats" style="font:600 12px var(--mono);color:var(--accent-ink);margin-bottom:10px;"></div>
+
+      <div class="event-radios" role="radiogroup" aria-label="GitHub Review Event">
+        <label class="event-radio">
+          <span><input type="radio" name="ghReviewEvent" value="REQUEST_CHANGES" checked> <strong>Request Changes</strong></span>
+          <span style="font-size:11.5px;color:var(--muted)">Blocks merge until 🚫 Blocking findings are addressed</span>
+        </label>
+        <label class="event-radio">
+          <span><input type="radio" name="ghReviewEvent" value="COMMENT"> <strong>Comment Only</strong></span>
+          <span style="font-size:11.5px;color:var(--muted)">Posts inline threads + sticky summary without blocking</span>
+        </label>
+        <label class="event-radio">
+          <span><input type="radio" name="ghReviewEvent" value="APPROVE"> <strong>Approve PR</strong></span>
+          <span style="font-size:11.5px;color:var(--muted)">Approves PR and posts any remaining non-blocking notes</span>
+        </label>
+      </div>
+
+      <label for="ghSummaryNote" style="display:block;font-weight:600;font-size:12px;margin-bottom:4px;">
+        Top-level Reviewer Summary (optional):
+      </label>
+      <textarea id="ghSummaryNote" rows="2" style="width:100%;padding:8px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);color:var(--ink);font:400 13px var(--font);margin-bottom:12px;" placeholder="Overall architecture looks good; please address the status transition guards (H1-H3) before merge."></textarea>
+
+      <div style="font-weight:600;font-size:12px;margin-bottom:4px;">
+        GitHub API Review Payload Preview (<code>POST /repos/{owner}/{repo}/pulls/{pr}/reviews</code>):
+      </div>
+      <pre class="preview-pre" id="ghPayloadPreview"></pre>
+      <div id="ghSubmitStatus" style="margin-top:8px;font-weight:600;font-size:12.5px;color:var(--ok);"></div>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn" id="copyGhPayloadBtn">Copy gh api Payload</button>
+      <div style="display:flex;gap:8px;">
+        <form method="dialog">
+          <button type="submit" class="btn">Cancel</button>
+        </form>
+        <button type="button" class="btn gh-submit" id="submitGhReviewBtn" autofocus>
+          🚀 Submit Review to GitHub
+        </button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Switch PR / Re-run Analysis Modal -->
+  <dialog id="switchPrDialog" closedby="any" aria-labelledby="switchPrTitle">
+    <div class="dlg-head">
+      <h2 id="switchPrTitle">Switch PR or Re-run Agent Analysis</h2>
+      <form method="dialog">
+        <button type="submit" class="btn" aria-label="Close modal">✕ Close</button>
+      </form>
+    </div>
+    <div class="dlg-body">
+      <div style="margin-bottom:12px;padding:10px 12px;border-radius:6px;background:var(--surface);border:1px solid var(--rule);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+          <label for="repoConfigInput" style="font-weight:700;font-size:12px;">
+            Default / Target Repository (<code>owner/repo</code>):
+          </label>
+          <span id="repoSourceBadge" class="chip" style="font:500 10.5px var(--mono);">source: auto</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <input id="repoConfigInput" type="text" placeholder="e.g. owner/repo (or set CRV_DEFAULT_REPO / .crvrc.json)" style="flex:1;padding:6px 10px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--bg);color:var(--ink);font:500 12.5px var(--mono);">
+          <button type="button" class="btn" id="refreshRepoPrsBtn" title="Browse recent PRs in this repo">Browse PRs</button>
+          <button type="button" class="btn" id="saveRepoConfigBtn" title="Save to .crvrc.json in current directory">Save as Default</button>
+        </div>
+        <div style="margin-top:4px;font-size:11px;color:var(--muted);">
+          Resolution order: <code>--repo</code> / UI → <code>CRV_DEFAULT_REPO</code> / <code>GH_REPO</code> env or <code>.env</code> → <code>.crvrc.json</code> → <code>git remote origin</code> in CWD.
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px;">
+        <label for="prSearchInput" style="display:block;font-weight:600;font-size:12px;margin-bottom:6px;">
+          Load any GitHub PR (PR number in target repo, <code>owner/repo#number</code>, or full GitHub URL):
+        </label>
+        <div style="display:flex;gap:8px;">
+          <input id="prSearchInput" type="text" placeholder="e.g. 1455, owner/repo#42, or https://github.com/owner/repo/pull/1455" style="flex:1;padding:7px 10px;border-radius:5px;border:1px solid var(--rule-strong);background:var(--surface);color:var(--ink);font:500 13px var(--mono);">
+          <button type="button" class="btn primary" id="loadPrBtn">Load in Workbench</button>
+        </div>
+        <div id="loadPrStatus" style="margin-top:6px;font:600 12px var(--mono);color:var(--accent-ink);"></div>
+      </div>
+
+      <div style="margin-bottom:14px;padding:10px 12px;border-radius:6px;background:var(--surface);border:1px solid var(--rule);">
+        <div style="font-weight:700;font-size:12px;margin-bottom:4px;">🤖 Run / Re-run Full 13-Lens AI Skill in Antigravity</div>
+        <p style="margin:0 0 8px;font-size:12px;color:var(--ink-2);">
+          Loading a PR above immediately decomposes its diff into the <strong>4 Human-Leverage Layers</strong> (Contracts, Flows, Behavioral Test Matrix, and existing GitHub threads). To run or re-run the full 13-lens + Verifier subagent review on the active PR, copy and send this prompt in your Antigravity chat:
+        </p>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <code id="skillPromptPreview" style="flex:1;padding:6px 8px;background:var(--code-bg);border:1px solid var(--rule);border-radius:4px;font:500 11.5px var(--mono);">Review PR with crv-code-review</code>
+          <button type="button" class="btn" id="copySkillRunPromptBtn">Copy Skill Prompt</button>
+          <button type="button" class="btn" id="copySkillRereviewPromptBtn">Copy Re-review (r2) Prompt</button>
+        </div>
+      </div>
+
+      <div>
+        <div style="font-weight:700;font-size:12px;margin-bottom:6px;">Recent Pull Requests in <code id="recentPrsRepoLabel">target repo</code>:</div>
+        <div id="recentPrsList" style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;">
+          <div style="font-size:12px;color:var(--muted);">Click "Switch PR / Re-run" while running <code>npm start</code> to fetch recent PRs via <code>gh pr list</code>...</div>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="./vendor/mermaid.min.js"></script>
+  <script src="./workbench.js"></script>
+</body>
+</html>

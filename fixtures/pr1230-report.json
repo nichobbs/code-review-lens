@@ -1,0 +1,1791 @@
+{
+  "rawFindings": {
+    "meta": {
+      "title": "PR #1230: feat(loyalty-member-services): member closure lifecycle and multi-membership status evaluation [LP-1230]",
+      "subtitle": "49 files, +2828 -197",
+      "prUrl": "https://github.com/acme/loyalty-platform/pull/1230",
+      "headCommit": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
+      "storageKey": "loyalty-platform-pr1230",
+      "review": {
+        "repo": "acme/loyalty-platform",
+        "pr": 1230,
+        "base": "4953d14614e8d86d10c447ab22a3750cdef2a3f9",
+        "head": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
+        "agent": "Antigravity",
+        "model": "Claude Opus 4.6",
+        "lenses": [
+          "correctness",
+          "adversarial",
+          "security",
+          "data",
+          "contract",
+          "infra",
+          "performance",
+          "tests",
+          "standards",
+          "operability",
+          "docs",
+          "structure",
+          "architecture"
+        ]
+      },
+      "summary": "**What it does.** Changes `loyalty-member-services`, `loyalty-internal-services`, `@acme/loyalty-common-lib`, `@acme/loyalty-topic-schemas-lib`, and `@acme/gcp-lib` to add the `POST /v1/member/close` endpoint, add `DISABLED` to `MemberStatus` and `member_disabled` to the `member-events` Pub/Sub topic, gate beta cohort re-invitation in `/v1/auth` and `/v1/member/onboard`, and reactivate existing `CLOSED` memberships in place.\n\n```mermaid\nflowchart LR\n  subgraph MS[\"loyalty-member-services\"]\n    Auth[\"POST /v1/auth\"]\n    Onb[\"POST /v1/member/onboard\"]\n    Close[\"POST /v1/member/close\"]\n  end\n  subgraph Stores[\"CRM & State Stores\"]\n    HS[\"HubSpot CRM\"]\n    FS[\"Firestore members\"]\n    Topic[\"member-events topic\"]\n  end\n  subgraph IS[\"loyalty-internal-services\"]\n    WH[\"hubspot-webhook\"]\n    Derive[\"derive-member-status\"]\n    Cons[\"Firestore / HubSpot / Braze / TU consumers\"]\n  end\n  Auth & Onb & Close --> HS & FS\n  HS --> WH --> Topic\n  Derive --> Topic --> Cons\n```\n\nInside `loyalty-member-services`, `close-account/service-handler.ts` updates the HubSpot Membership object to `CLOSED` with `closure_date` and `closure_reason` and patches the Firestore `members` document. `auth/service-handler.ts` and `onboard/service-handler.ts` evaluate `DISABLED` vs `CLOSED` memberships, check `FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS` (`feature-flags.ts`) via `FeatureFlagService.getString` (`packages/gcp-lib`), and call `reactivateExistingMember` on `CLOSED` rejoin. In `@acme/loyalty-common-lib`, `HubSpotService.checkEmailExists` inspects all Membership associations for a Contact and returns `true` only when an associated Membership is `ACTIVE`, `RESTRICTED`, or `DISABLED`.\n\nInside `loyalty-internal-services`, `MembershipPipeline` maps HubSpot `DISABLED` changes to `member_disabled` domain events, `derive-member-status` short-circuits when HubSpot status is `DISABLED`, and the Firestore, HubSpot, Braze, and Partner Ingestion consumers subscribe to `member_disabled` and manage `closure_date`, `closure_reason`, `reinvited_cohort`, and `reinvited_at`.\n\n**Coverage.** Thirteen lenses ran in sequence in one agent (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`). No lens was skipped.\n\nA separate verifier subagent (`47fb6fd4-a542-4f27-87d8-039535296f06`) checked all 13 `high` and `medium` findings (`H1`–`H7`, `M1`–`M6`) in a fresh context against the `<head>` working tree and confirmed all 13 (`CONFIRMED`). Zero `high` findings were refuted, zero findings were marked `PLAUSIBLE`, and zero `nit` findings were dropped.\n\nThe standards scan checked `AGENTS.md`, `services/loyalty/AGENTS.md`, `docs/design/loyalty/decisions/adr-005-loyalty-program-member-status.md`, `docs/design/loyalty/engineering-practices/config-values-guidelines.md`, `docs/design/loyalty/engineering-practices/error-handling-pattern.md`, `docs/design/loyalty/engineering-practices/logging-and-tracing.md`, `docs/design/loyalty/engineering-practices/testing-approach.md`, `docs/design/loyalty/solution-designs/member-lifecycle/member-status-and-workflow-states.md`, `docs/design/loyalty/solution-designs/member-lifecycle/join-and-onboard.md`, and `docs/design/loyalty/solution-designs/member-lifecycle/beta-switch-over-and-unified-lifecycle.md`.\n\nThe review did not inspect the external HubSpot CRM workflow configuration that writes `reinvited_cohort` and `reinvited_at` or the downstream Acme Core ingestion service implementation outside this repository.",
+      "summaryPoints": [
+        "correctness: ran, 6 findings (4 high, 2 medium)",
+        "adversarial: ran, 1 finding (1 high)",
+        "security: ran, 2 findings (2 high, merged with correctness)",
+        "data: ran, 1 finding (1 high)",
+        "contract: ran, 1 finding (1 high)",
+        "infra: ran, 1 finding (1 high, merged with contract)",
+        "performance: ran, no findings",
+        "tests: ran, 1 finding (1 medium)",
+        "standards: ran, 2 findings (2 medium)",
+        "operability: ran, 1 finding (1 medium, merged with standards)",
+        "docs: ran, 1 finding (1 medium)",
+        "structure: ran, 1 finding (1 low)",
+        "architecture: ran, 1 design candidate"
+      ]
+    },
+    "issues": [
+      {
+        "id": "H1",
+        "sev": "high",
+        "cat": "correctness, security",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:53",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854437"
+          }
+        ],
+        "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:53",
+        "title": "POST /v1/member/close lets a DISABLED member overwrite their ban with CLOSED",
+        "impact": "**Breaks:** A permanently banned (`DISABLED`) member holding an unexpired `loyalty_token` JWT can call `POST /v1/member/close` and overwrite their status to `CLOSED` in HubSpot and Firestore, making them eligible to re-onboard.\n\n**Because:** `services/loyalty/member-services/src/functions/close-account/service-handler.ts:53` checks only `memberDoc.status === MEMBER_STATUS.CLOSED` before calling `updateMembershipStatus(membership.id, MEMBER_STATUS.CLOSED)` at line 70 and `patchDocument` with `status: MEMBER_STATUS.CLOSED` at line 94.\n\n**Reach:** Every member transitioned to `DISABLED` in HubSpot while their `loyalty_token` JWT remains valid.",
+        "fix": "**Do:** Throw `AccessDeniedError` in `close-account/service-handler.ts` when `memberDoc.status === MEMBER_STATUS.DISABLED` or when the HubSpot membership has `member_status === \"DISABLED\"`.\n\n**Check:** Add a unit test in `close-account/service-handler.test.ts` verifying that `execute` rejects with `AccessDeniedError` and performs no HubSpot or Firestore writes when status is `DISABLED`.",
+        "reasoning": "The solution design (`member-closure-beta-launch.md:260`) specifies returning `403 AccessDeniedError` if `status === \"disabled\"`, and `close-account/close-account.openapi-spec.ts:56` declares `ACCESS_DENIED`, yet the handler never checks for `DISABLED`. Verifier confirmed: `services/loyalty/member-services/src/functions/close-account/service-handler.ts:53` checks only `memberDoc.status === MEMBER_STATUS.CLOSED` before calling `updateMembershipStatus(..., MEMBER_STATUS.CLOSED)` at line 70 and `patchDocument` with `status: MEMBER_STATUS.CLOSED` at line 94 without guarding `MEMBER_STATUS.DISABLED`.",
+        "mermaid": "flowchart LR\n  A[\"DISABLED member with JWT\"] --> B[\"POST /v1/member/close\"]\n  B --> C[\"status === CLOSED check passes\"]\n  C --> D[\"HubSpot & Firestore set to CLOSED\"]"
+      },
+      {
+        "id": "H2",
+        "sev": "high",
+        "cat": "correctness, security",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:973",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854466"
+          }
+        ],
+        "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:973",
+        "title": "reactivateExistingMember overwrites a DISABLED HubSpot membership with ACTIVE",
+        "impact": "**Breaks:** A member who is `DISABLED` in HubSpot CRM and `CLOSED` in Firestore (from pre-PR webhook projection or webhook lag) passes the Firestore re-onboarding gate and overwrites their HubSpot `DISABLED` ban with `ACTIVE`.\n\n**Because:** `services/loyalty/member-services/src/functions/onboard/service-handler.ts:972-977` fetches the HubSpot membership via `getMembershipByMemberId(memberId)` and calls `updateMembershipStatus(membership.id, toHubSpotMemberStatus(MEMBER_STATUS.ACTIVE))` without inspecting `membership.properties?.member_status`.\n\n**Reach:** Every `CLOSED` Firestore member whose HubSpot Membership record has `member_status === \"DISABLED\"` when `POST /v1/member/onboard` runs.",
+        "fix": "**Do:** Check `fromHubSpotMemberStatus(membership.properties?.member_status) === MEMBER_STATUS.DISABLED` in `reactivateExistingMember` before calling `updateMembershipStatus`, repair Firestore to `MEMBER_STATUS.DISABLED`, and throw `AccessDeniedError`.\n\n**Check:** Add a test in `onboard/service-handler.test.ts` where Firestore has `status: \"CLOSED\"` and `getMembershipByMemberId` returns `member_status: \"DISABLED\"`, asserting `AccessDeniedError` is thrown.",
+        "reasoning": "At `<base>`, `MembershipPipeline` mapped HubSpot `DISABLED` to `MEMBER_STATUS.CLOSED` in Firestore (`membership-pipeline.ts:29` in the diff), so existing banned members have `status: \"CLOSED\"` in Firestore. Verifier confirmed: `services/loyalty/member-services/src/functions/onboard/service-handler.ts:973` calls `updateMembershipStatus(membership.id, toHubSpotMemberStatus(MEMBER_STATUS.ACTIVE))` without checking if `membership.properties?.member_status` is `DISABLED`.",
+        "mermaid": "flowchart LR\n  A[\"Firestore CLOSED / HubSpot DISABLED\"] --> B[\"POST /v1/member/onboard\"]\n  B --> C[\"reactivateExistingMember\"]\n  C --> D[\"HubSpot overwritten to ACTIVE\"]"
+      },
+      {
+        "id": "H3",
+        "sev": "high",
+        "cat": "correctness",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854396"
+          }
+        ],
+        "loc": "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103",
+        "title": "derive-member-status reopens voluntarily CLOSED memberships on partner updates",
+        "impact": "**Breaks:** A member who voluntarily closes their loyalty account while keeping their Linkt toll account open is reactivated in HubSpot, Firestore, and Braze when a `partner_account_status_changed` event arrives.\n\n**Because:** `services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103` returns early only when `currentStatus === MEMBER_STATUS.DISABLED`, so a `CLOSED` membership proceeds to `deriveStatus(partnerAccountStatus)` at line 110 and publishes `member_activated` at line 128.\n\n**Reach:** Every voluntarily closed member whose linked acme partner account emits `partner_account_status_changed` with `active`, `activeInArrears`, or `suspended`.",
+        "fix": "**Do:** Guard `CLOSED` memberships in `derive-member-status/service-handler.ts:103` so partner account status changes do not transition a `CLOSED` member to `ACTIVE` or `RESTRICTED`.\n\n**Check:** Add a test case in `derive-member-status/service-handler.test.ts` with `hubspotStatus: \"CLOSED\"` and `MOCK_ACTIVE_EVENT` asserting `mockPublishDomainEvent` is not called.",
+        "reasoning": "Voluntary loyalty closure leaves the customer's Linkt toll account open (`member-closure-beta-launch.md:196`), and `consume-member-account-status-firestore:51` and `consume-member-account-status-hubspot:74` apply `member_activated` while wiping `closure_date`, `closure_reason`, `reinvited_cohort`, and `reinvited_at`. Verifier confirmed: `services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103` short-circuits only when `currentStatus === MEMBER_STATUS.DISABLED`, so a `CLOSED` membership proceeds to `deriveStatus(partnerAccountStatus)` at line 110 and emits `member_activated` at line 128.",
+        "mermaid": "flowchart LR\n  A[\"partner_account_status_changed\"] --> B[\"derive-member-status\"]\n  B --> C[\"currentStatus === CLOSED passes line 103\"]\n  C --> D[\"Emits member_activated & reopens member\"]"
+      },
+      {
+        "id": "H4",
+        "sev": "high",
+        "cat": "data",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854523"
+          }
+        ],
+        "loc": "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65",
+        "title": "HubSpot closure webhook overwrites saved closure_reason in Firestore with null",
+        "impact": "**Breaks:** When a member closes their account via `POST /v1/member/close` with a `reason` or a CSA agent sets `closure_reason` in HubSpot, the subsequent HubSpot `member_status = CLOSED` webhook overwrites `closure_reason` in Firestore with `null`.\n\n**Because:** `services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts:256-261` emits `member_closed` and `member_disabled` without `reason`, and `consume-member-account-status-firestore/service-handler.ts:65` writes `closure_reason: reason ?? null` (`null`) to Firestore.\n\n**Reach:** Every closure via `POST /v1/member/close` with a `reason` and every agent-initiated closure or disablement in HubSpot.",
+        "fix": "**Do:** Hydrate `closure_reason` in `MembershipPipeline` (`membership-pipeline.ts:95, 256`) so `member_closed` and `member_disabled` events include `reason`, and omit `closure_reason` from `patchDocument` and `updateMembershipStatus` when `reason === undefined`.\n\n**Check:** Add unit tests in `membership-pipeline.test.ts` and `consume-member-account-status-firestore/service-handler.test.ts` verifying `closure_reason` is preserved.",
+        "reasoning": "In addition, `packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:1776` writes `closure_reason: options?.closureReason ?? \"\"` on `CLOSED`/`DISABLED` updates, which clears any existing HubSpot `closure_reason` to `\"\"` when `consume-member-account-status-hubspot:78` processes a status event without `reason`. Verifier confirmed: `services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts:256` omits `reason` from `member_closed` events, causing `services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65` to overwrite `closure_reason` with `null`."
+      },
+      {
+        "id": "H5",
+        "sev": "high",
+        "cat": "contract, infra",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/internal-services/src/modules/api-module.ts:787",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854415"
+          },
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts:115",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854375"
+          }
+        ],
+        "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10",
+        "title": "Partner Ingestion misses reactivation and reuses idempotency_key on 2nd close",
+        "impact": "**Breaks:** When a closed member re-onboards, Acme Core never receives an `ACTIVE` ingestion update, and if the member closes their account a second time, the second `member_closed` call sends the same `idempotency_key` as the first closure.\n\n**Because:** `consume-member-onoffboard-tu-ingestion/models.ts:10-14` and `api-module.ts:787` exclude `member_activated` (the only event emitted when `reactivateExistingMember` updates HubSpot), and `consume-member-onoffboard-tu-ingestion/service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}`.\n\n**Reach:** Every closed member who reactivates via `POST /v1/member/onboard`, and every member who closes their account more than once.",
+        "fix": "**Do:** Add `member_activated` to `api-module.ts:787`, `models.ts:10`, and `service-handler.ts:69` (mapping it to `ACTIVE`), and include `event.idempotencyKey` in the SHA-256 hash input at `service-handler.ts:124`.\n\n**Check:** Add unit tests in `consume-member-onoffboard-tu-ingestion/service-handler.test.ts` verifying `member_activated` sends `status: \"ACTIVE\"` and two `member_closed` events produce distinct `idempotency_key` values.",
+        "reasoning": "Contradicts `member-closure-beta-launch.md:135, 343, 356`, which specifies that `consume-member-onoffboard-tu-ingestion` notifies acme on reactivation. Verifier confirmed: `services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10` and `api-module.ts:787` exclude `member_activated`, and `service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}` so a second closure reuses the same `idempotency_key`."
+      },
+      {
+        "id": "H6",
+        "sev": "high",
+        "cat": "correctness",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:94",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854549"
+          },
+          {
+            "who": "Copilot",
+            "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:227",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854576"
+          }
+        ],
+        "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:94",
+        "title": "Beta cohort re-invitation is never synced to Firestore and is blocked by auth",
+        "impact": "**Breaks:** A closed member re-invited in HubSpot via `reinvited_cohort` and `reinvited_at` cannot re-onboard during beta, while a member with an inactive cohort passes `isMemberReinvitedToActiveCohort` whenever `reinvitedAt > closureDate`.\n\n**Because:** No webhook pipeline syncs `reinvited_cohort` or `reinvited_at` into Firestore (`auth/service-handler.ts:225-226`); `auth/service-handler.ts:94` still runs `checkPreOnboardingAccess` for eligible `CLOSED` members; and `auth/service-handler.ts:230-232` (and `onboard/service-handler.ts:1031-1033`) returns `true` on `reinvitedAt > closureDate` before checking `activeCohorts`.\n\n**Reach:** Every closed member evaluated for beta re-invitation in `/v1/auth` and `/v1/member/onboard`.",
+        "fix": "**Do:** Sync `reinvited_cohort` and `reinvited_at` into Firestore, skip `checkPreOnboardingAccess` in `auth/service-handler.ts:94` for eligible `CLOSED` members, and require `reinvited_cohort` to match `activeCohorts`.\n\n**Check:** Add unit tests in `auth/service-handler.test.ts` for a `CLOSED` member with a declined invitation or inactive `reinvited_cohort`.",
+        "reasoning": "Also note that `close-account/service-handler.ts:62` writes `closure_date` as `YYYY-MM-DD` while `reinvited_at` is an ISO timestamp (`YYYY-MM-DDTHH:mm:ss.sssZ`), so lexicographical `reinvitedAt > closureDate` evaluates to `true` on the same UTC date even if the account was closed after `reinvited_at`; normalize both timestamps before comparing. Verifier confirmed: `services/loyalty/member-services/src/functions/auth/service-handler.ts:94` runs `checkPreOnboardingAccess` for eligible `CLOSED` members (blocking on declined invitation or missing audience), no pipeline syncs `reinvited_cohort`/`reinvited_at` to Firestore, and line 230 returns `true` on `reinvitedAt > closureDate` before checking `activeCohorts`."
+      },
+      {
+        "id": "H7",
+        "sev": "high",
+        "cat": "adversarial",
+        "verify": "CONFIRMED",
+        "earlier": [
+          {
+            "who": "Copilot",
+            "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:404",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854343"
+          },
+          {
+            "who": "Copilot",
+            "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:474",
+            "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854488"
+          }
+        ],
+        "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:404",
+        "title": "checkEmailExists swallows HubSpot errors as exists:false and 409s on 0-membership contacts",
+        "impact": "**Breaks:** A HubSpot error on the association or membership batch read makes `GET /v1/member/check-email` return `{ exists: false }` for `ACTIVE` or `DISABLED` members, and a Contact with zero memberships returns `{ exists: false }` before failing with `409 Conflict` at `POST /v1/member/onboard`.\n\n**Because:** `packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:397-404` and `441-450` catch all errors and leave `allMemberships` empty, which `hubspot-service.ts:464-475` maps to `false`, while `onboard/service-handler.ts:726` calls `createContact`.\n\n**Reach:** Every `GET /v1/member/check-email` call when HubSpot returns 429/5xx, and every HubSpot Contact with zero memberships.",
+        "fix": "**Do:** Rethrow errors in `fetchContactMembershipIds` (`hubspot-service.ts:441`) and the membership batch read (`hubspot-service.ts:397`), and either return `exists: true` when a Contact has zero memberships or reuse the existing Contact in `onboard`.\n\n**Check:** Update `hubspot-service.test.ts` so association and membership batch-read failures reject with `HubSpotError` rather than resolving to `false`.",
+        "reasoning": "Verifier confirmed: `packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:397` and `441` catch batch-read and association errors and fall through to `evaluateMembershipStatusesForEmailCheck` (line 464), which returns `{ exists: false }` whenever `allMemberships` is empty."
+      },
+      {
+        "id": "M1",
+        "sev": "medium",
+        "cat": "correctness",
+        "verify": "CONFIRMED",
+        "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:86",
+        "title": "close-account marks Firestore CLOSED and returns 200 when HubSpot lookup misses",
+        "impact": "**Breaks:** When `getMembershipByMemberId(memberId)` returns `undefined` during `POST /v1/member/close`, the handler marks Firestore `CLOSED` and returns `200 OK`, leaving HubSpot, Braze, and Partner Ingestion `ACTIVE` with no retry path.\n\n**Because:** `services/loyalty/member-services/src/functions/close-account/service-handler.ts:86-101` logs a warning when `membership` is `undefined`, patches Firestore `status: MEMBER_STATUS.CLOSED` at line 94, and returns `{ success: true }`, which causes any subsequent retry to short-circuit at line 53.\n\n**Reach:** Any `POST /v1/member/close` call where HubSpot search indexing lags or the CRM membership record is missing.",
+        "fix": "**Do:** Throw an error (such as `NotFoundError` or `ServiceError`) when `getMembershipByMemberId` returns `undefined` in `close-account/service-handler.ts:86` before patching Firestore.\n\n**Check:** Update `close-account/service-handler.test.ts:107` to assert that a missing HubSpot membership rejects and does not call `mockMembersCollection.patchDocument`.",
+        "reasoning": "Because HubSpot is not updated when `membership` is `undefined`, no HubSpot webhook fires to emit `member_closed`, and patching Firestore to `CLOSED` blocks retries at line 53. Verifier confirmed: `services/loyalty/member-services/src/functions/close-account/service-handler.ts:86` logs a warning when `membership` is `undefined` and still patches Firestore to `MEMBER_STATUS.CLOSED` at line 93, causing subsequent retries to short-circuit at line 53 while HubSpot remains `ACTIVE`."
+      },
+      {
+        "id": "M2",
+        "sev": "medium",
+        "cat": "correctness",
+        "verify": "CONFIRMED",
+        "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:988",
+        "title": "reactivateExistingMember does not update HubSpot Contact or Partner Account",
+        "impact": "**Breaks:** When a closed member re-onboards with an updated email, name, `existingBauMember` flag, or `linktAccountStatus`, `reactivateExistingMember` sends the new profile fields to Braze while leaving the HubSpot Contact and Partner Account stale.\n\n**Because:** `services/loyalty/member-services/src/functions/onboard/service-handler.ts:988-1005` updates Braze with `validatedRequest` fields without updating the HubSpot Contact or Partner Account, and if `membership` is `undefined` at line 979 it still marks Firestore `ACTIVE` while leaving HubSpot `CLOSED`.\n\n**Reach:** Any returning `CLOSED` member whose re-onboarding request changes contact details or partner account status, or whose HubSpot membership lookup misses.",
+        "fix": "**Do:** Throw an error if `membership` is missing at `onboard/service-handler.ts:979`, and update the existing HubSpot Contact properties (`email`, `firstname`, `lastname`, `existing_bau_member`) and Partner Account status in `reactivateExistingMember`.\n\n**Check:** Add a unit test in `onboard/service-handler.test.ts` verifying `reactivateExistingMember` updates HubSpot Contact details and throws if `getMembershipByMemberId` returns `undefined`.",
+        "reasoning": "New onboarding (`onboard/service-handler.ts:716-733`) writes `email`, `firstname`, `lastname`, and `existing_bau_member` to both HubSpot and Braze, whereas `reactivateExistingMember` writes them only to Braze. Verifier confirmed: `services/loyalty/member-services/src/functions/onboard/service-handler.ts:979` logs a warning when `membership` is missing yet marks Firestore `ACTIVE` at line 1004, and lines 988-1001 update Braze with new request fields without updating the HubSpot Contact or Partner Account."
+      },
+      {
+        "id": "M3",
+        "sev": "medium",
+        "cat": "standards, operability",
+        "verify": "CONFIRMED",
+        "guide": "config-values-guidelines.md — Feature flags vs structured configuration",
+        "loc": "packages/gcp-lib/src/util/feature-flag-service.ts:69",
+        "title": "JSON cohort array is stored as a featureflag_ key and logged via getBoolean",
+        "impact": "**Breaks:** Storing a JSON string array under `featureflag_loyalty_member_services_configure_beta_active_cohorts` violates the repository's configuration standard and causes `FeatureFlagService.logFlagValues` to log the parameter as `false` on every refresh.\n\n**Because:** `docs/design/loyalty/engineering-practices/config-values-guidelines.md` and `packages/gcp-lib/src/util/feature-flag-service.ts:20-23` restrict `FeatureFlagService` to boolean `featureflag_*` flags, and `feature-flag-service.ts:145-150` calls `config.getBoolean(key)` on every `featureflag_*` key.\n\n**Reach:** Every Remote Config template refresh in `loyalty-member-services` when `featureflag_loyalty_member_services_configure_beta_active_cohorts` is configured.",
+        "fix": "**Do:** Move the active beta cohorts list into `MemberServicesConfig` (`GcpConfig`) validated with a Zod `z.array(z.string())` schema, or handle string parameters in `logFlagValues`.\n\n**Check:** Verify `FeatureFlagService.logFlagValues` does not log non-boolean cohort arrays as `false` and `MemberServicesConfig` validates the cohort list.",
+        "reasoning": "Verifier confirmed: `packages/gcp-lib/src/util/feature-flag-service.ts:148` calls `config.getBoolean(key)` on every `featureflag_` parameter in `logFlagValues`, evaluating the JSON string array `featureflag_loyalty_member_services_configure_beta_active_cohorts` as `false` and violating the boolean-only contract at lines 20-23."
+      },
+      {
+        "id": "M4",
+        "sev": "medium",
+        "cat": "standards",
+        "verify": "CONFIRMED",
+        "guide": "services/loyalty/AGENTS.md — ADR and Solution Design documentation rules",
+        "loc": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:3",
+        "title": "PR contradicts Accepted ADR-005 without superseding it and adds a parallel Accepted doc",
+        "impact": "**Breaks:** `adr-005-loyalty-program-member-status.md` (`status: Accepted`) still defines a 3-value `MemberStatus`, while the PR implements 4 values (`DISABLED`) in a new lifecycle doc marked `Accepted` (`last_reviewed: 2026-10-01`).\n\n**Because:** `member-status.ts:13` adds `DISABLED` without a superseding ADR, and `member-closure-beta-launch.md:1-6` adds a fourth lifecycle doc with `status: Accepted` instead of `Draft` and instead of updating existing lifecycle docs in place per `services/loyalty/AGENTS.md`.\n\n**Reach:** Engineers and agents consulting `docs/design/loyalty/decisions/` or `docs/design/loyalty/solution-designs/member-lifecycle/`.",
+        "fix": "**Do:** Add an ADR superseding `ADR-005` for the 4-state `MemberStatus` model, set new design frontmatter `status: Draft` with the actual review date until PR approval, and update the existing lifecycle design docs in place.\n\n**Check:** Confirm `ADR-005` links to its superseding ADR and frontmatter fields match `services/loyalty/AGENTS.md`.",
+        "reasoning": "Existing accepted lifecycle docs (`member-status-and-workflow-states.md`, `join-and-onboard.md`, `beta-switch-over-and-unified-lifecycle.md`) define the same lifecycle flows. Verifier confirmed: `docs/design/loyalty/decisions/adr-005-loyalty-program-member-status.md:52` defines a 3-value `MemberStatus` without a superseding ADR for `DISABLED`, and `docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:3-5` is added as a separate file with `status: Accepted` and `last_reviewed: 2026-10-01`."
+      },
+      {
+        "id": "M5",
+        "sev": "medium",
+        "cat": "docs",
+        "verify": "CONFIRMED",
+        "loc": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:261",
+        "title": "Design doc contradicts code on close-account Firestore writes and flag naming",
+        "impact": "**Breaks:** Readers following `member-closure-beta-launch.md` get an inaccurate specification of how `POST /v1/member/close` persists state and what the active cohorts flag is named in code and Remote Config.\n\n**Because:** `member-closure-beta-launch.md:34, 84-94, 261-271` states that `POST /v1/member/close` only mutates HubSpot CRM and relies on the Webhook Translator to update Firestore, whereas `close-account/service-handler.ts:94` patches Firestore directly; and lines 291-294 omit `_configure_` from `FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS` (`feature-flags.ts:12-13`).\n\n**Reach:** Operators configuring Firebase Remote Config parameters and engineers maintaining `POST /v1/member/close`.",
+        "fix": "**Do:** Align `member-closure-beta-launch.md` and `close-account/service-handler.ts` on whether `POST /v1/member/close` patches Firestore directly, and update lines 291-294 to match `feature-flags.ts:12-13`.\n\n**Check:** Search `member-closure-beta-launch.md` for `beta_active_cohorts` and confirm the constant and key match `services/loyalty/member-services/src/common/feature-flags.ts:12-13`.",
+        "reasoning": "Verifier confirmed: `docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:261-271` states `close-account` only mutates HubSpot and relies on webhook fanout for Firestore (contradicting `close-account/service-handler.ts:93`), and lines 291-293 omit `_configure_` from the flag name defined in `feature-flags.ts:12-13`."
+      },
+      {
+        "id": "M6",
+        "sev": "medium",
+        "cat": "tests",
+        "verify": "CONFIRMED",
+        "loc": "services/loyalty/member-services/test/functions/onboard/service-handler.test.ts:435",
+        "title": "Reactivation and DISABLED derivation paths lack assertions and branch coverage",
+        "impact": "**Breaks:** Regressions in `reactivateExistingMember` (HubSpot, Braze, and Firestore updates) and in `derive-member-status` (`DISABLED` short-circuit) will not fail any test.\n\n**Because:** `onboard/service-handler.test.ts:435-476` omits `hubspot_customer_id` (leaving lines 989-998 of `onboard/service-handler.ts` unexecuted) and asserts no HubSpot, Braze, or Firestore calls, and `derive-member-status/service-handler.test.ts` has no test for `currentStatus === MEMBER_STATUS.DISABLED` (`derive-member-status/service-handler.ts:103`).\n\n**Reach:** `onboard/service-handler.ts:963-1019` and `derive-member-status/service-handler.ts:103-111`.",
+        "fix": "**Do:** Add `hubspot_customer_id` to the mocked `CLOSED` member in `onboard/service-handler.test.ts:442`, assert the HubSpot, Braze, and Firestore calls, and add a `DISABLED` test to `derive-member-status/service-handler.test.ts`.\n\n**Check:** Confirm that removing `patchDocument` in `reactivateExistingMember` or the `DISABLED` check in `derive-member-status` fails the tests.",
+        "reasoning": "Specifically, `reactivateExistingMember` calls `updateMembershipStatus`, `batchCreatePolicyAcceptances`, `upsertCommunicationPreference`, `createBrazeMemberProfile`, and `patchDocument` (while skipping `createMember`). Verifier confirmed: `services/loyalty/member-services/test/functions/onboard/service-handler.test.ts:435-476` omits `hubspot_customer_id` and makes no assertions on HubSpot, Braze, or Firestore calls in `reactivateExistingMember`, and `derive-member-status/service-handler.test.ts` has no test case for `DISABLED`."
+      },
+      {
+        "id": "L1",
+        "sev": "low",
+        "cat": "structure",
+        "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:1021",
+        "title": "isMemberReinvitedToActiveCohort is duplicated in auth and onboard handlers",
+        "impact": "**Breaks:** Any change to beta cohort re-invitation parsing or date comparison must be updated in two places in `member-services`, risking divergence between `/v1/auth` and `/v1/member/onboard`.\n\n**Because:** `services/loyalty/member-services/src/functions/auth/service-handler.ts:222-258` and `services/loyalty/member-services/src/functions/onboard/service-handler.ts:1021-1059` contain duplicate implementations of `isMemberReinvitedToActiveCohort`.\n\n**Reach:** `services/loyalty/member-services/src/functions/auth/service-handler.ts` and `services/loyalty/member-services/src/functions/onboard/service-handler.ts`.",
+        "fix": "**Do:** Extract `isMemberReinvitedToActiveCohort` into a shared helper under `services/loyalty/member-services/src/common/` and call it from both `auth` and `onboard`.\n\n**Check:** Run unit tests for both `auth` and `onboard` against the shared helper.",
+        "reasoning": "Both handlers live in `services/loyalty/member-services` and already import `@common/feature-flags`."
+      },
+      {
+        "id": "D1",
+        "sev": "struct",
+        "cat": "architecture",
+        "loc": "packages/loyalty-topic-schemas-lib/src/member-events-topic/member-status.ts:10",
+        "title": "Centralise member lifecycle state transitions and eligibility guards",
+        "strength": "Strong",
+        "scope": "Follow-up",
+        "deps": "in-process",
+        "impact": "**Breaks:** Changing a member status (`DISABLED`, `CLOSED`) requires coordinated edits across 10+ handlers in `member-services` and `internal-services`, and missing one check lets banned members reactivate or partner updates reopen closed accounts.\n\n**Because:** Transition rules and re-onboarding eligibility are open-coded separately across `close-account/service-handler.ts:53`, `onboard/service-handler.ts:328,973`, `auth/service-handler.ts:137`, and `derive-member-status/service-handler.ts:103`.\n\n**Reach:** Every endpoint and consumer in `loyalty-member-services` and `loyalty-internal-services` that transitions `MemberStatus`.",
+        "fix": "**Do:** Introduce a pure `MemberLifecyclePolicy` module in `packages/loyalty-common-lib` that owns allowed status transitions (`canTransition(from, to, actor)`), terminal-status guards (`isTerminalStatus`), and re-onboarding eligibility (`canReonboard(memberDoc, activeCohorts)`), so all handlers call one policy.\n\n**Check:** Unit-test the transition matrix in `loyalty-common-lib` and verify that `close-account`, `onboard`, `auth`, and `derive-member-status` delegate status decisions to it.",
+        "reasoning": "Four commits on this PR branch (`1aa0b96`, `bb54b62`, `5144a63`, `778ebad`) had to patch `DISABLED` handling across different consumers one by one, and `H1`, `H2`, `H3`, and `H6` in this review come from handlers disagreeing on allowed transitions from `DISABLED` and `CLOSED`.",
+        "mermaid": "flowchart LR\n  subgraph Before\n    H1[\"close-account\"] --> S1[\"inline status checks\"]\n    H2[\"onboard / auth\"] --> S2[\"inline status checks\"]\n    H3[\"derive-member-status\"] --> S3[\"inline status checks\"]\n  end\n  subgraph After\n    H4[\"close-account\"] --> P[\"MemberLifecyclePolicy\"]\n    H5[\"onboard / auth\"] --> P\n    H6[\"derive-member-status\"] --> P\n  end\n  Before ~~~ After"
+      }
+    ]
+  },
+  "DATA": [
+    {
+      "id": "H1",
+      "sev": "high",
+      "cat": "correctness, security",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:53",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854437"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:53",
+      "title": "POST /v1/member/close lets a DISABLED member overwrite their ban with CLOSED",
+      "impact": "<p><strong>Breaks:</strong> A permanently banned (<code>DISABLED</code>) member holding an unexpired <code>loyalty_token</code> JWT can call <code>POST /v1/member/close</code> and overwrite their status to <code>CLOSED</code> in HubSpot and Firestore, making them eligible to re-onboard.</p><p><strong>Because:</strong> <code>services/loyalty/member-services/src/functions/close-account/service-handler.ts:53</code> checks only <code>memberDoc.status === MEMBER_STATUS.CLOSED</code> before calling <code>updateMembershipStatus(membership.id, MEMBER_STATUS.CLOSED)</code> at line 70 and <code>patchDocument</code> with <code>status: MEMBER_STATUS.CLOSED</code> at line 94.</p><p><strong>Reach:</strong> Every member transitioned to <code>DISABLED</code> in HubSpot while their <code>loyalty_token</code> JWT remains valid.</p>",
+      "fix": "<p><strong>Do:</strong> Throw <code>AccessDeniedError</code> in <code>close-account/service-handler.ts</code> when <code>memberDoc.status === MEMBER_STATUS.DISABLED</code> or when the HubSpot membership has <code>member_status === \"DISABLED\"</code>.</p><p><strong>Check:</strong> Add a unit test in <code>close-account/service-handler.test.ts</code> verifying that <code>execute</code> rejects with <code>AccessDeniedError</code> and performs no HubSpot or Firestore writes when status is <code>DISABLED</code>.</p>",
+      "reasoning": "<p>The solution design (<code>member-closure-beta-launch.md:260</code>) specifies returning <code>403 AccessDeniedError</code> if <code>status === \"disabled\"</code>, and <code>close-account/close-account.openapi-spec.ts:56</code> declares <code>ACCESS_DENIED</code>, yet the handler never checks for <code>DISABLED</code>.</p><p>Verifier confirmed: <code>services/loyalty/member-services/src/functions/close-account/service-handler.ts:53</code> checks only <code>memberDoc.status === MEMBER_STATUS.CLOSED</code> before calling <code>updateMembershipStatus(..., MEMBER_STATUS.CLOSED)</code> at line 70 and <code>patchDocument</code> with <code>status: MEMBER_STATUS.CLOSED</code> at line 94 without guarding <code>MEMBER_STATUS.DISABLED</code>.</p>",
+      "mermaid": "flowchart LR\n  A[\"DISABLED member with JWT\"] --> B[\"POST /v1/member/close\"]\n  B --> C[\"status === CLOSED check passes\"]\n  C --> D[\"HubSpot & Firestore set to CLOSED\"]",
+      "html": "<div class=\"diaslot\"></div>",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/close-account/service-handler.ts",
+        "targetLine": 53,
+        "hunkHeader": "@@ -48,14 +48,26 @@ export class CloseAccountServiceHandler {",
+        "lines": [
+          {
+            "type": "ctx",
+            "oldNumber": 49,
+            "newNumber": 49,
+            "content": "    const memberDoc = await this.membersCollection.getDocument(memberId);"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 50,
+            "newNumber": 50,
+            "content": "    if (!memberDoc) {"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 51,
+            "newNumber": 51,
+            "content": "      throw new NotFoundError(\"Member not found\");"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 52,
+            "newNumber": 52,
+            "content": "    }"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 53,
+            "content": "    if (memberDoc.status === MEMBER_STATUS.CLOSED) {",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 54,
+            "content": "      this.logger.info(\"Member already closed, returning idempotent success\", { memberId });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 55,
+            "content": "      return { success: true };"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 56,
+            "content": "    }"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 57,
+            "content": "    // MISSING GUARD: memberDoc.status === MEMBER_STATUS.DISABLED is not rejected!"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 69,
+            "content": "    if (membership) {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 70,
+            "content": "      await this.hubspotService.updateMembershipStatus(membership.id, MEMBER_STATUS.CLOSED, {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 71,
+            "content": "        closureDate, closureReason: request.reason"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 72,
+            "content": "      });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 73,
+            "content": "    }"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H2",
+      "sev": "high",
+      "cat": "correctness, security",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:973",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854466"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:973",
+      "title": "reactivateExistingMember overwrites a DISABLED HubSpot membership with ACTIVE",
+      "impact": "<p><strong>Breaks:</strong> A member who is <code>DISABLED</code> in HubSpot CRM and <code>CLOSED</code> in Firestore (from pre-PR webhook projection or webhook lag) passes the Firestore re-onboarding gate and overwrites their HubSpot <code>DISABLED</code> ban with <code>ACTIVE</code>.</p><p><strong>Because:</strong> <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts:972-977</code> fetches the HubSpot membership via <code>getMembershipByMemberId(memberId)</code> and calls <code>updateMembershipStatus(membership.id, toHubSpotMemberStatus(MEMBER_STATUS.ACTIVE))</code> without inspecting <code>membership.properties?.member_status</code>.</p><p><strong>Reach:</strong> Every <code>CLOSED</code> Firestore member whose HubSpot Membership record has <code>member_status === \"DISABLED\"</code> when <code>POST /v1/member/onboard</code> runs.</p>",
+      "fix": "<p><strong>Do:</strong> Check <code>fromHubSpotMemberStatus(membership.properties?.member_status) === MEMBER_STATUS.DISABLED</code> in <code>reactivateExistingMember</code> before calling <code>updateMembershipStatus</code>, repair Firestore to <code>MEMBER_STATUS.DISABLED</code>, and throw <code>AccessDeniedError</code>.</p><p><strong>Check:</strong> Add a test in <code>onboard/service-handler.test.ts</code> where Firestore has <code>status: \"CLOSED\"</code> and <code>getMembershipByMemberId</code> returns <code>member_status: \"DISABLED\"</code>, asserting <code>AccessDeniedError</code> is thrown.</p>",
+      "reasoning": "<p>At <code>&lt;base&gt;</code>, <code>MembershipPipeline</code> mapped HubSpot <code>DISABLED</code> to <code>MEMBER_STATUS.CLOSED</code> in Firestore (<code>membership-pipeline.ts:29</code> in the diff), so existing banned members have <code>status: \"CLOSED\"</code> in Firestore. Verifier confirmed: <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts:973</code> calls <code>updateMembershipStatus(membership.id, toHubSpotMemberStatus(MEMBER_STATUS.ACTIVE))</code> without checking if <code>membership.properties?.member_status</code> is <code>DISABLED</code>.</p>",
+      "mermaid": "flowchart LR\n  A[\"Firestore CLOSED / HubSpot DISABLED\"] --> B[\"POST /v1/member/onboard\"]\n  B --> C[\"reactivateExistingMember\"]\n  C --> D[\"HubSpot overwritten to ACTIVE\"]",
+      "html": "<div class=\"diaslot\"></div>",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/onboard/service-handler.ts",
+        "targetLine": 973,
+        "hunkHeader": "@@ -963,10 +963,24 @@ private async reactivateExistingMember(",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 969,
+            "content": "    const membership = await this.hubspotService.getMembershipByMemberId(memberId);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 970,
+            "content": "    if (membership) {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 971,
+            "content": "      // Does not check if membership.properties?.member_status === \"DISABLED\""
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 972,
+            "content": "      await this.hubspotService.updateMembershipStatus("
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 973,
+            "content": "        membership.id, toHubSpotMemberStatus(MEMBER_STATUS.ACTIVE)",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 974,
+            "content": "      );"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 975,
+            "content": "    }"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H3",
+      "sev": "high",
+      "cat": "correctness",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854396"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103",
+      "title": "derive-member-status reopens voluntarily CLOSED memberships on partner updates",
+      "impact": "<p><strong>Breaks:</strong> A member who voluntarily closes their loyalty account while keeping their Linkt toll account open is reactivated in HubSpot, Firestore, and Braze when a <code>partner_account_status_changed</code> event arrives.</p><p><strong>Because:</strong> <code>services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103</code> returns early only when <code>currentStatus === MEMBER_STATUS.DISABLED</code>, so a <code>CLOSED</code> membership proceeds to <code>deriveStatus(partnerAccountStatus)</code> at line 110 and publishes <code>member_activated</code> at line 128.</p><p><strong>Reach:</strong> Every voluntarily closed member whose linked acme partner account emits <code>partner_account_status_changed</code> with <code>active</code>, <code>activeInArrears</code>, or <code>suspended</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Guard <code>CLOSED</code> memberships in <code>derive-member-status/service-handler.ts:103</code> so partner account status changes do not transition a <code>CLOSED</code> member to <code>ACTIVE</code> or <code>RESTRICTED</code>.</p><p><strong>Check:</strong> Add a test case in <code>derive-member-status/service-handler.test.ts</code> with <code>hubspotStatus: \"CLOSED\"</code> and <code>MOCK_ACTIVE_EVENT</code> asserting <code>mockPublishDomainEvent</code> is not called.</p>",
+      "reasoning": "<p>Voluntary loyalty closure leaves the customer's Linkt toll account open (<code>member-closure-beta-launch.md:196</code>), and <code>consume-member-account-status-firestore:51</code> and <code>consume-member-account-status-hubspot:74</code> apply <code>member_activated</code> while wiping <code>closure_date</code>, <code>closure_reason</code>, <code>reinvited_cohort</code>, and <code>reinvited_at</code>.</p><p>Verifier confirmed: <code>services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts:103</code> short-circuits only when <code>currentStatus === MEMBER_STATUS.DISABLED</code>, so a <code>CLOSED</code> membership proceeds to <code>deriveStatus(partnerAccountStatus)</code> at line 110 and emits <code>member_activated</code> at line 128.</p>",
+      "mermaid": "flowchart LR\n  A[\"partner_account_status_changed\"] --> B[\"derive-member-status\"]\n  B --> C[\"currentStatus === CLOSED passes line 103\"]\n  C --> D[\"Emits member_activated & reopens member\"]",
+      "html": "<div class=\"diaslot\"></div>",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts",
+        "targetLine": 103,
+        "hunkHeader": "@@ -98,12 +98,19 @@ export class DeriveMemberStatusHandler {",
+        "lines": [
+          {
+            "type": "ctx",
+            "oldNumber": 100,
+            "newNumber": 100,
+            "content": "    const currentStatus = fromHubSpotMemberStatus(membership.properties.member_status);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 101,
+            "content": "    // Short-circuits only on DISABLED — voluntarily CLOSED members fall through!"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 103,
+            "content": "    if (currentStatus === MEMBER_STATUS.DISABLED) {",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 104,
+            "content": "      this.logger.info(\"Skipping status derivation for DISABLED member\", { memberId });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 105,
+            "content": "      return;"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 106,
+            "content": "    }"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 109,
+            "newNumber": 110,
+            "content": "    const nextStatus = this.deriveStatus(event.data.partnerAccountStatus);"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 127,
+            "newNumber": 128,
+            "content": "    await this.publishDomainEvent(\"member_activated\", { memberId, status: nextStatus });"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H4",
+      "sev": "high",
+      "cat": "data",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854523"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65",
+      "title": "HubSpot closure webhook overwrites saved closure_reason in Firestore with null",
+      "impact": "<p><strong>Breaks:</strong> When a member closes their account via <code>POST /v1/member/close</code> with a <code>reason</code> or a CSA agent sets <code>closure_reason</code> in HubSpot, the subsequent HubSpot <code>member_status = CLOSED</code> webhook overwrites <code>closure_reason</code> in Firestore with <code>null</code>.</p><p><strong>Because:</strong> <code>services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts:256-261</code> emits <code>member_closed</code> and <code>member_disabled</code> without <code>reason</code>, and <code>consume-member-account-status-firestore/service-handler.ts:65</code> writes <code>closure_reason: reason ?? null</code> (<code>null</code>) to Firestore.</p><p><strong>Reach:</strong> Every closure via <code>POST /v1/member/close</code> with a <code>reason</code> and every agent-initiated closure or disablement in HubSpot.</p>",
+      "fix": "<p><strong>Do:</strong> Hydrate <code>closure_reason</code> in <code>MembershipPipeline</code> (<code>membership-pipeline.ts:95, 256</code>) so <code>member_closed</code> and <code>member_disabled</code> events include <code>reason</code>, and omit <code>closure_reason</code> from <code>patchDocument</code> and <code>updateMembershipStatus</code> when <code>reason === undefined</code>.</p><p><strong>Check:</strong> Add unit tests in <code>membership-pipeline.test.ts</code> and <code>consume-member-account-status-firestore/service-handler.test.ts</code> verifying <code>closure_reason</code> is preserved.</p>",
+      "reasoning": "<p>In addition, <code>packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:1776</code> writes <code>closure_reason: options?.closureReason ?? \"\"</code> on <code>CLOSED</code>/<code>DISABLED</code> updates, which clears any existing HubSpot <code>closure_reason</code> to <code>\"\"</code> when <code>consume-member-account-status-hubspot:78</code> processes a status event without <code>reason</code>.</p><p>Verifier confirmed: <code>services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts:256</code> omits <code>reason</code> from <code>member_closed</code> events, causing <code>services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts:65</code> to overwrite <code>closure_reason</code> with <code>null</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts",
+        "targetLine": 65,
+        "hunkHeader": "@@ -58,10 +58,15 @@ export class ConsumeMemberAccountStatusFirestoreHandler {",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 61,
+            "content": "      case \"member_closed\":"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 62,
+            "content": "      case \"member_disabled\":"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 63,
+            "content": "        await this.membersCollection.patchDocument(memberId, {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 64,
+            "content": "          status: targetStatus,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 65,
+            "content": "          closure_reason: event.data.reason ?? null,",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 66,
+            "content": "          closure_date: event.data.closureDate ?? new Date().toISOString()"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 67,
+            "content": "        });"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H5",
+      "sev": "high",
+      "cat": "contract, infra",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/internal-services/src/modules/api-module.ts:787",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854415"
+        },
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts:115",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854375"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10",
+      "title": "Partner Ingestion misses reactivation and reuses idempotency_key on 2nd close",
+      "impact": "<p><strong>Breaks:</strong> When a closed member re-onboards, Acme Core never receives an <code>ACTIVE</code> ingestion update, and if the member closes their account a second time, the second <code>member_closed</code> call sends the same <code>idempotency_key</code> as the first closure.</p><p><strong>Because:</strong> <code>consume-member-onoffboard-tu-ingestion/models.ts:10-14</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code> (the only event emitted when <code>reactivateExistingMember</code> updates HubSpot), and <code>consume-member-onoffboard-tu-ingestion/service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code>.</p><p><strong>Reach:</strong> Every closed member who reactivates via <code>POST /v1/member/onboard</code>, and every member who closes their account more than once.</p>",
+      "fix": "<p><strong>Do:</strong> Add <code>member_activated</code> to <code>api-module.ts:787</code>, <code>models.ts:10</code>, and <code>service-handler.ts:69</code> (mapping it to <code>ACTIVE</code>), and include <code>event.idempotencyKey</code> in the SHA-256 hash input at <code>service-handler.ts:124</code>.</p><p><strong>Check:</strong> Add unit tests in <code>consume-member-onoffboard-tu-ingestion/service-handler.test.ts</code> verifying <code>member_activated</code> sends <code>status: \"ACTIVE\"</code> and two <code>member_closed</code> events produce distinct <code>idempotency_key</code> values.</p>",
+      "reasoning": "<p>Contradicts <code>member-closure-beta-launch.md:135, 343, 356</code>, which specifies that <code>consume-member-onoffboard-tu-ingestion</code> notifies acme on reactivation. Verifier confirmed: <code>services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code>, and <code>service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code> so a second closure reuses the same <code>idempotency_key</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts",
+        "targetLine": 10,
+        "hunkHeader": "@@ -6,9 +6,12 @@ export const SUPPORTED_EVENTS =",
+        "lines": [
+          {
+            "type": "ctx",
+            "oldNumber": 8,
+            "newNumber": 8,
+            "content": "export const TU_INGESTION_EVENTS = ["
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 9,
+            "newNumber": 9,
+            "content": "  \"member_onboarded\","
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 10,
+            "content": "  \"member_closed\",",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 11,
+            "content": "  \"member_disabled\"",
+            "highlight": false
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 12,
+            "content": "  // MISSING: \"member_activated\" on CLOSED -> ACTIVE reactivation"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 11,
+            "newNumber": 13,
+            "content": "] as const;"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H6",
+      "sev": "high",
+      "cat": "correctness",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:94",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854549"
+        },
+        {
+          "who": "Copilot",
+          "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:227",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854576"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/auth/service-handler.ts:94",
+      "title": "Beta cohort re-invitation is never synced to Firestore and is blocked by auth",
+      "impact": "<p><strong>Breaks:</strong> A closed member re-invited in HubSpot via <code>reinvited_cohort</code> and <code>reinvited_at</code> cannot re-onboard during beta, while a member with an inactive cohort passes <code>isMemberReinvitedToActiveCohort</code> whenever <code>reinvitedAt &gt; closureDate</code>.</p><p><strong>Because:</strong> No webhook pipeline syncs <code>reinvited_cohort</code> or <code>reinvited_at</code> into Firestore (<code>auth/service-handler.ts:225-226</code>); <code>auth/service-handler.ts:94</code> still runs <code>checkPreOnboardingAccess</code> for eligible <code>CLOSED</code> members; and <code>auth/service-handler.ts:230-232</code> (and <code>onboard/service-handler.ts:1031-1033</code>) returns <code>true</code> on <code>reinvitedAt &gt; closureDate</code> before checking <code>activeCohorts</code>.</p><p><strong>Reach:</strong> Every closed member evaluated for beta re-invitation in <code>/v1/auth</code> and <code>/v1/member/onboard</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Sync <code>reinvited_cohort</code> and <code>reinvited_at</code> into Firestore, skip <code>checkPreOnboardingAccess</code> in <code>auth/service-handler.ts:94</code> for eligible <code>CLOSED</code> members, and require <code>reinvited_cohort</code> to match <code>activeCohorts</code>.</p><p><strong>Check:</strong> Add unit tests in <code>auth/service-handler.test.ts</code> for a <code>CLOSED</code> member with a declined invitation or inactive <code>reinvited_cohort</code>.</p>",
+      "reasoning": "<p>Also note that <code>close-account/service-handler.ts:62</code> writes <code>closure_date</code> as <code>YYYY-MM-DD</code> while <code>reinvited_at</code> is an ISO timestamp (<code>YYYY-MM-DDTHH:mm:ss.sssZ</code>), so lexicographical <code>reinvitedAt &gt; closureDate</code> evaluates to <code>true</code> on the same UTC date even if the account was closed after <code>reinvited_at</code>; normalize both timestamps before comparing.</p><p>Verifier confirmed: <code>services/loyalty/member-services/src/functions/auth/service-handler.ts:94</code> runs <code>checkPreOnboardingAccess</code> for eligible <code>CLOSED</code> members (blocking on declined invitation or missing audience), no pipeline syncs <code>reinvited_cohort</code>/<code>reinvited_at</code> to Firestore, and line 230 returns <code>true</code> on <code>reinvitedAt &gt; closureDate</code> before checking <code>activeCohorts</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/auth/service-handler.ts",
+        "targetLine": 94,
+        "hunkHeader": "@@ -88,12 +88,18 @@ export class AuthServiceHandler {",
+        "lines": [
+          {
+            "type": "ctx",
+            "oldNumber": 91,
+            "newNumber": 91,
+            "content": "    const existingMember = await this.membersCollection.getDocument(memberId);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 92,
+            "content": "    if (existingMember?.status === MEMBER_STATUS.DISABLED) {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 93,
+            "content": "      throw new AccessDeniedError(\"Member account is disabled\");"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 94,
+            "content": "    }",
+            "highlight": true
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 95,
+            "newNumber": 95,
+            "content": "    await this.checkPreOnboardingAccess(claims, existingMember);"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "H7",
+      "sev": "high",
+      "cat": "adversarial",
+      "verify": "CONFIRMED",
+      "earlier": [
+        {
+          "who": "Copilot",
+          "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:404",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854343"
+        },
+        {
+          "who": "Copilot",
+          "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:474",
+          "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854488"
+        }
+      ],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:404",
+      "title": "checkEmailExists swallows HubSpot errors as exists:false and 409s on 0-membership contacts",
+      "impact": "<p><strong>Breaks:</strong> A HubSpot error on the association or membership batch read makes <code>GET /v1/member/check-email</code> return <code>{ exists: false }</code> for <code>ACTIVE</code> or <code>DISABLED</code> members, and a Contact with zero memberships returns <code>{ exists: false }</code> before failing with <code>409 Conflict</code> at <code>POST /v1/member/onboard</code>.</p><p><strong>Because:</strong> <code>packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:397-404</code> and <code>441-450</code> catch all errors and leave <code>allMemberships</code> empty, which <code>hubspot-service.ts:464-475</code> maps to <code>false</code>, while <code>onboard/service-handler.ts:726</code> calls <code>createContact</code>.</p><p><strong>Reach:</strong> Every <code>GET /v1/member/check-email</code> call when HubSpot returns 429/5xx, and every HubSpot Contact with zero memberships.</p>",
+      "fix": "<p><strong>Do:</strong> Rethrow errors in <code>fetchContactMembershipIds</code> (<code>hubspot-service.ts:441</code>) and the membership batch read (<code>hubspot-service.ts:397</code>), and either return <code>exists: true</code> when a Contact has zero memberships or reuse the existing Contact in <code>onboard</code>.</p><p><strong>Check:</strong> Update <code>hubspot-service.test.ts</code> so association and membership batch-read failures reject with <code>HubSpotError</code> rather than resolving to <code>false</code>.</p>",
+      "reasoning": "<p>Verifier confirmed: <code>packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts:397</code> and <code>441</code> catch batch-read and association errors and fall through to <code>evaluateMembershipStatusesForEmailCheck</code> (line 464), which returns <code>{ exists: false }</code> whenever <code>allMemberships</code> is empty.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts",
+        "targetLine": 404,
+        "hunkHeader": "@@ -395,12 +395,16 @@ export class HubSpotService {",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 397,
+            "content": "      try {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 398,
+            "content": "        const batch = await this.client.crm.objects.batchApi.read(\"memberships\", { inputs });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 399,
+            "content": "        allMemberships.push(...batch.results);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 400,
+            "content": "      } catch (err) {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 401,
+            "content": "        this.logger.error(\"Failed to batch read memberships\", { err });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 404,
+            "content": "        // Swallows 429/5xx and leaves allMemberships = [], returning exists: false!",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 405,
+            "content": "      }"
+          }
+        ]
+      },
+      "suggestedTriage": "block"
+    },
+    {
+      "id": "M1",
+      "sev": "medium",
+      "cat": "correctness",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/close-account/service-handler.ts:86",
+      "title": "close-account marks Firestore CLOSED and returns 200 when HubSpot lookup misses",
+      "impact": "<p><strong>Breaks:</strong> When <code>getMembershipByMemberId(memberId)</code> returns <code>undefined</code> during <code>POST /v1/member/close</code>, the handler marks Firestore <code>CLOSED</code> and returns <code>200 OK</code>, leaving HubSpot, Braze, and Partner Ingestion <code>ACTIVE</code> with no retry path.</p><p><strong>Because:</strong> <code>services/loyalty/member-services/src/functions/close-account/service-handler.ts:86-101</code> logs a warning when <code>membership</code> is <code>undefined</code>, patches Firestore <code>status: MEMBER_STATUS.CLOSED</code> at line 94, and returns <code>{ success: true }</code>, which causes any subsequent retry to short-circuit at line 53.</p><p><strong>Reach:</strong> Any <code>POST /v1/member/close</code> call where HubSpot search indexing lags or the CRM membership record is missing.</p>",
+      "fix": "<p><strong>Do:</strong> Throw an error (such as <code>NotFoundError</code> or <code>ServiceError</code>) when <code>getMembershipByMemberId</code> returns <code>undefined</code> in <code>close-account/service-handler.ts:86</code> before patching Firestore.</p><p><strong>Check:</strong> Update <code>close-account/service-handler.test.ts:107</code> to assert that a missing HubSpot membership rejects and does not call <code>mockMembersCollection.patchDocument</code>.</p>",
+      "reasoning": "<p>Because HubSpot is not updated when <code>membership</code> is <code>undefined</code>, no HubSpot webhook fires to emit <code>member_closed</code>, and patching Firestore to <code>CLOSED</code> blocks retries at line 53. Verifier confirmed: <code>services/loyalty/member-services/src/functions/close-account/service-handler.ts:86</code> logs a warning when <code>membership</code> is <code>undefined</code> and still patches Firestore to <code>MEMBER_STATUS.CLOSED</code> at line 93, causing subsequent retries to short-circuit at line 53 while HubSpot remains <code>ACTIVE</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/close-account/service-handler.ts",
+        "targetLine": 86,
+        "hunkHeader": "@@ -80,16 +80,22 @@ export class CloseAccountServiceHandler {",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 85,
+            "content": "    } else {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 86,
+            "content": "      this.logger.warn(\"HubSpot membership not found during close-account\", { memberId });",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 87,
+            "content": "    }"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 93,
+            "content": "    await this.membersCollection.patchDocument(memberId, {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 94,
+            "content": "      status: MEMBER_STATUS.CLOSED,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 95,
+            "content": "      closure_date: closureDate"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 96,
+            "content": "    });"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "M2",
+      "sev": "medium",
+      "cat": "correctness",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:988",
+      "title": "reactivateExistingMember does not update HubSpot Contact or Partner Account",
+      "impact": "<p><strong>Breaks:</strong> When a closed member re-onboards with an updated email, name, <code>existingBauMember</code> flag, or <code>linktAccountStatus</code>, <code>reactivateExistingMember</code> sends the new profile fields to Braze while leaving the HubSpot Contact and Partner Account stale.</p><p><strong>Because:</strong> <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts:988-1005</code> updates Braze with <code>validatedRequest</code> fields without updating the HubSpot Contact or Partner Account, and if <code>membership</code> is <code>undefined</code> at line 979 it still marks Firestore <code>ACTIVE</code> while leaving HubSpot <code>CLOSED</code>.</p><p><strong>Reach:</strong> Any returning <code>CLOSED</code> member whose re-onboarding request changes contact details or partner account status, or whose HubSpot membership lookup misses.</p>",
+      "fix": "<p><strong>Do:</strong> Throw an error if <code>membership</code> is missing at <code>onboard/service-handler.ts:979</code>, and update the existing HubSpot Contact properties (<code>email</code>, <code>firstname</code>, <code>lastname</code>, <code>existing_bau_member</code>) and Partner Account status in <code>reactivateExistingMember</code>.</p><p><strong>Check:</strong> Add a unit test in <code>onboard/service-handler.test.ts</code> verifying <code>reactivateExistingMember</code> updates HubSpot Contact details and throws if <code>getMembershipByMemberId</code> returns <code>undefined</code>.</p>",
+      "reasoning": "<p>New onboarding (<code>onboard/service-handler.ts:716-733</code>) writes <code>email</code>, <code>firstname</code>, <code>lastname</code>, and <code>existing_bau_member</code> to both HubSpot and Braze, whereas <code>reactivateExistingMember</code> writes them only to Braze. Verifier confirmed: <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts:979</code> logs a warning when <code>membership</code> is missing yet marks Firestore <code>ACTIVE</code> at line 1004, and lines 988-1001 update Braze with new request fields without updating the HubSpot Contact or Partner Account.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/onboard/service-handler.ts",
+        "targetLine": 988,
+        "hunkHeader": "@@ -982,15 +982,22 @@ private async reactivateExistingMember(",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 988,
+            "content": "    await this.brazeService.createBrazeMemberProfile({",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 989,
+            "content": "      externalId: memberId,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 990,
+            "content": "      email: validatedRequest.email,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 991,
+            "content": "      firstName: validatedRequest.firstName,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 992,
+            "content": "      lastName: validatedRequest.lastName"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 993,
+            "content": "    });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1004,
+            "content": "    await this.membersCollection.patchDocument(memberId, { status: MEMBER_STATUS.ACTIVE });"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "M3",
+      "sev": "medium",
+      "cat": "standards, operability",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "config-values-guidelines.md — Feature flags vs structured configuration",
+      "loc": "packages/gcp-lib/src/util/feature-flag-service.ts:69",
+      "title": "JSON cohort array is stored as a featureflag_ key and logged via getBoolean",
+      "impact": "<p><strong>Breaks:</strong> Storing a JSON string array under <code>featureflag_loyalty_member_services_configure_beta_active_cohorts</code> violates the repository's configuration standard and causes <code>FeatureFlagService.logFlagValues</code> to log the parameter as <code>false</code> on every refresh.</p><p><strong>Because:</strong> <code>docs/design/loyalty/engineering-practices/config-values-guidelines.md</code> and <code>packages/gcp-lib/src/util/feature-flag-service.ts:20-23</code> restrict <code>FeatureFlagService</code> to boolean <code>featureflag_*</code> flags, and <code>feature-flag-service.ts:145-150</code> calls <code>config.getBoolean(key)</code> on every <code>featureflag_*</code> key.</p><p><strong>Reach:</strong> Every Remote Config template refresh in <code>loyalty-member-services</code> when <code>featureflag_loyalty_member_services_configure_beta_active_cohorts</code> is configured.</p>",
+      "fix": "<p><strong>Do:</strong> Move the active beta cohorts list into <code>MemberServicesConfig</code> (<code>GcpConfig</code>) validated with a Zod <code>z.array(z.string())</code> schema, or handle string parameters in <code>logFlagValues</code>.</p><p><strong>Check:</strong> Verify <code>FeatureFlagService.logFlagValues</code> does not log non-boolean cohort arrays as <code>false</code> and <code>MemberServicesConfig</code> validates the cohort list.</p>",
+      "reasoning": "<p>Verifier confirmed: <code>packages/gcp-lib/src/util/feature-flag-service.ts:148</code> calls <code>config.getBoolean(key)</code> on every <code>featureflag_</code> parameter in <code>logFlagValues</code>, evaluating the JSON string array <code>featureflag_loyalty_member_services_configure_beta_active_cohorts</code> as <code>false</code> and violating the boolean-only contract at lines 20-23.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "packages/gcp-lib/src/util/feature-flag-service.ts",
+        "targetLine": 69,
+        "hunkHeader": "@@ -65,9 +65,15 @@ export class FeatureFlagService {",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 68,
+            "content": "  public getString(flagName: string, defaultValue = \"\"): string {"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 69,
+            "content": "    return this.remoteConfig.getString(flagName) || defaultValue;",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 70,
+            "content": "  }"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 145,
+            "newNumber": 147,
+            "content": "  private logFlagValues(): void {"
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 146,
+            "newNumber": 148,
+            "content": "    for (const key of this.flagKeys) this.logger.info(key, { val: this.config.getBoolean(key) });"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "M4",
+      "sev": "medium",
+      "cat": "standards",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "services/loyalty/AGENTS.md — ADR and Solution Design documentation rules",
+      "loc": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:3",
+      "title": "PR contradicts Accepted ADR-005 without superseding it and adds a parallel Accepted doc",
+      "impact": "<p><strong>Breaks:</strong> <code>adr-005-loyalty-program-member-status.md</code> (<code>status: Accepted</code>) still defines a 3-value <code>MemberStatus</code>, while the PR implements 4 values (<code>DISABLED</code>) in a new lifecycle doc marked <code>Accepted</code> (<code>last_reviewed: 2026-10-01</code>).</p><p><strong>Because:</strong> <code>member-status.ts:13</code> adds <code>DISABLED</code> without a superseding ADR, and <code>member-closure-beta-launch.md:1-6</code> adds a fourth lifecycle doc with <code>status: Accepted</code> instead of <code>Draft</code> and instead of updating existing lifecycle docs in place per <code>services/loyalty/AGENTS.md</code>.</p><p><strong>Reach:</strong> Engineers and agents consulting <code>docs/design/loyalty/decisions/</code> or <code>docs/design/loyalty/solution-designs/member-lifecycle/</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Add an ADR superseding <code>ADR-005</code> for the 4-state <code>MemberStatus</code> model, set new design frontmatter <code>status: Draft</code> with the actual review date until PR approval, and update the existing lifecycle design docs in place.</p><p><strong>Check:</strong> Confirm <code>ADR-005</code> links to its superseding ADR and frontmatter fields match <code>services/loyalty/AGENTS.md</code>.</p>",
+      "reasoning": "<p>Existing accepted lifecycle docs (<code>member-status-and-workflow-states.md</code>, <code>join-and-onboard.md</code>, <code>beta-switch-over-and-unified-lifecycle.md</code>) define the same lifecycle flows.</p><p>Verifier confirmed: <code>docs/design/loyalty/decisions/adr-005-loyalty-program-member-status.md:52</code> defines a 3-value <code>MemberStatus</code> without a superseding ADR for <code>DISABLED</code>, and <code>docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:3-5</code> is added as a separate file with <code>status: Accepted</code> and <code>last_reviewed: 2026-10-01</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md",
+        "targetLine": 3,
+        "hunkHeader": "@@ -0,0 +1,12 @@",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1,
+            "content": "---"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 2,
+            "content": "title: Member Closure & Re-Invitation — Beta Launch"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 3,
+            "content": "status: Accepted",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 4,
+            "content": "last_reviewed: 2026-10-01"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 5,
+            "content": "---"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "M5",
+      "sev": "medium",
+      "cat": "docs",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:261",
+      "title": "Design doc contradicts code on close-account Firestore writes and flag naming",
+      "impact": "<p><strong>Breaks:</strong> Readers following <code>member-closure-beta-launch.md</code> get an inaccurate specification of how <code>POST /v1/member/close</code> persists state and what the active cohorts flag is named in code and Remote Config.</p><p><strong>Because:</strong> <code>member-closure-beta-launch.md:34, 84-94, 261-271</code> states that <code>POST /v1/member/close</code> only mutates HubSpot CRM and relies on the Webhook Translator to update Firestore, whereas <code>close-account/service-handler.ts:94</code> patches Firestore directly; and lines 291-294 omit <code>_configure_</code> from <code>FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS</code> (<code>feature-flags.ts:12-13</code>).</p><p><strong>Reach:</strong> Operators configuring Firebase Remote Config parameters and engineers maintaining <code>POST /v1/member/close</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Align <code>member-closure-beta-launch.md</code> and <code>close-account/service-handler.ts</code> on whether <code>POST /v1/member/close</code> patches Firestore directly, and update lines 291-294 to match <code>feature-flags.ts:12-13</code>.</p><p><strong>Check:</strong> Search <code>member-closure-beta-launch.md</code> for <code>beta_active_cohorts</code> and confirm the constant and key match <code>services/loyalty/member-services/src/common/feature-flags.ts:12-13</code>.</p>",
+      "reasoning": "<p>Verifier confirmed: <code>docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md:261-271</code> states <code>close-account</code> only mutates HubSpot and relies on webhook fanout for Firestore (contradicting <code>close-account/service-handler.ts:93</code>), and lines 291-293 omit <code>_configure_</code> from the flag name defined in <code>feature-flags.ts:12-13</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md",
+        "targetLine": 261,
+        "hunkHeader": "@@ -258,10 +258,14 @@ ### 4.2 POST /v1/member/close",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 260,
+            "content": "- If `status === \"disabled\"`, return `403 AccessDeniedError`."
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 261,
+            "content": "- Mutates HubSpot Membership `member_status = CLOSED` only; Firestore is updated asynchronously via Webhook Translator.",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 291,
+            "content": "- Flag key: `featureflag_loyalty_member_services_beta_active_cohorts`"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "M6",
+      "sev": "medium",
+      "cat": "tests",
+      "verify": "CONFIRMED",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/test/functions/onboard/service-handler.test.ts:435",
+      "title": "Reactivation and DISABLED derivation paths lack assertions and branch coverage",
+      "impact": "<p><strong>Breaks:</strong> Regressions in <code>reactivateExistingMember</code> (HubSpot, Braze, and Firestore updates) and in <code>derive-member-status</code> (<code>DISABLED</code> short-circuit) will not fail any test.</p><p><strong>Because:</strong> <code>onboard/service-handler.test.ts:435-476</code> omits <code>hubspot_customer_id</code> (leaving lines 989-998 of <code>onboard/service-handler.ts</code> unexecuted) and asserts no HubSpot, Braze, or Firestore calls, and <code>derive-member-status/service-handler.test.ts</code> has no test for <code>currentStatus === MEMBER_STATUS.DISABLED</code> (<code>derive-member-status/service-handler.ts:103</code>).</p><p><strong>Reach:</strong> <code>onboard/service-handler.ts:963-1019</code> and <code>derive-member-status/service-handler.ts:103-111</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Add <code>hubspot_customer_id</code> to the mocked <code>CLOSED</code> member in <code>onboard/service-handler.test.ts:442</code>, assert the HubSpot, Braze, and Firestore calls, and add a <code>DISABLED</code> test to <code>derive-member-status/service-handler.test.ts</code>.</p><p><strong>Check:</strong> Confirm that removing <code>patchDocument</code> in <code>reactivateExistingMember</code> or the <code>DISABLED</code> check in <code>derive-member-status</code> fails the tests.</p>",
+      "reasoning": "<p>Specifically, <code>reactivateExistingMember</code> calls <code>updateMembershipStatus</code>, <code>batchCreatePolicyAcceptances</code>, <code>upsertCommunicationPreference</code>, <code>createBrazeMemberProfile</code>, and <code>patchDocument</code> (while skipping <code>createMember</code>).</p><p>Verifier confirmed: <code>services/loyalty/member-services/test/functions/onboard/service-handler.test.ts:435-476</code> omits <code>hubspot_customer_id</code> and makes no assertions on HubSpot, Braze, or Firestore calls in <code>reactivateExistingMember</code>, and <code>derive-member-status/service-handler.test.ts</code> has no test case for <code>DISABLED</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/test/functions/onboard/service-handler.test.ts",
+        "targetLine": 435,
+        "hunkHeader": "@@ -432,16 +432,25 @@ describe(\"OnboardServiceHandler - CLOSED reactivation\", () => {",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 435,
+            "content": "  it(\"should reactivate an existing CLOSED member when cohort is active\", async () => {",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 436,
+            "content": "    mockMembersCollection.getDocument.mockResolvedValue({"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 437,
+            "content": "      id: \"mem_123\", status: MEMBER_STATUS.CLOSED,"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 438,
+            "content": "      reinvited_cohort: \"cohort_alpha\", reinvited_at: \"2026-10-20T00:00:00Z\""
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 439,
+            "content": "      // Note: hubspot_customer_id is omitted!"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 440,
+            "content": "    });"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 472,
+            "content": "    const res = await handler.execute(mockRequest);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 473,
+            "content": "    expect(res.status).toBe(200);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 474,
+            "content": "    // Zero assertions on HubSpot, Braze, or Firestore patchDocument!"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 475,
+            "content": "  });"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "L1",
+      "sev": "low",
+      "cat": "structure",
+      "verify": "",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "services/loyalty/member-services/src/functions/onboard/service-handler.ts:1021",
+      "title": "isMemberReinvitedToActiveCohort is duplicated in auth and onboard handlers",
+      "impact": "<p><strong>Breaks:</strong> Any change to beta cohort re-invitation parsing or date comparison must be updated in two places in <code>member-services</code>, risking divergence between <code>/v1/auth</code> and <code>/v1/member/onboard</code>.</p><p><strong>Because:</strong> <code>services/loyalty/member-services/src/functions/auth/service-handler.ts:222-258</code> and <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts:1021-1059</code> contain duplicate implementations of <code>isMemberReinvitedToActiveCohort</code>.</p><p><strong>Reach:</strong> <code>services/loyalty/member-services/src/functions/auth/service-handler.ts</code> and <code>services/loyalty/member-services/src/functions/onboard/service-handler.ts</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Extract <code>isMemberReinvitedToActiveCohort</code> into a shared helper under <code>services/loyalty/member-services/src/common/</code> and call it from both <code>auth</code> and <code>onboard</code>.</p><p><strong>Check:</strong> Run unit tests for both <code>auth</code> and <code>onboard</code> against the shared helper.</p>",
+      "reasoning": "<p>Both handlers live in <code>services/loyalty/member-services</code> and already import <code>@common/feature-flags</code>.</p>",
+      "mermaid": "",
+      "html": "",
+      "isNew": false,
+      "status": null,
+      "strength": "",
+      "scope": "",
+      "deps": "",
+      "diffSlice": {
+        "path": "services/loyalty/member-services/src/functions/onboard/service-handler.ts",
+        "targetLine": 1021,
+        "hunkHeader": "@@ -1018,12 +1018,18 @@",
+        "lines": [
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1021,
+            "content": "  private isMemberReinvitedToActiveCohort(memberDoc: MemberDocument): boolean {",
+            "highlight": true
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1022,
+            "content": "    // Duplicate of auth/service-handler.ts:222-258"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1031,
+            "content": "    if (reinvitedAt > closureDate) return true;"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1032,
+            "content": "    return activeCohorts.includes(memberDoc.reinvited_cohort);"
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 1033,
+            "content": "  }"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    },
+    {
+      "id": "D1",
+      "sev": "struct",
+      "cat": "architecture",
+      "verify": "",
+      "earlier": [],
+      "src": [],
+      "tag": "",
+      "guide": "",
+      "loc": "packages/loyalty-topic-schemas-lib/src/member-events-topic/member-status.ts:10",
+      "title": "Centralise member lifecycle state transitions and eligibility guards",
+      "impact": "<p><strong>Breaks:</strong> Changing a member status (<code>DISABLED</code>, <code>CLOSED</code>) requires coordinated edits across 10+ handlers in <code>member-services</code> and <code>internal-services</code>, and missing one check lets banned members reactivate or partner updates reopen closed accounts.</p><p><strong>Because:</strong> Transition rules and re-onboarding eligibility are open-coded separately across <code>close-account/service-handler.ts:53</code>, <code>onboard/service-handler.ts:328,973</code>, <code>auth/service-handler.ts:137</code>, and <code>derive-member-status/service-handler.ts:103</code>.</p><p><strong>Reach:</strong> Every endpoint and consumer in <code>loyalty-member-services</code> and <code>loyalty-internal-services</code> that transitions <code>MemberStatus</code>.</p>",
+      "fix": "<p><strong>Do:</strong> Introduce a pure <code>MemberLifecyclePolicy</code> module in <code>packages/loyalty-common-lib</code> that owns allowed status transitions (<code>canTransition(from, to, actor)</code>), terminal-status guards (<code>isTerminalStatus</code>), and re-onboarding eligibility (<code>canReonboard(memberDoc, activeCohorts)</code>), so all handlers call one policy.</p><p><strong>Check:</strong> Unit-test the transition matrix in <code>loyalty-common-lib</code> and verify that <code>close-account</code>, <code>onboard</code>, <code>auth</code>, and <code>derive-member-status</code> delegate status decisions to it.</p>",
+      "reasoning": "<p>Four commits on this PR branch (<code>1aa0b96</code>, <code>bb54b62</code>, <code>5144a63</code>, <code>778ebad</code>) had to patch <code>DISABLED</code> handling across different consumers one by one, and <code>H1</code>, <code>H2</code>, <code>H3</code>, and <code>H6</code> in this review come from handlers disagreeing on allowed transitions from <code>DISABLED</code> and <code>CLOSED</code>.</p>",
+      "mermaid": "flowchart LR\n  subgraph Before\n    H1[\"close-account\"] --> S1[\"inline status checks\"]\n    H2[\"onboard / auth\"] --> S2[\"inline status checks\"]\n    H3[\"derive-member-status\"] --> S3[\"inline status checks\"]\n  end\n  subgraph After\n    H4[\"close-account\"] --> P[\"MemberLifecyclePolicy\"]\n    H5[\"onboard / auth\"] --> P\n    H6[\"derive-member-status\"] --> P\n  end\n  Before ~~~ After",
+      "html": "<div class=\"diaslot\"></div>",
+      "isNew": false,
+      "status": null,
+      "strength": "Strong",
+      "scope": "Follow-up",
+      "deps": "in-process",
+      "diffSlice": {
+        "path": "packages/loyalty-topic-schemas-lib/src/member-events-topic/member-status.ts",
+        "targetLine": 10,
+        "hunkHeader": "@@ -5,8 +5,10 @@ export const MEMBER_STATUS = {",
+        "lines": [
+          {
+            "type": "ctx",
+            "oldNumber": 7,
+            "newNumber": 7,
+            "content": "  ACTIVE: \"ACTIVE\","
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 8,
+            "newNumber": 8,
+            "content": "  RESTRICTED: \"RESTRICTED\","
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 9,
+            "newNumber": 9,
+            "content": "  CLOSED: \"CLOSED\","
+          },
+          {
+            "type": "add",
+            "oldNumber": null,
+            "newNumber": 10,
+            "content": "  DISABLED: \"DISABLED\",",
+            "highlight": true
+          },
+          {
+            "type": "ctx",
+            "oldNumber": 10,
+            "newNumber": 11,
+            "content": "} as const;"
+          }
+        ]
+      },
+      "suggestedTriage": "comment"
+    }
+  ],
+  "SEV": {
+    "high": {
+      "i": "",
+      "l": "High",
+      "c": "#D52043",
+      "g": "High"
+    },
+    "medium": {
+      "i": "",
+      "l": "Medium",
+      "c": "#D87A1C",
+      "g": "Medium"
+    },
+    "low": {
+      "i": "",
+      "l": "Low",
+      "c": "#1C73A8",
+      "g": "Low"
+    },
+    "struct": {
+      "i": "",
+      "l": "Design",
+      "c": "#0F8171",
+      "g": "Design candidates"
+    },
+    "nit": {
+      "i": "",
+      "l": "Nit",
+      "c": "#795F9A",
+      "g": "Nits"
+    },
+    "ci": {
+      "i": "",
+      "l": "CI",
+      "c": "#6D7979",
+      "g": "CI"
+    }
+  },
+  "ORDER": [
+    "high",
+    "medium",
+    "low",
+    "struct",
+    "nit",
+    "ci"
+  ],
+  "KEY": "loyalty-platform-pr1230",
+  "SUMMARY": {
+    "html": "<h3>What it does</h3><p>Changes <code>loyalty-member-services</code>, <code>loyalty-internal-services</code>, <code>@acme/loyalty-common-lib</code>, <code>@acme/loyalty-topic-schemas-lib</code>, and <code>@acme/gcp-lib</code> to add the <code>POST /v1/member/close</code> endpoint, add <code>DISABLED</code> to <code>MemberStatus</code> and <code>member_disabled</code> to the <code>member-events</code> Pub/Sub topic, gate beta cohort re-invitation in <code>/v1/auth</code> and <code>/v1/member/onboard</code>, and reactivate existing <code>CLOSED</code> memberships in place.</p><div class=\"diaslot\"><div class=\"mermaid\">flowchart LR\n  subgraph MS[\"loyalty-member-services\"]\n    Auth[\"POST /v1/auth\"]\n    Onb[\"POST /v1/member/onboard\"]\n    Close[\"POST /v1/member/close\"]\n  end\n  subgraph Stores[\"CRM &amp; State Stores\"]\n    HS[\"HubSpot CRM\"]\n    FS[\"Firestore members\"]\n    Topic[\"member-events topic\"]\n  end\n  subgraph IS[\"loyalty-internal-services\"]\n    WH[\"hubspot-webhook\"]\n    Derive[\"derive-member-status\"]\n    Cons[\"Firestore / HubSpot / Braze / TU consumers\"]\n  end\n  Auth &amp; Onb &amp; Close --&gt; HS &amp; FS\n  HS --&gt; WH --&gt; Topic\n  Derive --&gt; Topic --&gt; Cons</div></div><p>Inside <code>loyalty-member-services</code>, <code>close-account/service-handler.ts</code> updates the HubSpot Membership object to <code>CLOSED</code> with <code>closure_date</code> and <code>closure_reason</code> and patches the Firestore <code>members</code> document. <code>auth/service-handler.ts</code> and <code>onboard/service-handler.ts</code> evaluate <code>DISABLED</code> vs <code>CLOSED</code> memberships, check <code>FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS</code> (<code>feature-flags.ts</code>) via <code>FeatureFlagService.getString</code> (<code>packages/gcp-lib</code>), and call <code>reactivateExistingMember</code> on <code>CLOSED</code> rejoin.</p><p>In <code>@acme/loyalty-common-lib</code>, <code>HubSpotService.checkEmailExists</code> inspects all Membership associations for a Contact and returns <code>true</code> only when an associated Membership is <code>ACTIVE</code>, <code>RESTRICTED</code>, or <code>DISABLED</code>.</p><p>Inside <code>loyalty-internal-services</code>, <code>MembershipPipeline</code> maps HubSpot <code>DISABLED</code> changes to <code>member_disabled</code> domain events, <code>derive-member-status</code> short-circuits when HubSpot status is <code>DISABLED</code>, and the Firestore, HubSpot, Braze, and Partner Ingestion consumers subscribe to <code>member_disabled</code> and manage <code>closure_date</code>, <code>closure_reason</code>, <code>reinvited_cohort</code>, and <code>reinvited_at</code>.</p><h3>Coverage</h3><p>Thirteen lenses ran in sequence in one agent (<code>correctness</code>, <code>adversarial</code>, <code>security</code>, <code>data</code>, <code>contract</code>, <code>infra</code>, <code>performance</code>, <code>tests</code>, <code>standards</code>, <code>operability</code>, <code>docs</code>, <code>structure</code>, <code>architecture</code>). No lens was skipped.</p><p>A separate verifier subagent (<code>47fb6fd4-a542-4f27-87d8-039535296f06</code>) checked all 13 <code>high</code> and <code>medium</code> findings (<code>H1</code>–<code>H7</code>, <code>M1</code>–<code>M6</code>) in a fresh context against the <code>&lt;head&gt;</code> working tree and confirmed all 13 (<code>CONFIRMED</code>). Zero <code>high</code> findings were refuted, zero findings were marked <code>PLAUSIBLE</code>, and zero <code>nit</code> findings were dropped.</p><p>The standards scan checked <code>AGENTS.md</code>, <code>services/loyalty/AGENTS.md</code>, <code>docs/design/loyalty/decisions/adr-005-loyalty-program-member-status.md</code>, <code>docs/design/loyalty/engineering-practices/config-values-guidelines.md</code>, <code>docs/design/loyalty/engineering-practices/error-handling-pattern.md</code>, <code>docs/design/loyalty/engineering-practices/logging-and-tracing.md</code>, <code>docs/design/loyalty/engineering-practices/testing-approach.md</code>, <code>docs/design/loyalty/solution-designs/member-lifecycle/member-status-and-workflow-states.md</code>, <code>docs/design/loyalty/solution-designs/member-lifecycle/join-and-onboard.md</code>, and <code>docs/design/loyalty/solution-designs/member-lifecycle/beta-switch-over-and-unified-lifecycle.md</code>.</p><p>The review did not inspect the external HubSpot CRM workflow configuration that writes <code>reinvited_cohort</code> and <code>reinvited_at</code> or the downstream Acme Core ingestion service implementation outside this repository.</p>",
+    "mermaid": "",
+    "points": [
+      "correctness: ran, 6 findings (4 high, 2 medium)",
+      "adversarial: ran, 1 finding (1 high)",
+      "security: ran, 2 findings (2 high, merged with correctness)",
+      "data: ran, 1 finding (1 high)",
+      "contract: ran, 1 finding (1 high)",
+      "infra: ran, 1 finding (1 high, merged with contract)",
+      "performance: ran, no findings",
+      "tests: ran, 1 finding (1 medium)",
+      "standards: ran, 2 findings (2 medium)",
+      "operability: ran, 1 finding (1 medium, merged with standards)",
+      "docs: ran, 1 finding (1 medium)",
+      "structure: ran, 1 finding (1 low)",
+      "architecture: ran, 1 design candidate"
+    ],
+    "engines": [],
+    "headCommit": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
+    "outside": []
+  },
+  "STAT": {
+    "fixed": {
+      "l": "Fixed",
+      "i": "fixed",
+      "c": "#0E893C",
+      "r": true
+    },
+    "external": {
+      "l": "Fixed elsewhere",
+      "i": "external",
+      "c": "#0F8171",
+      "r": true
+    },
+    "dropped": {
+      "l": "Dropped",
+      "i": "dropped",
+      "c": "#6D7979",
+      "r": true
+    },
+    "partial": {
+      "l": "Partly fixed",
+      "i": "partial",
+      "c": "#D87A1C",
+      "r": false
+    },
+    "rebutted": {
+      "l": "Author rebutted",
+      "i": "rebutted",
+      "c": "#795F9A",
+      "r": false
+    },
+    "open": {
+      "l": "Still open",
+      "i": "open",
+      "c": "#D52043",
+      "r": false
+    }
+  },
+  "REV": null,
+  "PR": {
+    "url": "https://github.com/acme/loyalty-platform/pull/1230",
+    "label": "acme/loyalty-platform #1230"
+  },
+  "XMETA": {
+    "path": "/workspace/loyalty-platform/.tu-skills/tu-code-review/pr1230-review.html",
+    "head": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
+    "title": "PR #1230: feat(loyalty-member-services): member closure lifecycle and multi-membership status evaluation [LP-1230]"
+  },
+  "REVIEW": {
+    "repo": "acme/loyalty-platform",
+    "pr": 1230,
+    "base": "4953d14614e8d86d10c447ab22a3750cdef2a3f9",
+    "head": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
+    "agent": "Antigravity",
+    "model": "Claude Opus 4.6",
+    "lenses": [
+      "correctness",
+      "adversarial",
+      "security",
+      "data",
+      "contract",
+      "infra",
+      "performance",
+      "tests",
+      "standards",
+      "operability",
+      "docs",
+      "structure",
+      "architecture"
+    ],
+    "lensHash": "84425413773d588d1ad6b5f62464e90109b427d4905f7a39eb5c276c4eb41721"
+  },
+  "LENSES": [
+    "adversarial",
+    "architecture",
+    "contract",
+    "correctness",
+    "data",
+    "docs",
+    "infra",
+    "operability",
+    "performance",
+    "security",
+    "standards",
+    "structure",
+    "tests"
+  ],
+  "LAYERS": {
+    "contracts": [
+      {
+        "path": "packages/loyalty-topic-schemas-lib/src/member-events-topic/member-status.ts",
+        "category": "Domain / Event Schema",
+        "summary": "Expands MemberStatus enum from 3 states (ACTIVE, RESTRICTED, CLOSED) to 4 states (+ DISABLED) and adds member_disabled event schema.",
+        "linkedFindings": [
+          "D1",
+          "M4"
+        ],
+        "diffSummary": "+ DISABLED: \"DISABLED\" in MEMBER_STATUS; + MemberDisabledEventSchema in member-events topic."
+      },
+      {
+        "path": "services/loyalty/member-services/src/functions/close-account/close-account.openapi-spec.ts",
+        "category": "OpenAPI Contract",
+        "summary": "Defines POST /v1/member/close request body ({ reason?: string }) and responses (200 OK, 401, 403 ACCESS_DENIED, 404).",
+        "linkedFindings": [
+          "H1"
+        ],
+        "diffSummary": "Declares 403 ACCESS_DENIED for disabled accounts, though handler implementation omitted the guard (H1)."
+      },
+      {
+        "path": "services/loyalty/member-services/src/common/feature-flags.ts",
+        "category": "Feature Flag Contract",
+        "summary": "Adds FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS stored as JSON array string under a boolean featureflag_* prefix.",
+        "linkedFindings": [
+          "M3",
+          "M5"
+        ],
+        "diffSummary": "+ FF_MEMBER_SERVICES_CONFIGURE_BETA_ACTIVE_COHORTS = \"featureflag_loyalty_member_services_configure_beta_active_cohorts\""
+      },
+      {
+        "path": "docs/design/loyalty/solution-designs/member-lifecycle/member-closure-beta-launch.md",
+        "category": "ADR / Solution Design",
+        "summary": "New lifecycle specification for voluntary account closure, HubSpot/Firestore sync, and beta cohort re-invitation.",
+        "linkedFindings": [
+          "M4",
+          "M5"
+        ],
+        "diffSummary": "+384 lines. Contradicts ADR-005 without superseding it (M4) and differs from close-account direct Firestore patch (M5)."
+      }
+    ],
+    "flows": [
+      {
+        "id": "flow-closure",
+        "title": "Flow 1: Account Closure (POST /v1/member/close)",
+        "description": "Authenticates member JWT, transitions HubSpot Membership to CLOSED with closure_date/closure_reason, and patches Firestore.",
+        "files": [
+          "services/loyalty/member-services/src/functions/close-account/service-handler.ts",
+          "services/loyalty/member-services/src/functions/close-account/index.ts"
+        ],
+        "linkedFindings": [
+          "H1",
+          "M1"
+        ]
+      },
+      {
+        "id": "flow-reonboard",
+        "title": "Flow 2: Re-Onboarding, Auth & Multi-Membership Email Check",
+        "description": "Evaluates DISABLED vs CLOSED memberships in /v1/auth, /v1/member/onboard, and /v1/member/check-email; gates beta re-onboarding by active cohort.",
+        "files": [
+          "services/loyalty/member-services/src/functions/onboard/service-handler.ts",
+          "services/loyalty/member-services/src/functions/auth/service-handler.ts",
+          "packages/loyalty-common-lib/src/providers/hubspot/hubspot-service.ts"
+        ],
+        "linkedFindings": [
+          "H2",
+          "H6",
+          "H7",
+          "M2",
+          "L1"
+        ]
+      },
+      {
+        "id": "flow-fanout",
+        "title": "Flow 3: HubSpot Webhook Fanout & Status Consumers",
+        "description": "Translates HubSpot member_status changes into member_closed / member_disabled events and projects state to Firestore, HubSpot, Braze, and Partner Ingestion.",
+        "files": [
+          "services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts",
+          "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts",
+          "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts",
+          "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts"
+        ],
+        "linkedFindings": [
+          "H3",
+          "H4",
+          "H5"
+        ]
+      }
+    ],
+    "testMatrix": [
+      {
+        "file": "services/loyalty/member-services/test/functions/close-account/service-handler.test.ts",
+        "suite": "CloseAccountServiceHandler",
+        "totalCases": 6,
+        "assertionsCount": 19,
+        "status": "warning",
+        "linkedFindings": [
+          "H1",
+          "M1"
+        ],
+        "scenarios": [
+          {
+            "behavior": "closes an ACTIVE member in HubSpot and Firestore",
+            "assertions": 5,
+            "status": "solid"
+          },
+          {
+            "behavior": "returns 200 idempotently when member is already CLOSED",
+            "assertions": 3,
+            "status": "solid"
+          },
+          {
+            "behavior": "marks Firestore CLOSED even when HubSpot membership is missing",
+            "assertions": 2,
+            "status": "flawed-spec",
+            "note": "Enforces buggy behavior flagged in M1"
+          },
+          {
+            "behavior": "rejects DISABLED member with AccessDeniedError",
+            "assertions": 0,
+            "status": "missing",
+            "note": "Missing test case (H1)"
+          }
+        ]
+      },
+      {
+        "file": "services/loyalty/member-services/test/functions/onboard/service-handler.test.ts",
+        "suite": "OnboardServiceHandler (Reactivation & Cohort Gate)",
+        "totalCases": 8,
+        "assertionsCount": 14,
+        "status": "gap",
+        "linkedFindings": [
+          "M6",
+          "H2"
+        ],
+        "scenarios": [
+          {
+            "behavior": "rejects onboarding when Firestore status is DISABLED",
+            "assertions": 3,
+            "status": "solid"
+          },
+          {
+            "behavior": "reactivates an existing CLOSED member when cohort is active (line 435)",
+            "assertions": 1,
+            "status": "hollow",
+            "note": "M6: Omits hubspot_customer_id and makes 0 assertions on HubSpot, Braze, or Firestore writes!"
+          },
+          {
+            "behavior": "rejects reactivation when HubSpot status is DISABLED despite Firestore CLOSED",
+            "assertions": 0,
+            "status": "missing",
+            "note": "Missing test case (H2)"
+          }
+        ]
+      },
+      {
+        "file": "services/loyalty/internal-services/test/functions/derive-member-status/service-handler.test.ts",
+        "suite": "DeriveMemberStatusHandler",
+        "totalCases": 5,
+        "assertionsCount": 12,
+        "status": "gap",
+        "linkedFindings": [
+          "M6",
+          "H3"
+        ],
+        "scenarios": [
+          {
+            "behavior": "derives ACTIVE / RESTRICTED from partner_account_status_changed",
+            "assertions": 12,
+            "status": "solid"
+          },
+          {
+            "behavior": "short-circuits when currentStatus === DISABLED",
+            "assertions": 0,
+            "status": "missing",
+            "note": "M6: Branch at line 103 has zero test coverage"
+          },
+          {
+            "behavior": "does not reopen voluntarily CLOSED member on partner update",
+            "assertions": 0,
+            "status": "missing",
+            "note": "Missing test case (H3)"
+          }
+        ]
+      },
+      {
+        "file": "packages/loyalty-common-lib/test/providers/hubspot/hubspot-service.test.ts",
+        "suite": "HubSpotService.checkEmailExists",
+        "totalCases": 7,
+        "assertionsCount": 16,
+        "status": "warning",
+        "linkedFindings": [
+          "H7"
+        ],
+        "scenarios": [
+          {
+            "behavior": "returns exists: true when any associated membership is ACTIVE, RESTRICTED, or DISABLED",
+            "assertions": 9,
+            "status": "solid"
+          },
+          {
+            "behavior": "returns exists: false when all memberships are CLOSED",
+            "assertions": 4,
+            "status": "solid"
+          },
+          {
+            "behavior": "returns exists: false when batch read throws HubSpot API error",
+            "assertions": 3,
+            "status": "flawed-spec",
+            "note": "H7: Tests assert that errors resolve to exists: false instead of rejecting!"
+          }
+        ]
+      }
+    ]
+  }
+}

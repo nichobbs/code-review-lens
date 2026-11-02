@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Agentic PR Review Workbench",
+  "version": "0.1.0",
+  "description": "Triage AI code review findings across 4 human-leverage layers and publish curated review threads directly to GitHub Pull Requests.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Open Agentic PR Review Workbench",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://github.com/*",
+    "http://127.0.0.1:4320/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://github.com/*/*/pull/*"
+      ],
+      "css": [
+        "content/github-pr.css"
+      ],
+      "js": [
+        "content/github-pr.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
