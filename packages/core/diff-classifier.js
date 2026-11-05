@@ -1,5 +1,9 @@
 'use strict';
 
+const { spawnSync: defaultSpawnSync } = require('child_process');
+const { parseGitHubRepoSlug } = require('./repo-config');
+const { parsePaginatedGhJson } = require('./github-comments');
+
 /**
  * 4-Layer Agentic PR Diff Classifier & Behavioral Test Matrix Extractor
  *
@@ -127,9 +131,17 @@ function parseUnifiedDiff(diffText) {
     let newLine = 0;
     let additions = 0;
     let deletions = 0;
+    let fallbackAdditions = null;
+    let fallbackDeletions = null;
 
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i];
+      const statsMatch = /^# crv-file-stats:\s*additions=(\d+)\s+deletions=(\d+)/.exec(line);
+      if (statsMatch) {
+        fallbackAdditions = Number(statsMatch[1]);
+        fallbackDeletions = Number(statsMatch[2]);
+        continue;
+      }
       const hunkMatch = /^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(.*)/.exec(line);
       if (hunkMatch) {
         currentHunk = {
@@ -171,6 +183,11 @@ function parseUnifiedDiff(diffText) {
           content: line.slice(1)
         });
       }
+    }
+
+    if (hunks.length === 0 && fallbackAdditions !== null && fallbackDeletions !== null) {
+      additions = fallbackAdditions;
+      deletions = fallbackDeletions;
     }
 
     const fileEntry = {
@@ -461,11 +478,262 @@ function extractDiffSlice(parsedFiles, loc, radius = 7) {
   };
 }
 
+/**
+ * Synthesizes a valid unified git diff string (`diff --git a/... b/...`) from GitHub's
+ * `/repos/{owner}/{repo}/pulls/{pr}/files` entries and/or `gh pr view --json files` metadata.
+ * Used when `gh pr diff` fails with HTTP 406 (`PullRequest.diff too_large` > 20,000 lines).
+ */
+function synthesizeUnifiedDiffFromFiles(apiFiles = [], prMetaFiles = []) {
+  const seenPaths = new Set();
+  const chunks = [];
+
+  for (const f of apiFiles || []) {
+    if (!f) continue;
+    const newPath = f.filename || f.path;
+    if (!newPath) continue;
+    seenPaths.add(newPath);
+    const oldPath = f.previous_filename || newPath;
+    const status = f.status || 'modified';
+    const additions = Number(f.additions || 0);
+    const deletions = Number(f.deletions || 0);
+
+    const headerLines = [
+      `diff --git a/${oldPath} b/${newPath}`,
+      `# crv-file-stats: additions=${additions} deletions=${deletions} status=${status}`,
+      `--- ${status === 'added' ? '/dev/null' : `a/${oldPath}`}`,
+      `+++ ${status === 'removed' ? '/dev/null' : `b/${newPath}`}`
+    ];
+
+    if (typeof f.patch === 'string' && f.patch.trim()) {
+      headerLines.push(f.patch.replace(/\r?\n$/, ''));
+    } else {
+      headerLines.push('# patch omitted by GitHub API for large or binary file');
+    }
+    chunks.push(headerLines.join('\n'));
+  }
+
+  for (const mf of prMetaFiles || []) {
+    if (!mf) continue;
+    const filePath = mf.path || mf.filename;
+    if (!filePath || seenPaths.has(filePath)) continue;
+    seenPaths.add(filePath);
+    const additions = Number(mf.additions || 0);
+    const deletions = Number(mf.deletions || 0);
+    chunks.push(
+      [
+        `diff --git a/${filePath} b/${filePath}`,
+        `# crv-file-stats: additions=${additions} deletions=${deletions} status=modified`,
+        `--- a/${filePath}`,
+        `+++ b/${filePath}`,
+        '# patch omitted by GitHub API for large or binary file'
+      ].join('\n')
+    );
+  }
+
+  return chunks.length ? chunks.join('\n') + '\n' : '';
+}
+
+function hasLocalGitCommit(oid, cwd, spawnSyncFn = defaultSpawnSync) {
+  if (!oid) return false;
+  const res = spawnSyncFn('git', ['cat-file', '-e', `${oid}^{commit}`], {
+    cwd,
+    encoding: 'utf8',
+    timeout: 5000
+  });
+  return res && res.status === 0;
+}
+
+function findMatchingGitRemote(targetRepo, cwd, spawnSyncFn = defaultSpawnSync) {
+  if (!targetRepo) return null;
+  const res = spawnSyncFn('git', ['remote', '-v'], {
+    cwd,
+    encoding: 'utf8',
+    timeout: 5000
+  });
+  if (!res || res.status !== 0 || !res.stdout) return null;
+  const normTarget = String(targetRepo).trim().toLowerCase();
+  const lines = res.stdout.split(/\r?\n/);
+  for (const line of lines) {
+    const m = /^(\S+)\s+(\S+)/.exec(line.trim());
+    if (!m) continue;
+    const remoteName = m[1];
+    const slug = parseGitHubRepoSlug(m[2]);
+    if (slug && slug.toLowerCase() === normTarget) {
+      return remoteName;
+    }
+  }
+  return null;
+}
+
+/**
+ * Attempts to compute the full unified PR diff locally via `git diff <baseRefOid>...<headRefOid>`,
+ * fetching missing PR commits if the current directory is a clone of `repo`.
+ * Bypasses GitHub's 20,000-line REST diff limit completely when inside the local repo.
+ */
+function tryLocalGitDiff({
+  repo,
+  pr,
+  baseRefOid,
+  headRefOid,
+  baseRefName,
+  cwd = process.cwd(),
+  spawnSyncFn = defaultSpawnSync
+} = {}) {
+  if (!baseRefOid || !headRefOid) return null;
+
+  const insideRes = spawnSyncFn('git', ['rev-parse', '--is-inside-work-tree'], {
+    cwd,
+    encoding: 'utf8',
+    timeout: 5000
+  });
+  if (!insideRes || insideRes.status !== 0) return null;
+
+  let hasBase = hasLocalGitCommit(baseRefOid, cwd, spawnSyncFn);
+  let hasHead = hasLocalGitCommit(headRefOid, cwd, spawnSyncFn);
+
+  if (!hasBase || !hasHead) {
+    const remote = findMatchingGitRemote(repo, cwd, spawnSyncFn);
+    if (remote) {
+      if (pr) {
+        spawnSyncFn('git', ['fetch', '--no-tags', remote, baseRefOid, `pull/${pr}/head`], {
+          cwd,
+          encoding: 'utf8',
+          timeout: 45000
+        });
+      }
+      hasBase = hasLocalGitCommit(baseRefOid, cwd, spawnSyncFn);
+      hasHead = hasLocalGitCommit(headRefOid, cwd, spawnSyncFn);
+
+      if (!hasHead && pr) {
+        spawnSyncFn('git', ['fetch', '--no-tags', remote, `pull/${pr}/head`], {
+          cwd,
+          encoding: 'utf8',
+          timeout: 45000
+        });
+        hasHead = hasLocalGitCommit(headRefOid, cwd, spawnSyncFn);
+      }
+      if (!hasBase && baseRefName) {
+        spawnSyncFn('git', ['fetch', '--no-tags', remote, baseRefName], {
+          cwd,
+          encoding: 'utf8',
+          timeout: 45000
+        });
+        hasBase = hasLocalGitCommit(baseRefOid, cwd, spawnSyncFn);
+      }
+    }
+  }
+
+  if (!hasBase || !hasHead) return null;
+
+  const maxBuffer = 100 * 1024 * 1024;
+  let diffRes = spawnSyncFn(
+    'git',
+    ['diff', '--no-color', '--no-ext-diff', `${baseRefOid}...${headRefOid}`],
+    { cwd, encoding: 'utf8', maxBuffer }
+  );
+  if (!diffRes || diffRes.status !== 0) {
+    diffRes = spawnSyncFn(
+      'git',
+      ['diff', '--no-color', '--no-ext-diff', baseRefOid, headRefOid],
+      { cwd, encoding: 'utf8', maxBuffer }
+    );
+  }
+  if (diffRes && diffRes.status === 0 && typeof diffRes.stdout === 'string') {
+    return diffRes.stdout;
+  }
+  return null;
+}
+
+/**
+ * Fetches a PR's unified diff with automatic multi-tier fallback when `gh pr diff` fails
+ * (e.g. HTTP 406 `PullRequest.diff too_large` when a PR exceeds 20,000 lines):
+ * 1. `gh pr diff <pr> [--repo <repo>]`
+ * 2. Local git repository `git diff <baseRefOid>...<headRefOid>` (fetching refs if in matching repo)
+ * 3. `gh api repos/<repo>/pulls/<pr>/files?per_page=100 --paginate --slurp` + per-file patch synthesis
+ * 4. `prMeta.files` file-stats synthesis
+ */
+function fetchPrDiffWithFallback({
+  pr,
+  repo,
+  repoArgs = [],
+  prMeta = null,
+  cwd = process.cwd(),
+  onFallback = null,
+  spawnSyncFn = defaultSpawnSync
+} = {}) {
+  const maxBuffer = 100 * 1024 * 1024;
+  const effectiveRepoArgs =
+    repoArgs.length > 0 ? repoArgs : repo && !/^https?:\/\//i.test(String(pr)) ? ['--repo', repo] : [];
+
+  const diffRes = spawnSyncFn('gh', ['pr', 'diff', String(pr), ...effectiveRepoArgs], {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer
+  });
+  if (diffRes && diffRes.status === 0) {
+    return { diffText: diffRes.stdout || '', source: 'gh-pr-diff' };
+  }
+
+  const ghDiffErr = ((diffRes && (diffRes.stderr || diffRes.stdout)) || `gh pr diff ${pr} failed`).trim();
+  if (typeof onFallback === 'function') {
+    onFallback(ghDiffErr);
+  }
+
+  const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i.exec(
+    (prMeta && prMeta.url) || String(pr || '')
+  );
+  const resolvedRepo = (urlMatch && urlMatch[1]) || repo || null;
+  const resolvedPr = (prMeta && prMeta.number) || (urlMatch && urlMatch[2]) || String(pr).replace(/^#/, '');
+
+  // Fallback 1: Local git repository diff (no line limit)
+  const localDiff = tryLocalGitDiff({
+    repo: resolvedRepo,
+    pr: resolvedPr,
+    baseRefOid: prMeta && prMeta.baseRefOid,
+    headRefOid: prMeta && prMeta.headRefOid,
+    baseRefName: prMeta && prMeta.baseRefName,
+    cwd,
+    spawnSyncFn
+  });
+  if (localDiff !== null && localDiff.trim()) {
+    return { diffText: localDiff, source: 'local-git-diff' };
+  }
+
+  // Fallback 2: GitHub Pull Request Files API (`repos/{owner}/{repo}/pulls/{pr}/files`)
+  if (resolvedRepo && resolvedPr) {
+    const filesApiRes = spawnSyncFn(
+      'gh',
+      ['api', `repos/${resolvedRepo}/pulls/${resolvedPr}/files?per_page=100`, '--paginate', '--slurp'],
+      { cwd, encoding: 'utf8', maxBuffer }
+    );
+    if (filesApiRes && filesApiRes.status === 0 && (filesApiRes.stdout || '').trim()) {
+      try {
+        const apiFiles = parsePaginatedGhJson(filesApiRes.stdout);
+        const synthesized = synthesizeUnifiedDiffFromFiles(apiFiles, (prMeta && prMeta.files) || []);
+        if (synthesized.trim() || apiFiles.length === 0) {
+          return { diffText: synthesized, source: 'gh-pr-files-api' };
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Fallback 3: `prMeta.files` from `gh pr view --json files`
+  if (prMeta && Array.isArray(prMeta.files) && prMeta.files.length > 0) {
+    const synthesized = synthesizeUnifiedDiffFromFiles([], prMeta.files);
+    return { diffText: synthesized, source: 'pr-meta-files' };
+  }
+
+  throw new Error(ghDiffErr);
+}
+
 module.exports = {
   classifyFilePath,
   inferFlowName,
   parseUnifiedDiff,
   extractTestCasesFromHunks,
   buildLayersFromParsedDiff,
-  extractDiffSlice
+  extractDiffSlice,
+  synthesizeUnifiedDiffFromFiles,
+  tryLocalGitDiff,
+  fetchPrDiffWithFallback
 };

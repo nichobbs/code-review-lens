@@ -12,10 +12,14 @@ const {
   parseOverviewComment,
   buildGitHubReviewPayload,
   hydrateFromGitHubComments,
+  parsePaginatedGhJson,
   classifyFilePath,
   inferFlowName,
   parseUnifiedDiff,
+  buildLayersFromParsedDiff,
   extractDiffSlice,
+  synthesizeUnifiedDiffFromFiles,
+  fetchPrDiffWithFallback,
   checkFindingsShape,
   compileFindingsToWorkbenchReport,
   parseGitHubRepoSlug,
@@ -488,4 +492,114 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
   } finally {
     if (fs.existsSync(tmpSubmitPath)) fs.unlinkSync(tmpSubmitPath);
   }
+});
+
+test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via local git & per-file API', () => {
+  // 1. parsePaginatedGhJson handles single page, --slurp nested pages, and concatenated pages
+  assert.deepEqual(parsePaginatedGhJson('[{"id":1},{"id":2}]'), [{ id: 1 }, { id: 2 }]);
+  assert.deepEqual(parsePaginatedGhJson('[[{"id":1}],[{"id":2}]]'), [{ id: 1 }, { id: 2 }]);
+  assert.deepEqual(parsePaginatedGhJson('[{"id":1}]\n[{"id":2}]'), [{ id: 1 }, { id: 2 }]);
+
+  // 2. synthesizeUnifiedDiffFromFiles + parseUnifiedDiff preserves hunks AND omitted-patch stats
+  const apiFiles = [
+    {
+      filename: 'services/hub/src/openapi-spec.ts',
+      status: 'modified',
+      additions: 2,
+      deletions: 1,
+      patch: '@@ -1,3 +1,4 @@\n-export const v = "1.0";\n+export const v = "2.0";\n+export const path = "/v2/hub";'
+    },
+    {
+      filename: 'services/hub/test/hub.test.ts',
+      status: 'added',
+      additions: 5,
+      deletions: 0,
+      patch: '@@ -0,0 +1,5 @@\n+describe("Hub", () => {\n+  it("returns v2", () => {\n+    expect(v).toBe("2.0");\n+  });\n+});'
+    },
+    {
+      // Giant lockfile where GitHub omits `patch` and causes `gh pr diff` HTTP 406
+      filename: 'package-lock.json',
+      status: 'modified',
+      additions: 21500,
+      deletions: 4200
+    }
+  ];
+
+  const synthesized = synthesizeUnifiedDiffFromFiles(apiFiles);
+  const parsed = parseUnifiedDiff(synthesized);
+  assert.equal(parsed.length, 3);
+  const layers = buildLayersFromParsedDiff(parsed, []);
+  assert.equal(layers.contracts.length, 1);
+  assert.equal(layers.testMatrix.length, 1);
+  assert.equal(layers.testMatrix[0].cases.length, 1);
+  assert.equal(layers.testMatrix[0].cases[0].behavior, 'returns v2');
+  assert.equal(layers.config.length, 1);
+  assert.equal(layers.config[0].path, 'package-lock.json');
+  assert.equal(layers.config[0].additions, 21500);
+  assert.equal(layers.config[0].deletions, 4200);
+
+  // 3. fetchPrDiffWithFallback falls back to gh-pr-files-api when gh pr diff returns HTTP 406
+  const http406Err =
+    'could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)\nPullRequest.diff too_large';
+  let fallbackLogged = '';
+
+  const fallbackApiResult = fetchPrDiffWithFallback({
+    pr: 1480,
+    repo: 'transurban/cx-integration-hub',
+    prMeta: {
+      number: 1480,
+      url: 'https://github.com/transurban/cx-integration-hub/pull/1480',
+      baseRefOid: 'aaaa1111',
+      headRefOid: 'bbbb2222'
+    },
+    onFallback: (msg) => {
+      fallbackLogged = msg;
+    },
+    spawnSyncFn: (bin, args) => {
+      if (bin === 'gh' && args[0] === 'pr' && args[1] === 'diff') {
+        return { status: 1, stdout: '', stderr: http406Err };
+      }
+      if (bin === 'git') {
+        // Simulate running outside the git repo
+        return { status: 128, stdout: '', stderr: 'not a git repository' };
+      }
+      if (bin === 'gh' && args[0] === 'api' && args[1].includes('/pulls/1480/files')) {
+        return { status: 0, stdout: JSON.stringify([apiFiles]), stderr: '' };
+      }
+      return { status: 1, stdout: '', stderr: 'unexpected call' };
+    }
+  });
+
+  assert.match(fallbackLogged, /PullRequest\.diff too_large/);
+  assert.equal(fallbackApiResult.source, 'gh-pr-files-api');
+  assert.equal(parseUnifiedDiff(fallbackApiResult.diffText).length, 3);
+
+  // 4. fetchPrDiffWithFallback uses local-git-diff when inside the git repo with commits present
+  const fallbackGitResult = fetchPrDiffWithFallback({
+    pr: 1480,
+    repo: 'transurban/cx-integration-hub',
+    prMeta: {
+      number: 1480,
+      baseRefOid: 'aaaa1111',
+      headRefOid: 'bbbb2222'
+    },
+    spawnSyncFn: (bin, args) => {
+      if (bin === 'gh' && args[0] === 'pr' && args[1] === 'diff') {
+        return { status: 1, stdout: '', stderr: http406Err };
+      }
+      if (bin === 'git' && args[0] === 'rev-parse') {
+        return { status: 0, stdout: 'true\n', stderr: '' };
+      }
+      if (bin === 'git' && args[0] === 'cat-file') {
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (bin === 'git' && args[0] === 'diff') {
+        return { status: 0, stdout: synthesized, stderr: '' };
+      }
+      return { status: 1, stdout: '', stderr: 'unexpected' };
+    }
+  });
+
+  assert.equal(fallbackGitResult.source, 'local-git-diff');
+  assert.equal(parseUnifiedDiff(fallbackGitResult.diffText).length, 3);
 });

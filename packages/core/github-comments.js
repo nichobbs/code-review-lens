@@ -379,6 +379,27 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
   return { overviewMeta, findingThreads, generalComments };
 }
 
+/**
+ * Safely parses JSON output from `gh api ... --paginate` (with or without `--slurp`).
+ * Handles single JSON arrays, `--slurp` nested page arrays (`[[...], [...]]`), and
+ * concatenated page arrays (`[...]\n[...]`) produced when `--paginate` runs without `--slurp`.
+ */
+function parsePaginatedGhJson(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return [];
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return parsed.length > 0 && Array.isArray(parsed[0]) ? parsed.flat() : parsed;
+    }
+    return [parsed];
+  } catch (e) {
+    const normalized = '[' + trimmed.replace(/\]\s*\[/g, '],[') + ']';
+    const pages = JSON.parse(normalized);
+    return Array.isArray(pages) ? pages.flat() : [];
+  }
+}
+
 module.exports = {
   SEVERITY_BADGES,
   TRIAGE_LABELS,
@@ -389,5 +410,6 @@ module.exports = {
   serializeOverviewComment,
   parseOverviewComment,
   buildGitHubReviewPayload,
-  hydrateFromGitHubComments
+  hydrateFromGitHubComments,
+  parsePaginatedGhJson
 };
