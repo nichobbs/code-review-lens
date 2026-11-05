@@ -38,18 +38,41 @@
       const raw = localStorage.getItem(storageKey());
       if (raw) {
         triage = JSON.parse(raw) || {};
+      } else {
+        triage = {};
       }
     } catch (e) {
       triage = {};
     }
+
+    const ghOverviewTriage = report?.GITHUB_STATE?.overviewMeta?.triage || {};
+    const ghThreads = report?.GITHUB_STATE?.findingThreads || {};
+
     if (report && Array.isArray(report.DATA)) {
       for (const d of report.DATA) {
+        const ghThread = ghThreads[d.id];
+        const ghSaved = ghOverviewTriage[d.id];
         if (!triage[d.id]) {
+          const action =
+            ghThread?.action ||
+            ghSaved?.action ||
+            d.suggestedTriage ||
+            (d.sev === 'high' ? 'block' : 'comment');
+          const note = ghThread?.note || ghSaved?.note || '';
+          const done = Boolean(ghThread || ghSaved?.done);
           triage[d.id] = {
-            action: d.suggestedTriage || (d.sev === 'high' ? 'block' : 'comment'),
-            note: '',
-            done: false
+            action,
+            note,
+            done,
+            ghCommentId: ghThread?.commentId,
+            ghUrl: ghThread?.htmlUrl
           };
+        } else if (ghThread) {
+          triage[d.id].ghCommentId = ghThread.commentId;
+          triage[d.id].ghUrl = ghThread.htmlUrl;
+          if (!triage[d.id].note && ghThread.note) {
+            triage[d.id].note = ghThread.note;
+          }
         }
       }
     }
@@ -155,12 +178,13 @@
     const findingsCount = report?.DATA?.length || 0;
     const contractsCount = (report?.LAYERS?.contracts?.length || 0) + (report?.LAYERS?.flows?.length || 0);
     const testsCount = report?.LAYERS?.testMatrix?.length || 0;
+    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 13;
 
     const nav = $('#layerNav');
     if (!nav) return;
 
     const items = [
-      { id: 'overview', label: '1. Intent & Arch', badge: '13 lenses' },
+      { id: 'overview', label: '1. Intent & Arch', badge: `${lensesCount} lenses` },
       { id: 'findings', label: '2. Risk Findings', badge: String(findingsCount) },
       { id: 'contracts', label: '3. Contracts & Flows', badge: String(contractsCount) },
       { id: 'tests', label: '4. Test Matrix', badge: String(testsCount) }
@@ -303,6 +327,14 @@
   function renderOverviewLayer() {
     const s = report?.SUMMARY || {};
     const rev = report?.REVIEW || {};
+    const issues = report?.DATA || [];
+    const highMed = issues.filter((d) => d.sev === 'high' || d.sev === 'medium');
+    const verifiedHighMed = highMed.filter((d) => d.verify === 'CONFIRMED' || d.verify === 'PLAUSIBLE');
+    const verifyText = highMed.length > 0
+      ? `✓ ${verifiedHighMed.length} / ${highMed.length} High & Medium Findings Verified`
+      : issues.length > 0
+        ? `✓ ${issues.length} Findings Loaded`
+        : '✓ 4-Layer Diff Decomposition Ready';
     const points = (s.points || [])
       .map((p) => `<li><code>${escapeHtml(p.split(':')[0])}</code>:${escapeHtml(p.split(':').slice(1).join(':'))}</li>`)
       .join('');
@@ -320,7 +352,7 @@
 
       <div class="fhead">
         <div class="fmeta">
-          <span class="verify-pill">✓ 13 / 13 High & Medium Findings Verified</span>
+          <span class="verify-pill">${escapeHtml(verifyText)}</span>
           <span>Agent: <strong>${escapeHtml(rev.agent || 'Antigravity')}</strong> (${escapeHtml(rev.model || 'Claude Opus 4.6')})</span>
           <span>Head: <code>${escapeHtml((rev.head || '').slice(0, 8))}</code></span>
         </div>
@@ -341,51 +373,60 @@
     const flows = report?.LAYERS?.flows || [];
 
     const contractCards = contracts
-      .map(
-        (c) => `<div class="layer-card">
+      .map((c) => {
+        const diffSum = c.diffSummary || c.summary || '';
+        const linked = c.linkedFindings || c.findings || [];
+        return `<div class="layer-card">
           <div class="layer-card-header">
             <h3 class="layer-card-title"><code>${escapeHtml(c.path)}</code></h3>
-            <span class="status-badge solid">${escapeHtml(c.category)}</span>
+            <span class="status-badge solid">${escapeHtml(c.category || 'Contract')}</span>
           </div>
-          <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(c.summary)}</p>
-          <div style="font:400 12px var(--mono);background:var(--well);padding:6px 10px;border-radius:4px;margin-bottom:8px;">
-            ${escapeHtml(c.diffSummary)}
-          </div>
-          <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(c.summary || '')}</p>
+          ${diffSum ? `<div style="font:400 12px var(--mono);background:var(--well);padding:6px 10px;border-radius:4px;margin-bottom:8px;">
+            ${escapeHtml(diffSum)}
+          </div>` : ''}
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;">
             <strong style="color:var(--muted)">Linked Findings:</strong>
-            ${(c.linkedFindings || [])
-              .map(
-                (fid) =>
-                  `<button type="button" class="btn" style="height:24px;padding:0 8px;font-size:11px;" data-jump-finding="${escapeHtml(fid)}">Jump to ${escapeHtml(fid)}</button>`
-              )
-              .join('')}
+            ${linked.length
+              ? linked
+                  .map(
+                    (fid) =>
+                      `<button type="button" class="btn" style="height:24px;padding:0 8px;font-size:11px;" data-jump-finding="${escapeHtml(fid)}">Jump to ${escapeHtml(fid)}</button>`
+                  )
+                  .join('')
+              : '<span style="color:var(--muted)">None</span>'}
           </div>
-        </div>`
-      )
+        </div>`;
+      })
       .join('');
 
     const flowCards = flows
-      .map(
-        (f) => `<div class="layer-card">
+      .map((f) => {
+        const title = f.title || f.name || 'Execution Flow';
+        const desc = f.description || f.summary || '';
+        const linked = f.linkedFindings || f.findings || [];
+        return `<div class="layer-card">
           <div class="layer-card-header">
-            <h3 class="layer-card-title">${escapeHtml(f.title)}</h3>
+            <h3 class="layer-card-title">${escapeHtml(title)}</h3>
             <span class="tpill">${(f.files || []).length} files</span>
           </div>
-          <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(f.description)}</p>
+          <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(desc)}</p>
           <ul style="margin:0 0 10px;padding-left:18px;font:400 12px/1.6 var(--mono);color:var(--ink-2)">
             ${(f.files || []).map((file) => `<li>${escapeHtml(file)}</li>`).join('')}
           </ul>
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;">
             <strong style="color:var(--muted)">Findings in this Flow:</strong>
-            ${(f.linkedFindings || [])
-              .map(
-                (fid) =>
-                  `<button type="button" class="btn" style="height:24px;padding:0 8px;font-size:11px;" data-jump-finding="${escapeHtml(fid)}">${escapeHtml(fid)}</button>`
-              )
-              .join('')}
+            ${linked.length
+              ? linked
+                  .map(
+                    (fid) =>
+                      `<button type="button" class="btn" style="height:24px;padding:0 8px;font-size:11px;" data-jump-finding="${escapeHtml(fid)}">${escapeHtml(fid)}</button>`
+                  )
+                  .join('')
+              : '<span style="color:var(--muted)">None</span>'}
           </div>
-        </div>`
-      )
+        </div>`;
+      })
       .join('');
 
     return `<div class="panein">
@@ -398,11 +439,11 @@
       </div>
       <div class="sec">
         <h4>Public Contracts, Schemas, Feature Flags & ADRs (${contracts.length})</h4>
-        ${contractCards}
+        ${contractCards || '<p style="color:var(--muted)">No contract or schema files modified in this diff.</p>'}
       </div>
       <div class="sec">
         <h4>Story-Ordered Production Flows (${flows.length})</h4>
-        ${flowCards}
+        ${flowCards || '<p style="color:var(--muted)">No production flow files modified in this diff.</p>'}
       </div>
     </div>`;
   }
@@ -411,25 +452,39 @@
     const matrix = report?.LAYERS?.testMatrix || [];
     const cards = matrix
       .map((suite) => {
-        const rows = (suite.scenarios || [])
-          .map(
-            (sc) => `<tr>
-              <td>${escapeHtml(sc.behavior)}${sc.note ? `<div style="color:var(--s-high-ink);font-size:11.5px;margin-top:2px;">⚠️ ${escapeHtml(sc.note)}</div>` : ''}</td>
-              <td class="num" style="text-align:center;font-weight:700;">${sc.assertions}</td>
-              <td><span class="status-badge ${escapeHtml(sc.status)}">${escapeHtml(sc.status)}</span></td>
-            </tr>`
-          )
+        const scenarios = suite.scenarios || suite.cases || [];
+        const totalCases = suite.totalCases ?? scenarios.length;
+        const assertionsCount =
+          suite.assertionsCount ?? scenarios.reduce((sum, c) => sum + (c.assertions || 0), 0);
+        const linked = suite.linkedFindings || suite.findings || [];
+
+        const rows = scenarios
+          .map((sc) => {
+            const st = sc.status || (sc.hollow ? 'hollow' : sc.mockOnly ? 'flawed-spec' : 'solid');
+            const note =
+              sc.note ||
+              (sc.hollow
+                ? 'Zero assertions detected in test body'
+                : sc.mockOnly
+                  ? 'Mock-only assertions'
+                  : '');
+            return `<tr>
+              <td>${escapeHtml(sc.behavior)}${note ? `<div style="color:var(--s-high-ink);font-size:11.5px;margin-top:2px;">⚠️ ${escapeHtml(note)}</div>` : ''}</td>
+              <td class="num" style="text-align:center;font-weight:700;">${sc.assertions ?? 0}</td>
+              <td><span class="status-badge ${escapeHtml(st)}">${escapeHtml(st)}</span></td>
+            </tr>`;
+          })
           .join('');
 
         return `<div class="layer-card">
           <div class="layer-card-header">
             <div>
-              <h3 class="layer-card-title">${escapeHtml(suite.suite)}</h3>
+              <h3 class="layer-card-title">${escapeHtml(suite.suite || suite.file)}</h3>
               <div style="font:400 11.5px var(--mono);color:var(--muted)">${escapeHtml(suite.file)}</div>
             </div>
             <div style="display:flex;gap:6px;align-items:center;">
-              <span class="tpill num">${suite.totalCases} tests · ${suite.assertionsCount} assertions</span>
-              ${(suite.linkedFindings || [])
+              <span class="tpill num">${totalCases} tests · ${assertionsCount} assertions</span>
+              ${linked
                 .map(
                   (fid) =>
                     `<button type="button" class="btn" style="height:24px;padding:0 8px;font-size:11px;" data-jump-finding="${escapeHtml(fid)}">See ${escapeHtml(fid)}</button>`
@@ -445,12 +500,14 @@
                 <th style="width:120px;">Verdict</th>
               </tr>
             </thead>
-            <tbody>${rows}</tbody>
+            <tbody>${rows || '<tr><td colspan="3" style="color:var(--muted)">No individual test cases parsed from diff hunks.</td></tr>'}</tbody>
           </table>
           <details style="margin-top:10px;font-size:12px;color:var(--muted)">
             <summary style="cursor:pointer;font-weight:600;">Raw AI-generated unit test boilerplate collapsed by default (click to inspect)</summary>
-            <div style="margin-top:6px;padding:8px 10px;background:var(--well);border-radius:4px;font-family:var(--mono);">
-              Raw mock setup in <code>${escapeHtml(suite.file)}</code> is hidden so human reviewers can focus on behavioral coverage and assertion gaps above.
+            <div style="margin-top:6px;padding:8px 10px;background:var(--well);border-radius:4px;font-family:var(--mono);overflow-x:auto;">
+              ${suite.rawDiff
+                ? `<pre style="margin:0;white-space:pre-wrap;font:400 11.5px/1.45 var(--mono);color:var(--ink-2);">${escapeHtml(suite.rawDiff)}</pre>`
+                : `Raw mock setup in <code>${escapeHtml(suite.file)}</code> is hidden so human reviewers can focus on behavioral coverage and assertion gaps above.`}
             </div>
           </details>
         </div>`;
@@ -536,6 +593,27 @@
           ? `<div class="sec">
               <h4>Verifier & Evidence</h4>
               <div class="prose">${d.reasoning}</div>
+            </div>`
+          : ''
+      }
+
+      ${
+        report?.GITHUB_STATE?.findingThreads?.[d.id]?.replies?.length
+          ? `<div class="sec">
+              <h4>GitHub PR Thread Replies (${report.GITHUB_STATE.findingThreads[d.id].replies.length})</h4>
+              <div style="display:flex;flex-direction:column;gap:8px;">
+                ${report.GITHUB_STATE.findingThreads[d.id].replies
+                  .map(
+                    (rep) => `<div style="padding:8px 12px;border-radius:6px;border:1px solid var(--rule);background:var(--surface);font-size:12.5px;">
+                      <div style="font-weight:700;color:var(--ink-2);margin-bottom:4px;">
+                        @${escapeHtml(rep.author || 'reviewer')}
+                        ${rep.createdAt ? `<span style="font-weight:400;color:var(--muted);margin-left:6px;">${escapeHtml(rep.createdAt)}</span>` : ''}
+                      </div>
+                      <div style="white-space:pre-wrap;">${escapeHtml(rep.body || '')}</div>
+                    </div>`
+                  )
+                  .join('')}
+              </div>
             </div>`
           : ''
       }
@@ -633,15 +711,20 @@
 
     const inlineComments = published.map((d) => {
       const t = getTriage(d.id);
-      const [filePath, lineStr] = String(d.loc || '').split(':');
+      const locMatch = /^(.+):(\d+)(?:-(\d+))?$/.exec(String(d.loc || '').trim());
+      const filePath = locMatch ? locMatch[1] : String(d.loc || '').trim();
+      const lineNum = locMatch ? Number(locMatch[2]) : 1;
       const meta = {
         v: 1,
         id: d.id,
         sev: d.sev,
+        cat: d.cat || '',
         verify: d.verify || '',
         action: t.action,
         loc: d.loc || '',
-        head: report?.REVIEW?.head || ''
+        title: d.title || '',
+        head: report?.REVIEW?.head || '',
+        pr: report?.REVIEW?.pr || null
       };
       const bodyParts = [
         `<!-- crv-finding: ${JSON.stringify(meta)} -->`,
@@ -650,30 +733,72 @@
         stripHtmlToMd(d.impact),
         '',
         stripHtmlToMd(d.fix)
-      ].filter(Boolean);
+      ];
+      if (d.mermaid) {
+        bodyParts.push(
+          '',
+          '<details>',
+          '<summary>Architecture / Flow Diagram & Reasoning</summary>',
+          '',
+          '```mermaid',
+          d.mermaid.trim(),
+          '```',
+          d.reasoning ? `\n${stripHtmlToMd(d.reasoning)}` : '',
+          '</details>'
+        );
+      } else if (d.reasoning) {
+        bodyParts.push(
+          '',
+          '<details>',
+          '<summary>Verification & Reasoning</summary>',
+          '',
+          stripHtmlToMd(d.reasoning),
+          '</details>'
+        );
+      }
 
       return {
         path: filePath,
-        line: Number(lineStr) || 1,
+        line: lineNum || 1,
         side: 'RIGHT',
-        body: bodyParts.join('\n')
+        body: bodyParts.filter(Boolean).join('\n')
       };
     });
+
+    const counts = { block: 0, comment: 0, dismiss: 0, pending: 0 };
+    for (const d of issues) {
+      const act = getTriage(d.id).action || 'pending';
+      counts[act] = (counts[act] || 0) + 1;
+    }
 
     const overviewMeta = {
       v: 1,
       repo: report?.REVIEW?.repo || '',
       pr: report?.REVIEW?.pr || 0,
       head: report?.REVIEW?.head || '',
+      counts,
       triage: Object.fromEntries(
-        issues.map((d) => [d.id, { action: getTriage(d.id).action, note: getTriage(d.id).note }])
+        issues.map((d) => [d.id, { action: getTriage(d.id).action, done: Boolean(getTriage(d.id).done), note: getTriage(d.id).note }])
       )
     };
+
+    const overviewLines = [
+      `<!-- crv-meta: ${JSON.stringify(overviewMeta)} -->`,
+      `## 🛡️ Agentic PR Review Workbench — ${report?.PR?.label || `PR #${overviewMeta.pr || ''}`}`,
+      '',
+      summaryNote ? `${summaryNote.trim()}\n` : '',
+      `| Triage Status | Count | Description |`,
+      `| :--- | :---: | :--- |`,
+      `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
+      `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
+      `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
+      `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`
+    ].filter(Boolean);
 
     const reviewPayload = {
       commit_id: report?.REVIEW?.head,
       event: selectedEvent,
-      body: `<!-- crv-meta: ${JSON.stringify(overviewMeta)} -->\n## 🛡️ Agentic PR Review (${published.length} curated findings)\n\n${summaryNote}`.trim(),
+      body: overviewLines.join('\n').trim(),
       comments: inlineComments
     };
 
@@ -719,8 +844,7 @@
   }
 
   function setupDialogAndTheme() {
-    const dialog = $('#ghReviewDialog');
-    if (dialog) {
+    document.querySelectorAll('dialog[closedby="any"]').forEach((dialog) => {
       // Fallback for browsers without native closedby="any" support per modern-web-guidance
       if (!('closedBy' in HTMLDialogElement.prototype)) {
         dialog.addEventListener('click', (event) => {
@@ -739,7 +863,7 @@
       dialog.addEventListener('close', () => {
         dialog.returnValue = '';
       });
-    }
+    });
 
     // Two-state dark mode toggle per modern-web-guidance (`dark-mode-toggle`)
     const themeBtn = $('#themeToggleBtn');
@@ -1170,7 +1294,7 @@
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save default repo');
         if (sourceBadge) sourceBadge.textContent = `source: .crvrc.json`;
-        if (statusEl) statusEl.textContent = `✓ Saved default repo ${data.repo} to ${data.savedTo}`;
+        if (statusEl) statusEl.textContent = `✓ Saved default repo ${data.repo} to ${data.saved?.configPath || data.savedTo || '.crvrc.json'}`;
         populateRecentPrs(data.repo);
       } catch (err) {
         if (statusEl) statusEl.textContent = `⚠ ${err.message}`;
@@ -1284,9 +1408,27 @@
       }
     });
 
+    if (ghConnected && typeof EventSource !== 'undefined') {
+      try {
+        const es = new EventSource(apiUrl('/api/events'));
+        es.addEventListener('report-updated', async () => {
+          try {
+            const rRes = await fetch(apiUrl('/api/report'));
+            if (rRes.ok) {
+              report = await rRes.json();
+              loadTriage();
+              renderHeader();
+              renderRack();
+              renderPane();
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+
     window.addEventListener('keydown', (e) => {
-      if (['TEXTAREA', 'INPUT'].includes(e.target?.tagName)) return;
-      if ($('#ghReviewDialog')?.open) return;
+      if (['TEXTAREA', 'INPUT', 'SELECT'].includes(e.target?.tagName)) return;
+      if ($('#ghReviewDialog')?.open || $('#switchPrDialog')?.open) return;
       if (e.key === 'j' || e.key === 'ArrowDown') {
         e.preventDefault();
         stepFinding(1);

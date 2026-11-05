@@ -8,7 +8,7 @@ Run it when the reviewer names an earlier report, asks to re-review a PR that ha
 
 1. **From the previous HTML/JSON report** (when available):
    ```bash
-   /usr/bin/python3 <skill>/scripts/extract_findings.py <previous-report.html> <scratch>/previous-findings.json
+   python3 <skill>/scripts/extract_findings.py <previous-report.html> <scratch>/previous-findings.json
    ```
    Both `build_report.py` and `crv export-html` embed `<script type="application/json" id="crv-findings">`, so `extract_findings.py` recovers the exact `findings.json` losslessly.
 2. **From GitHub PR comments (`<scratch>/github-threads.json`)**:
@@ -55,5 +55,5 @@ crv export-html <scratch>/findings.json --diff <scratch>/diff.patch --out .crv-s
 Or with the classic flight-strip builder:
 
 ```bash
-/usr/bin/python3 <skill>/scripts/build_report.py <scratch>/findings.json --revise <previous-report.html>
+python3 <skill>/scripts/build_report.py <scratch>/findings.json --revise <previous-report.html>
 ```

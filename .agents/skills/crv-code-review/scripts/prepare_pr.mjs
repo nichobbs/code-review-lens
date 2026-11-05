@@ -81,8 +81,10 @@ function main() {
       fs.writeFileSync(targetDiff, diffText);
     }
   } else {
-    const resolvedCfg = resolveRepoConfig({ explicitRepo: repo });
+    const shortMatch = /^([^/]+\/[^#]+)#(\d+)$/.exec(String(prInput));
+    const resolvedCfg = resolveRepoConfig({ explicitRepo: repo || (shortMatch && shortMatch[1]) });
     const activeRepo = resolvedCfg.repo || null;
+    const targetPr = shortMatch ? shortMatch[2] : String(prInput).replace(/^#/, '');
     const isFullUrl = /^https?:\/\//i.test(String(prInput));
     if (!isFullUrl && !activeRepo) {
       console.error(
@@ -100,7 +102,7 @@ function main() {
     const prMetaRaw = runGh([
       'pr',
       'view',
-      String(prInput),
+      String(targetPr),
       ...repoArgs,
       '--json',
       'number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,files,reviews,comments,statusCheckRollup'
@@ -108,12 +110,12 @@ function main() {
     const prMeta = JSON.parse(prMetaRaw);
     fs.writeFileSync(path.join(absScratch, 'pr-meta.json'), JSON.stringify(prMeta, null, 2));
 
-    diffText = runGh(['pr', 'diff', String(prInput), ...repoArgs]);
+    diffText = runGh(['pr', 'diff', String(targetPr), ...repoArgs]);
     fs.writeFileSync(path.join(absScratch, 'diff.patch'), diffText);
 
     const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(prMeta.url || '');
     const resolvedRepo = (urlMatch ? urlMatch[1] : null) || activeRepo;
-    const prNum = prMeta.number || (urlMatch ? urlMatch[2] : prInput);
+    const prNum = prMeta.number || (urlMatch ? urlMatch[2] : targetPr);
 
     if (resolvedRepo && prNum) {
       try {

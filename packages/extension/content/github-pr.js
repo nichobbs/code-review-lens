@@ -86,7 +86,12 @@
   }
 
   function injectWorkbenchButton(findingCount) {
-    if (document.querySelector('#crv-workbench-trigger')) return;
+    const existingBtn = document.querySelector('#crv-workbench-trigger');
+    if (existingBtn) {
+      const badge = existingBtn.querySelector('.crv-ext-badge');
+      if (badge) badge.textContent = String(findingCount || 'Open');
+      return;
+    }
     const navBar =
       document.querySelector('.tabnav-tabs') ||
       document.querySelector('.gh-header-actions');
@@ -96,7 +101,11 @@
     btn.id = 'crv-workbench-trigger';
     btn.type = 'button';
     btn.className = 'crv-ext-tab-btn';
-    btn.innerHTML = `🛡️ Agent Workbench <span class="crv-ext-badge">${findingCount || 'Open'}</span>`;
+    btn.append('🛡️ Agent Workbench ');
+    const badge = document.createElement('span');
+    badge.className = 'crv-ext-badge';
+    badge.textContent = String(findingCount || 'Open');
+    btn.appendChild(badge);
     btn.addEventListener('click', async () => {
       try {
         await chrome.runtime.sendMessage({ type: 'OPEN_SIDE_PANEL' });
@@ -108,6 +117,7 @@
   }
 
   async function initPrPage() {
+    if (!parsePrUrl()) return;
     try {
       const result = await scanPageCommentsForCrvMarkers();
       injectWorkbenchButton(result.findings.length);
@@ -136,5 +146,7 @@
     return true;
   });
 
+  document.addEventListener('turbo:load', initPrPage);
+  window.addEventListener('popstate', initPrPage);
   initPrPage();
 })();

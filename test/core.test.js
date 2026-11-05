@@ -110,6 +110,21 @@ test('GitHub sticky overview comment round-trips crv-meta & hydrateFromGitHubCom
         body: 'Fixed in commit abc1234!',
         user: { login: 'colleague' },
         created_at: '2026-10-30T02:00:00Z'
+      },
+      {
+        id: 6001,
+        path: 'services/loyalty/member-services/src/functions/close-account/service-handler.ts',
+        line: 70,
+        body: 'Human reviewer question on line 70',
+        user: { login: 'teammate' },
+        html_url: 'https://github.com/pr/1230#discussion_r6001'
+      },
+      {
+        id: 6002,
+        in_reply_to_id: 6001,
+        body: 'Good catch, will update.',
+        user: { login: 'author' },
+        created_at: '2026-10-30T03:00:00Z'
       }
     ]
   );
@@ -119,6 +134,11 @@ test('GitHub sticky overview comment round-trips crv-meta & hydrateFromGitHubCom
   assert.equal(hydrated.findingThreads.H1.action, 'block');
   assert.equal(hydrated.findingThreads.H1.replies.length, 1);
   assert.equal(hydrated.findingThreads.H1.replies[0].body, 'Fixed in commit abc1234!');
+  assert.equal(hydrated.generalComments.length, 1);
+  assert.equal(hydrated.generalComments[0].author, 'teammate');
+  assert.equal(hydrated.generalComments[0].line, 70);
+  assert.equal(hydrated.generalComments[0].replies.length, 1);
+  assert.equal(hydrated.generalComments[0].replies[0].body, 'Good catch, will update.');
 });
 
 test('4-Layer diff classifier & Behavioral Test Matrix extractor work on unified diffs', () => {
@@ -237,10 +257,19 @@ test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings
   assert.ok(compiled.DATA[0].diffSlice);
   assert.equal(compiled.DATA[0].diffSlice.targetLine, 14);
   assert.equal(compiled.LAYERS.contracts.length, 1);
+  assert.ok(compiled.LAYERS.contracts[0].diffSummary.includes('/v1/member/close'));
+  assert.deepEqual(compiled.LAYERS.contracts[0].linkedFindings, []);
   assert.equal(compiled.LAYERS.flows.length, 1);
   assert.deepEqual(compiled.LAYERS.flows[0].findings, ['H1']);
+  assert.deepEqual(compiled.LAYERS.flows[0].linkedFindings, ['H1']);
+  assert.ok(compiled.LAYERS.flows[0].title);
+  assert.ok(compiled.LAYERS.flows[0].description);
   assert.equal(compiled.LAYERS.testMatrix.length, 1);
   assert.equal(compiled.LAYERS.testMatrix[0].cases.length, 3);
+  assert.equal(compiled.LAYERS.testMatrix[0].scenarios.length, 3);
+  assert.equal(compiled.LAYERS.testMatrix[0].totalCases, 3);
+  assert.equal(compiled.LAYERS.testMatrix[0].assertionsCount, 2);
+  assert.ok(compiled.LAYERS.testMatrix[0].rawDiff.includes('closes active member'));
   assert.equal(compiled.LAYERS.testMatrix[0].cases[0].hollow, false);
   assert.equal(compiled.LAYERS.testMatrix[0].cases[1].hollow, true);
   assert.equal(compiled.LAYERS.testMatrix[0].cases[2].mockOnly, true);
@@ -262,7 +291,7 @@ test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings
   fs.writeFileSync(htmlPath, buildStandaloneHtml(compiled));
   const extractedPath = path.join(tmpDir, 'extracted-findings.json');
   const extractScript = path.join(__dirname, '../.agents/skills/crv-code-review/scripts/extract_findings.py');
-  const extractStdout = execFileSync('/usr/bin/python3', [extractScript, htmlPath, extractedPath], { encoding: 'utf8' });
+  const extractStdout = execFileSync('python3', [extractScript, htmlPath, extractedPath], { encoding: 'utf8' });
   assert.match(extractStdout, /mode:exact/);
   const recovered = JSON.parse(fs.readFileSync(extractedPath, 'utf8'));
   assert.equal(recovered.issues[0].id, 'H1');
@@ -438,4 +467,96 @@ test('Chrome Extension standalone workbench bundle, MV3 CSP compliance, and loca
 
   const evilRes = invokeServer('GET', '/api/health', 'https://evil.example.com');
   assert.equal(evilRes.headers['access-control-allow-origin'], undefined);
+});
+
+test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prevents static path traversal', async () => {
+  const { PassThrough } = require('node:stream');
+  const report = loadReportFile(path.join(__dirname, '../fixtures/pr1230-report.json'));
+  const tmpSubmitPath = path.join(os.tmpdir(), `crv-test-submit-${Date.now()}.json`);
+  const { server } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath });
+
+  function invokeServer({ method = 'GET', url = '/', headers = {}, body = null }) {
+    return new Promise((resolve, reject) => {
+      const req = new PassThrough();
+      req.method = method;
+      req.url = url;
+      req.headers = { host: '127.0.0.1:4320', ...headers };
+
+      const res = new PassThrough();
+      res.statusCode = 200;
+      res.headers = {};
+      res.setHeader = (k, v) => {
+        res.headers[k.toLowerCase()] = v;
+      };
+      res.writeHead = (statusCode, hdrs = {}) => {
+        res.statusCode = statusCode;
+        res.headers = { ...res.headers, ...hdrs };
+        return res;
+      };
+      const chunks = [];
+      res.on('data', (c) => chunks.push(Buffer.from(c)));
+      res.on('finish', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          text: async () => text,
+          json: async () => JSON.parse(text)
+        });
+      });
+      res.on('error', reject);
+
+      server.emit('request', req, res);
+      if (body !== null) {
+        req.write(body);
+      }
+      req.end();
+    });
+  }
+
+  try {
+    // 1. GET /api/report
+    const repRes = await invokeServer({ method: 'GET', url: '/api/report' });
+    assert.equal(repRes.status, 200);
+    const repData = await repRes.json();
+    assert.equal(repData.REVIEW.pr, 1230);
+
+    // 2. Reject cross-origin POST (CSRF protection)
+    const csrfRes = await invokeServer({
+      method: 'POST',
+      url: '/api/github/submit-review',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'https://evil.example.com'
+      },
+      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: {} })
+    });
+    assert.equal(csrfRes.status, 403);
+
+    // 3. Allow Chrome Extension and localhost POSTs
+    const extRes = await invokeServer({
+      method: 'POST',
+      url: '/api/github/submit-review',
+      headers: {
+        'content-type': 'application/json',
+        origin: 'chrome-extension://abcdefghijklmnop'
+      },
+      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: { event: 'COMMENT' } })
+    });
+    assert.equal(extRes.status, 200);
+    const extJson = await extRes.json();
+    assert.equal(extJson.ok, true);
+    assert.equal(extJson.savedTo, tmpSubmitPath);
+
+    // 4. Static asset serving & path traversal check
+    const indexRes = await invokeServer({ method: 'GET', url: '/' });
+    assert.equal(indexRes.status, 200);
+    const indexHtml = await indexRes.text();
+    assert.ok(indexHtml.includes('id="resizer"'));
+
+    const traversalRes = await invokeServer({ method: 'GET', url: '/..%2f..%2fpackage.json' });
+    assert.equal(traversalRes.status, 404);
+  } finally {
+    if (fs.existsSync(tmpSubmitPath)) fs.unlinkSync(tmpSubmitPath);
+  }
 });

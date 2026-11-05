@@ -86,7 +86,7 @@ Write `findings.json` in the scratch folder, in the shape in [findings.md](./ref
    ```bash
    crv export-html <scratch>/findings.json --diff <scratch>/diff.patch --out .crv-skills/crv-code-review/pr<N>-workbench.html
    ```
-   (You can also run `/usr/bin/python3 <skill>/scripts/build_report.py <scratch>/findings.json <out>` if the classic flight-strip view is requested.)
+   (You can also run `python3 <skill>/scripts/build_report.py <scratch>/findings.json <out>` if the classic flight-strip view is requested.)
    When `SHAPE:` warnings are printed, fix the findings named and rebuild.
 2. **Start the interactive Workbench server** so the human reviewer can triage findings (`🚫 Block`, `💬 Comment`, `🔇 Dismiss`) and publish directly to GitHub PR comments:
    ```bash

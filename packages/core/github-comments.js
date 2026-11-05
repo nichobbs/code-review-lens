@@ -50,7 +50,7 @@ function stripHtmlToMarkdown(html) {
 
 function parseLoc(loc) {
   if (!loc) return { path: '', line: null };
-  const match = /^([^:]+):(\d+)(?:-(\d+))?$/.exec(String(loc).trim());
+  const match = /^(.+):(\d+)(?:-(\d+))?$/.exec(String(loc).trim());
   if (!match) return { path: String(loc).trim(), line: null };
   return {
     path: match[1],
@@ -77,6 +77,7 @@ function serializeFindingComment(finding, triage = {}, reviewMeta = {}) {
     verify: finding.verify || '',
     action,
     loc: finding.loc || '',
+    title: finding.title || '',
     head: reviewMeta.head || '',
     pr: reviewMeta.pr || null,
     updatedAt: new Date().toISOString()
@@ -289,8 +290,10 @@ function buildGitHubReviewPayload(report, triageMap = {}, options = {}) {
 function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
   let overviewMeta = null;
   const findingThreads = {};
+  const generalComments = [];
+  const generalByCommentId = new Map();
 
-  for (const ic of issueComments) {
+  for (const ic of issueComments || []) {
     const parsed = parseOverviewComment(ic.body);
     if (parsed) {
       overviewMeta = {
@@ -300,15 +303,29 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
         author: ic.user?.login || 'unknown',
         updatedAt: ic.updated_at || parsed.updatedAt
       };
+    } else if (ic && ic.body) {
+      generalComments.push({
+        id: ic.id,
+        path: null,
+        line: null,
+        author: ic.user?.login || 'unknown',
+        body: ic.body,
+        url: ic.html_url || '',
+        createdAt: ic.created_at || ic.updated_at || '',
+        replies: []
+      });
     }
   }
 
-  for (const rc of reviewComments) {
+  for (const rc of reviewComments || []) {
     const parsed = parseFindingComment(rc.body);
     if (parsed && parsed.meta?.id) {
       const id = parsed.meta.id;
+      const headingMatch = /^###\s+.*?`[^`]+`\s+—\s+([^\n·]+)/m.exec(rc.body || '');
+      const title = parsed.meta.title || (headingMatch ? headingMatch[1].trim() : `Finding ${id}`);
       findingThreads[id] = {
         id,
+        title,
         commentId: rc.id,
         htmlUrl: rc.html_url,
         path: rc.path,
@@ -316,6 +333,7 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
         author: rc.user?.login || 'unknown',
         action: parsed.meta.action,
         note: parsed.note,
+        body: rc.body || '',
         meta: parsed.meta,
         replies: []
       };
@@ -331,11 +349,34 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
           createdAt: rc.created_at,
           htmlUrl: rc.html_url
         });
+      } else if (generalByCommentId.has(rc.in_reply_to_id)) {
+        generalByCommentId.get(rc.in_reply_to_id).replies.push({
+          id: rc.id,
+          author: rc.user?.login || 'unknown',
+          body: rc.body,
+          createdAt: rc.created_at,
+          htmlUrl: rc.html_url
+        });
+      }
+    } else if (rc && rc.body) {
+      const entry = {
+        id: rc.id,
+        path: rc.path || null,
+        line: rc.line || rc.original_line || 1,
+        author: rc.user?.login || 'unknown',
+        body: rc.body,
+        url: rc.html_url || '',
+        createdAt: rc.created_at || rc.updated_at || '',
+        replies: []
+      };
+      generalComments.push(entry);
+      if (rc.id != null) {
+        generalByCommentId.set(rc.id, entry);
       }
     }
   }
 
-  return { overviewMeta, findingThreads };
+  return { overviewMeta, findingThreads, generalComments };
 }
 
 module.exports = {

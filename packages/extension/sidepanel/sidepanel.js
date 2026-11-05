@@ -1,7 +1,6 @@
 'use strict';
 
-const LOCAL_SERVER_ORIGIN = 'http://127.0.0.1:4320';
-
+let activeServerOrigin = 'http://127.0.0.1:4320';
 let activePrInfo = { repo: '', pr: 0, title: '' };
 let localServerOnline = false;
 
@@ -10,7 +9,8 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function parseGitHubPrUrl(urlStr) {
@@ -36,21 +36,38 @@ function updateCliCommandBox() {
   }
 }
 
+async function resolveLocalServerHealth() {
+  for (let port = 4320; port <= 4325; port++) {
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 500);
+      const res = await fetch(`${base}/api/health`, {
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.ok) {
+          return { origin: base, port, data };
+        }
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
 async function checkLocalServerStatus() {
   const badgeEl = document.getElementById('serverStatusBadge');
   const detailEl = document.getElementById('localServerDetail');
   const localBtn = document.getElementById('openFullWorkbenchBtn');
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1500);
-    const res = await fetch(`${LOCAL_SERVER_ORIGIN}/api/health`, {
-      signal: controller.signal
-    });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    localServerOnline = Boolean(data?.ok);
+    const detected = await resolveLocalServerHealth();
+    if (!detected) throw new Error('Local server offline');
+    activeServerOrigin = detected.origin;
+    const { data, port } = detected;
+    localServerOnline = true;
 
     if (badgeEl) {
       badgeEl.textContent = '🟢 Local Server Online';
@@ -59,17 +76,18 @@ async function checkLocalServerStatus() {
     if (detailEl) {
       detailEl.textContent =
         data.activeRepo && data.activePr
-          ? `Serving ${data.activeRepo}#${data.activePr}`
-          : 'Listening on :4320';
+          ? `Serving ${data.activeRepo}#${data.activePr} (:${port})`
+          : `Listening on :${port}`;
     }
     if (localBtn) {
       localBtn.textContent =
         activePrInfo.repo && activePrInfo.pr
-          ? `Load PR #${activePrInfo.pr} in :4320`
-          : 'Open Local Server (:4320)';
+          ? `Load PR #${activePrInfo.pr} in :${port}`
+          : `Open Local Server (:${port})`;
     }
   } catch (err) {
     localServerOnline = false;
+    activeServerOrigin = 'http://127.0.0.1:4320';
     if (badgeEl) {
       badgeEl.textContent = '⚪ Standalone Mode';
       badgeEl.classList.remove('online');
@@ -153,7 +171,7 @@ function renderFindings(container, findings) {
   container.innerHTML = findings
     .map(
       (f) => `<div class="finding-item">
-        <strong>${escapeHtml(f.id || 'Finding')}</strong> (${escapeHtml((f.sev || 'info').toUpperCase())}) · <code>${escapeHtml(f.action || 'comment')}</code>
+        <strong>${escapeHtml(f.id || 'Finding')}</strong> (${escapeHtml(String(f.sev || 'info').toUpperCase())}) · <code>${escapeHtml(f.action || 'comment')}</code>
         ${f.title ? `<div style="margin-top:2px;font-weight:500;">${escapeHtml(f.title)}</div>` : ''}
         <div style="color:var(--muted);margin-top:2px;font-family:var(--mono);font-size:11px;">${escapeHtml(f.loc || '')}</div>
       </div>`
@@ -179,7 +197,7 @@ document.getElementById('openFullWorkbenchBtn')?.addEventListener('click', async
         btn.textContent = `Loading PR #${activePrInfo.pr}...`;
       }
       try {
-        await fetch(`${LOCAL_SERVER_ORIGIN}/api/github/load-pr`, {
+        await fetch(`${activeServerOrigin}/api/github/load-pr`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -191,7 +209,7 @@ document.getElementById('openFullWorkbenchBtn')?.addEventListener('click', async
         // Proceed to open tab even if load-pr fails
       }
     }
-    await chrome.tabs.create({ url: LOCAL_SERVER_ORIGIN });
+    await chrome.tabs.create({ url: activeServerOrigin });
   } catch (err) {
     console.error('Failed to open local server tab:', err);
   } finally {

@@ -247,6 +247,22 @@ html, body {
   user-select: none;
 }
 
+.resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 10;
+  transition: background 0.12s;
+}
+
+.resizer:hover,
+.resizer.drag {
+  background: var(--accent);
+}
+
 .layer-nav {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -858,7 +874,8 @@ dialog::backdrop {
   backdrop-filter: blur(2px);
 }
 
-dialog#ghReviewDialog {
+dialog#ghReviewDialog,
+dialog#switchPrDialog {
   border: 1px solid var(--rule-strong);
   border-radius: 10px;
   padding: 0;
@@ -869,7 +886,8 @@ dialog#ghReviewDialog {
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
 }
 
-dialog#ghReviewDialog[open] {
+dialog#ghReviewDialog[open],
+dialog#switchPrDialog[open] {
   display: flex;
   flex-direction: column;
 }
