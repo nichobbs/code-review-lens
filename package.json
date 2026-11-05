@@ -22,6 +22,7 @@
     "review": "node ./packages/cli/bin/crv.js review",
     "export-html": "node ./packages/cli/bin/crv.js export-html",
     "install-skill": "node ./packages/cli/bin/crv.js install-skill",
+    "sync-extension": "node ./scripts/sync-extension-workbench.js",
     "test": "node --test ./test/*.test.js"
   },
   "engines": {

@@ -10,14 +10,31 @@
     return { repo: m[1], pr: Number(m[2]) };
   }
 
+  function extractPageMetadata(prInfo) {
+    const titleEl =
+      document.querySelector('.js-issue-title') ||
+      document.querySelector('bdi.markdown-title') ||
+      document.querySelector('.gh-header-title');
+    const branchEls = Array.from(document.querySelectorAll('.commit-ref'));
+    const baseBranch = branchEls[0]?.textContent?.trim() || '';
+    const headBranch = branchEls[1]?.textContent?.trim() || '';
+    return {
+      title: titleEl ? titleEl.textContent.trim() : `PR #${prInfo.pr}`,
+      url: `https://github.com/${prInfo.repo}/pull/${prInfo.pr}`,
+      baseBranch,
+      headBranch
+    };
+  }
+
   /**
    * Scans GitHub PR comment DOM nodes in batches using requestAnimationFrame
    * so we never block the main thread on large PR threads.
    */
   async function scanPageCommentsForCrvMarkers() {
     const prInfo = parsePrUrl();
-    if (!prInfo) return { repo: '', pr: 0, meta: null, findings: [] };
+    if (!prInfo) return { repo: '', pr: 0, title: '', url: '', meta: null, findings: [] };
 
+    const pageMeta = extractPageMetadata(prInfo);
     const commentElements = Array.from(
       document.querySelectorAll('.comment-body, textarea[name="comment[body]"]')
     );
@@ -40,7 +57,14 @@
             const findingMatch = FINDING_RE.exec(raw);
             if (findingMatch) {
               try {
-                findings.push(JSON.parse(findingMatch[1]));
+                const parsedFinding = JSON.parse(findingMatch[1]);
+                const headingEl = el.querySelector ? el.querySelector('h3, h4, strong') : null;
+                const textBody = (el.textContent || '').trim();
+                findings.push({
+                  ...parsedFinding,
+                  title: parsedFinding.title || (headingEl ? headingEl.textContent.trim() : ''),
+                  body: parsedFinding.body || textBody
+                });
               } catch (e) {}
             }
           }
@@ -55,6 +79,7 @@
     return {
       repo: prInfo.repo,
       pr: prInfo.pr,
+      ...pageMeta,
       meta: discoveredMeta,
       findings
     };

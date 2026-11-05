@@ -669,6 +669,24 @@ function buildStandaloneHtml(report) {
     .replace('<script src="./workbench.js"></script>', `<script>\n${workbenchJs}\n</script>`);
 }
 
+function isAllowedCorsOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false;
+  return (
+    /^chrome-extension:\/\/[a-p]{32}$/.test(origin) ||
+    /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)
+  );
+}
+
+function applyCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (isAllowedCorsOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+}
+
 /**
  * Validates that a mutating HTTP request originates from localhost, 127.0.0.1,
  * a Chrome extension, or a non-browser local client (no Origin/Sec-Fetch-Site).
@@ -754,12 +772,33 @@ function createWorkbenchServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
+    applyCorsHeaders(req, res);
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
     // Reject cross-origin POST requests to protect local state and GitHub credentials
     if (req.method === 'POST' && !isAllowedLocalOrigin(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: false, error: 'Forbidden cross-origin request' }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          status: 'online',
+          activeRepo: report?.REVIEW?.repo || null,
+          activePr: report?.REVIEW?.pr || null,
+          title: report?.XMETA?.title || null
+        })
+      );
       return;
     }
 
@@ -964,5 +1003,6 @@ module.exports = {
   syncReportWithGitHub,
   syncReportWithGitHubAsync,
   buildStandaloneHtml,
-  createWorkbenchServer
+  createWorkbenchServer,
+  isAllowedCorsOrigin
 };
