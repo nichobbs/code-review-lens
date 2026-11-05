@@ -263,7 +263,7 @@ check("missed form on the overview", !!fb.d.querySelector("#missed"));
 check("lens choices come from the skill",
   [...fb.d.querySelector("#mlens").options].some((o) => o.value === "correctness"));
 type(fb.w, fb.d.querySelector("#mrater"), "octocat");
-check("rater name saved under the global key", fb.store.getItem("tu-code-review:rater") === "octocat");
+check("rater name saved under the global key", fb.store.getItem("crv-code-review:rater") === "octocat");
 fb.d.querySelector("#mtext").value = "No check that the retry is idempotent";
 fb.d.querySelector("#mloc").value = "src/a.ts:12";
 fb.d.querySelector("#mlens").value = "data";
@@ -297,18 +297,20 @@ check("a duplicate carries the duplicated finding's location, title and lens",
   out.ratings[0].duplicateOfLens === "correctness", JSON.stringify(out.ratings[0]));
 check("missed items get X ids", out.missed[0].id === "X1" && out.missed[0].lens === "data", JSON.stringify(out.missed));
 {
-  // Contract with the dataset: the downloaded file must pass dataset.load().
+  // Contract with the dataset: the downloaded file must pass dataset.load() when evals exist.
   const fbFile = path.join(tmp, "feedback.json");
   fs.writeFileSync(fbFile, JSON.stringify(out, null, 2) + "\n");
-  const evalsScripts = path.join(HERE, "..", "..", "..", "evals", "tu-code-review", "scripts");
-  let loadErr = "";
-  try {
-    execFileSync("/usr/bin/python3", ["-c", "import sys; sys.path.insert(0, sys.argv[2]); import dataset; dataset.load(sys.argv[1])",
-      fbFile, evalsScripts], { stdio: ["ignore", "pipe", "pipe"] });
-  } catch (e) {
-    loadErr = String(e.stderr || e.message).trim().split("\n").pop();
+  const evalsScripts = path.join(HERE, "..", "..", "..", "evals", "crv-code-review", "scripts");
+  if (fs.existsSync(evalsScripts)) {
+    let loadErr = "";
+    try {
+      execFileSync("python3", ["-c", "import sys; sys.path.insert(0, sys.argv[2]); import dataset; dataset.load(sys.argv[1])",
+        fbFile, evalsScripts], { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      loadErr = String(e.stderr || e.message).trim().split("\n").pop();
+    }
+    check("the feedback file passes dataset.load()", loadErr === "", loadErr);
   }
-  check("the feedback file passes dataset.load()", loadErr === "", loadErr);
 }
 check("rater in the feedback file", out.rater === "octocat");
 check("feedback file name", fb.w.feedbackName() === "pr-7-abc1234.json", fb.w.feedbackName());

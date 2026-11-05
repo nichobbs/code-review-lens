@@ -1,5 +1,28 @@
 'use strict';
 
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function resolveLocalWorkbenchUrl() {
+  for (let port = 4320; port <= 4325; port++) {
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 350);
+      const res = await fetch(`${base}/api/report`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (res.ok) return base;
+    } catch (e) {}
+  }
+  return 'http://127.0.0.1:4320';
+}
+
 async function refreshSidePanel() {
   const statusEl = document.getElementById('prStatus');
   const listEl = document.getElementById('findingsList');
@@ -41,8 +64,9 @@ function renderFindings(container, findings) {
   container.innerHTML = findings
     .map(
       (f) => `<div class="finding-item">
-        <strong>${f.id || 'Finding'}</strong> (${(f.sev || 'info').toUpperCase()}) · <code>${f.action || 'comment'}</code>
-        <div style="color:var(--muted);margin-top:2px;">${f.loc || ''}</div>
+        <strong>${escapeHtml(f.id || 'Finding')}</strong> (${escapeHtml(String(f.sev || 'info').toUpperCase())}) · <code>${escapeHtml(f.action || 'comment')}</code>
+        ${f.title ? `<div style="margin-top:2px;">${escapeHtml(f.title)}</div>` : ''}
+        <div style="color:var(--muted);margin-top:2px;">${escapeHtml(f.loc || '')}</div>
       </div>`
     )
     .join('');
@@ -50,7 +74,8 @@ function renderFindings(container, findings) {
 
 document.getElementById('openFullWorkbenchBtn')?.addEventListener('click', async () => {
   try {
-    await chrome.tabs.create({ url: 'http://127.0.0.1:4320' });
+    const url = await resolveLocalWorkbenchUrl();
+    await chrome.tabs.create({ url });
   } catch (err) {
     console.error('Failed to open Workbench tab:', err);
   }

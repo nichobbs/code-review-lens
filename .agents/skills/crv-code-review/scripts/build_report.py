@@ -754,7 +754,7 @@ let done=JSON.parse(localStorage.getItem(KEY)||'{}');
 const CKEY=KEY+':comments';
 let notes=JSON.parse(localStorage.getItem(CKEY)||'{}');
 // Ratings and missed items judge the review; they live beside comments and never tick a finding done.
-const RKEY=KEY+':ratings',MKEY=KEY+':missed',RATER='tu-code-review:rater';
+const RKEY=KEY+':ratings',MKEY=KEY+':missed',RATER='crv-code-review:rater';
 function readJSON(k,d){try{const v=JSON.parse(localStorage.getItem(k)||'null');return v==null?d:v;}catch(e){return d;}}
 let ratings=readJSON(RKEY,{}),missed=readJSON(MKEY,[]);
 let filter='all', tab='todo';
