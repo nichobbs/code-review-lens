@@ -203,22 +203,28 @@ LEADS_FIX = ("**Do:**", "**Check:**")
 SLOP_RE = re.compile(
     r"\b(?:delve|tapestry|testament|underscore[sd]?|pivotal|crucial|seamlessly|holistic|"
     r"paradigm|synergy|foster|elevate|beacon|landscape|interplay|intricate|meticulous|"
-    r"multifaceted|overarching|robust|streamline|utilize|leverage|load-bearing|fans out|"
-    r"poisons|evaporates|bolted on|earns its place|makes the call|leans on|sit with|"
-    r"the estate|closes the hole|hits a wall|single pane of glass)\b",
+    r"multifaceted|overarching|robust|streamline|utilize|leverage|facilitate|empower|"
+    r"cutting-edge|game changer|realm|paramount|transformative|embark|supercharge|harness|"
+    r"ever-evolving|load-bearing|fans out|poisons|evaporates|bolted on|earns its place|"
+    r"makes the call|leans on|sit with|the estate|closes the hole|hits a wall|"
+    r"single pane of glass)\b",
     re.IGNORECASE,
 )
 NOT_X_BUT_Y_RE = re.compile(r"\bnot\s+(?:just\s+|only\s+)?[^,;.]{2,35},\s*but\s+(?:rather\s+)?", re.IGNORECASE)
+
+CODE_SPAN_RE = re.compile(r"```[\s\S]*?```|``[^`\n]+``|`[^`\n]+`")
 
 def shape_warnings(findings):
     """Warn per issue when impact/fix stray from the lesson shape (references/findings.md,
     "Write each finding as one lesson") or contain banned AI filler / figurative idioms.
     Warnings only, so older findings files still build. Resolved issues are skipped."""
     msgs = []
-    summary_text = (findings.get("meta") or {}).get("summary") or ""
+    summary_text = CODE_SPAN_RE.sub(" ", (findings.get("meta") or {}).get("summary") or "")
     sm = SLOP_RE.search(summary_text)
     if sm:
         msgs.append("meta.summary: contains banned AI filler or figurative idiom '%s'" % sm.group(0))
+    if NOT_X_BUT_Y_RE.search(summary_text):
+        msgs.append("meta.summary: contains 'not X, but Y' contrast (state the positive claim directly)")
     for x in findings.get("issues", []):
         if not is_open(x):
             continue
@@ -233,7 +239,7 @@ def shape_warnings(findings):
             msgs.append("%s: impact is %d chars; aim under ~700 and move detail to `reasoning`" % (x["id"], len(imp)))
         if len(fix) > 500:
             msgs.append("%s: fix is %d chars; aim under ~450 and move detail to `reasoning`" % (x["id"], len(fix)))
-        prose = " ".join([x.get("title") or "", imp, fix])
+        prose = CODE_SPAN_RE.sub(" ", " ".join([x.get("title") or "", imp, fix]))
         m_slop = SLOP_RE.search(prose)
         if m_slop:
             msgs.append("%s: contains banned AI filler or figurative idiom '%s' (use literal prose)" % (x["id"], m_slop.group(0)))

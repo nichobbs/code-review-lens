@@ -6,12 +6,12 @@ Read `references/patterns.md` before this lens runs. Find callers and copies wit
 
 ## Looks for
 
-Run the six checks in this order.
+Run the five checks in this order.
 
 1. **Delete & YAGNI (6-part Lean taxonomy).** Apply the deletion test to new abstractions in the diff:
    - **Delete:** dead branches, unused exports, or speculative options/parameters with no caller in `<head>`.
    - **Reuse:** inspect `attentionSignals.reuseCandidates` and `attentionSignals.addedSymbols` in `<scratch>/layers.json`. For each client, helper, error type, interceptor, or config loader the diff adds, grep the repository for one that already does the job (or check whether the diff defines the same helper in two files). If one exists, the finding is to use it, with its `path:line`.
-   - **Stdlib / native over new dependency:** flag a newly added third-party package or custom utility when the language runtime or standard library (`crypto.randomUUID`, ` structuredClone`, `URLSearchParams`, `fs.promises`, `Array.prototype`) already provides it in 1–3 lines.
+   - **Stdlib / native over new dependency:** flag a newly added third-party package or custom utility when the language runtime or standard library (`crypto.randomUUID`, `structuredClone`, `URLSearchParams`, `fs.promises`, `Array.prototype`) already provides it in 1–3 lines.
    - **Single-implementation wrapper (`yagni`):** a new interface, abstract class, factory, or wrapper module with only one implementation (and no test fake that requires the seam) whose removal would only inline its calls into its caller.
    - **Merge pass-through layers:** a function or file that only forwards arguments unchanged to another function.
    - **Split by job, never by line count:** flag an arbitrary split where one cohesive job was chopped across files by line count, or a single function that mixes I/O orchestration with pure domain calculation.

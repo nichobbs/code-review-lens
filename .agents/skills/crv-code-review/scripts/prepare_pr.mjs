@@ -221,17 +221,36 @@ function main() {
   const codeownersRules = codeownersText ? parseCodeowners(codeownersText) : [];
 
   // Compute Caller Blast Radius for modified contract files
+  const IGNORED_CONTRACT_STEMS = new Set([
+    'index',
+    'models',
+    'schema',
+    'types',
+    'contract',
+    'contracts',
+    'skill',
+    'agents',
+    'claude',
+    'readme',
+    'config',
+    'package'
+  ]);
   const callerBlastRadius = {};
   for (const f of parsedFiles) {
-    if (f.layer !== 'contracts') continue;
+    if (f.layer !== 'contracts' || /\.md$/i.test(f.path)) continue;
     const baseStem = path.basename(f.path).replace(/\.[a-z0-9]+$/i, '');
     const contractSyms = (f.addedSymbols || []).map((s) => s.name);
     const searchTokens = [...new Set([...contractSyms, baseStem])].filter(
-      (t) => /^[A-Za-z0-9_-]{4,}$/.test(t) && !['index', 'models', 'schema', 'types'].includes(t.toLowerCase())
+      (t) =>
+        /^[A-Za-z0-9_][A-Za-z0-9_-]{3,}$/.test(t) &&
+        !IGNORED_CONTRACT_STEMS.has(t.toLowerCase())
     );
     if (searchTokens.length === 0) continue;
-    const tokPattern = searchTokens.slice(0, 6).join('|');
-    const cGrep = spawnSync('git', ['grep', '-l', '-E', tokPattern], {
+    const tokPattern = searchTokens
+      .slice(0, 6)
+      .map((t) => (/^[A-Za-z0-9_]+$/.test(t) ? `\\b${t}\\b` : t))
+      .join('|');
+    const cGrep = spawnSync('git', ['grep', '-l', '-E', '-e', tokPattern], {
       encoding: 'utf8',
       timeout: 4000,
       maxBuffer: 2 * 1024 * 1024
@@ -265,6 +284,31 @@ function main() {
 
   fs.writeFileSync(path.join(absScratch, 'layers.json'), JSON.stringify(layers, null, 2));
   fs.writeFileSync(path.join(absScratch, 'github-threads.json'), JSON.stringify(hydratedThreads, null, 2));
+
+  // Pre-bundle judge.md, findings.md, verifier.md, and all lenses/*.md into <scratch>/lenses-bundle.md
+  // so headless/interactive agents can read all rules and lenses in a single tool call instead of 17 sequential reads.
+  try {
+    const skillRoot = path.resolve(scriptDir, '..');
+    const refFiles = ['references/judge.md', 'references/findings.md', 'references/verifier.md'];
+    const lensesDir = path.join(skillRoot, 'lenses');
+    const lensFiles = fs.existsSync(lensesDir)
+      ? fs
+          .readdirSync(lensesDir)
+          .filter((n) => n.endsWith('.md'))
+          .sort()
+          .map((n) => `lenses/${n}`)
+      : [];
+    const bundleParts = [];
+    for (const rel of [...refFiles, ...lensFiles]) {
+      const full = path.join(skillRoot, rel);
+      if (fs.existsSync(full)) {
+        bundleParts.push(`<!-- ==================== ${rel} ==================== -->\n` + fs.readFileSync(full, 'utf8'));
+      }
+    }
+    if (bundleParts.length > 0) {
+      fs.writeFileSync(path.join(absScratch, 'lenses-bundle.md'), bundleParts.join('\n\n'));
+    }
+  } catch (e) {}
 
   const totalCases = layers.testMatrix.reduce((acc, f) => acc + f.cases.length, 0);
   const hollowCases = layers.testMatrix.reduce(

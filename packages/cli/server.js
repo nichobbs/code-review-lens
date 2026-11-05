@@ -36,20 +36,44 @@ function loadReportFile(filePath, options = {}) {
   if (resolved.endsWith('.json')) {
     const parsed = JSON.parse(content);
     if (parsed && Array.isArray(parsed.issues) && !Array.isArray(parsed.DATA)) {
+      const dir = path.dirname(resolved);
       let diffText = options.diffText || '';
       if (!diffText && options.diffPath && fs.existsSync(options.diffPath)) {
         diffText = fs.readFileSync(options.diffPath, 'utf8');
       } else if (!diffText) {
-        const siblingDiff = path.join(path.dirname(resolved), 'diff.patch');
+        const siblingDiff = path.join(dir, 'diff.patch');
         if (fs.existsSync(siblingDiff)) {
           diffText = fs.readFileSync(siblingDiff, 'utf8');
+        }
+      }
+      let prMeta = options.prMeta || null;
+      if (!prMeta) {
+        const siblingPrMeta = path.join(dir, 'pr-meta.json');
+        if (fs.existsSync(siblingPrMeta)) {
+          try {
+            prMeta = JSON.parse(fs.readFileSync(siblingPrMeta, 'utf8'));
+          } catch (e) {}
+        }
+      }
+      let layers = options.layers || null;
+      if (!layers) {
+        const siblingLayers = path.join(dir, 'layers.json');
+        if (fs.existsSync(siblingLayers)) {
+          try {
+            layers = JSON.parse(fs.readFileSync(siblingLayers, 'utf8'));
+          } catch (e) {}
         }
       }
       const warnings = checkFindingsShape(parsed);
       if (warnings.length) {
         console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
       }
-      return compileFindingsToWorkbenchReport(parsed, { diffText, outPath: options.outPath });
+      return compileFindingsToWorkbenchReport(parsed, {
+        diffText,
+        prMeta,
+        layers,
+        outPath: options.outPath
+      });
     }
     return parsed;
   }
@@ -240,15 +264,24 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
   }
 
   // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json matching this repo
-  const scratchCandidates = [
-    path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}/findings.json`)
-  ];
-  const scratchFindingsPath = scratchCandidates.find((p) => fs.existsSync(p));
-  if (scratchFindingsPath) {
+  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}`);
+  const scratchFindingsPath = path.join(scratchDir, 'findings.json');
+  const scratchLayersPath = path.join(scratchDir, 'layers.json');
+  let stagedLayers = null;
+  if (fs.existsSync(scratchLayersPath)) {
+    try {
+      stagedLayers = JSON.parse(fs.readFileSync(scratchLayersPath, 'utf8'));
+    } catch (e) {}
+  }
+  if (fs.existsSync(scratchFindingsPath)) {
     const findingsJson = JSON.parse(fs.readFileSync(scratchFindingsPath, 'utf8'));
     const findingsRepo = findingsJson?.meta?.review?.repo || findingsJson?.REVIEW?.repo || '';
     if (!findingsRepo || !repo || String(findingsRepo).toLowerCase() === String(repo).toLowerCase()) {
-      const compiled = compileFindingsToWorkbenchReport(findingsJson, { diffText, prMeta });
+      const compiled = compileFindingsToWorkbenchReport(findingsJson, {
+        diffText,
+        prMeta,
+        layers: stagedLayers
+      });
       compiled.GITHUB_STATE = hydrated;
       return compiled;
     }
@@ -369,7 +402,11 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
     issues: autoIssues
   };
 
-  const compiled = compileFindingsToWorkbenchReport(syntheticFindings, { diffText });
+  const compiled = compileFindingsToWorkbenchReport(syntheticFindings, {
+    diffText,
+    prMeta,
+    layers: stagedLayers
+  });
   compiled.GITHUB_STATE = hydrated;
   return compiled;
 }

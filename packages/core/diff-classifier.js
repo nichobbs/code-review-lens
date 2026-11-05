@@ -207,7 +207,7 @@ function parseUnifiedDiff(diffText) {
     if (classification.layer === 'tests') {
       fileEntry.testMatrix = extractTestCasesFromHunks(filePath, hunks);
       fileEntry.internalMocks = extractInternalMocksFromHunks(hunks);
-      fileEntry.shortcuts = extractShortcutsFromHunks(filePath, hunks);
+      fileEntry.shortcuts = [];
     } else if (classification.layer === 'flows' || classification.layer === 'contracts') {
       fileEntry.removedGuards = extractRemovedGuardsFromHunks(filePath, hunks);
       fileEntry.addedSymbols = extractAddedSymbolsFromHunks(filePath, hunks);
@@ -340,18 +340,26 @@ function extractShortcutsFromHunks(filePath, hunks) {
   if (Array.isArray(filePath)) {
     const all = [];
     for (const f of filePath) {
+      if (f.layer === 'tests') continue;
       all.push(...extractShortcutsFromHunks(f.path, f.hunks));
     }
     return all;
   }
+  const normPath = String(filePath || '').replace(/\\/g, '/');
+  if (/\.(?:md|mdx|txt|rst)$/i.test(normPath) || TEST_PATTERNS.some((re) => re.test(normPath))) {
+    return [];
+  }
+
   const shortcuts = [];
-  const markerRe = /(?:\/\/|#|\/\*+|\*)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)(?:\*\/)?$/i;
+  // Match full-line comments or trailing comments not enclosed in quotes or backticks
+  const fullLineCommentRe = /^\s*(?:\/\/|#|\/\*+|\*)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)(?:\*\/)?$/i;
+  const trailingCommentRe = /^[^'"`]*?(?:\/\/|#)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)$/i;
 
   for (const hunk of hunks || []) {
     for (const l of hunk.lines || []) {
       if (l.type !== 'add') continue;
       const text = String(l.content || '').trim();
-      const m = markerRe.exec(text);
+      const m = fullLineCommentRe.exec(text) || trailingCommentRe.exec(text);
       if (!m) continue;
 
       const marker = m[1].toLowerCase();
@@ -399,28 +407,32 @@ function parseCodeowners(codeownersText) {
   if (!codeownersText || typeof codeownersText !== 'string') return [];
   const rules = [];
   for (const rawLine of codeownersText.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const parts = line.split(/\s+/);
+    const stripped = rawLine.replace(/\s+#.*$/, '').trim();
+    if (!stripped || stripped.startsWith('#')) continue;
+    const parts = stripped.split(/\s+/);
     if (parts.length < 2) continue;
     const pattern = parts[0];
     const owners = parts.slice(1).filter((p) => p.startsWith('@') || p.includes('@'));
     if (!owners.length) continue;
 
     const clean = pattern.replace(/^\//, '').replace(/\/$/, '');
-    const anchored = pattern.startsWith('/');
+    const anchored = pattern.startsWith('/') || clean.includes('/');
     const dirOnly = pattern.endsWith('/');
+    const endsWithSingleWildcard = /(?:^|\/)\*[^/]*$/.test(clean) && !/\*\*$/.test(clean);
     const escaped = clean
       .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\?/g, '[^/]')
+      .replace(/\/\*\*\//g, '__SLASH_DOUBLE_STAR_SLASH__')
       .replace(/\*\*/g, '__DOUBLE_STAR__')
       .replace(/\*/g, '[^/]*')
-      .replace(/__DOUBLE_STAR__/g, '.*')
-      .replace(/\?/g, '[^/]');
+      .replace(/__SLASH_DOUBLE_STAR_SLASH__/g, '(?:/.*)?/')
+      .replace(/__DOUBLE_STAR__/g, '.*');
 
+    const suffix = dirOnly ? '(?:/.*)?$' : endsWithSingleWildcard ? '$' : '(?:/.*|$)';
     const regexStr =
       pattern === '*'
         ? '^.*$'
-        : `${anchored ? '^' : '(?:^|/)'}${escaped}${dirOnly ? '(?:/.*)?$' : '(?:/.*|$)'}`;
+        : `${anchored ? '^' : '(?:^|/)'}${escaped}${suffix}`;
     try {
       rules.push({ pattern, regex: new RegExp(regexStr), owners });
     } catch (e) {}
@@ -494,14 +506,23 @@ function analyzeSpecAlignment(parsedFiles = [], prMeta = null) {
 
       if (section === 'out-of-scope' && bullet) {
         outOfScope.push(itemText);
+        continue;
       } else if (section === 'precedent' && bullet) {
         repoPrecedents.push(itemText);
+        continue;
       }
 
-      if (/\bGiven\b[\s\S]+\bWhen\b[\s\S]+\bThen\b/i.test(itemText)) {
-        rawClauses.push({ kind: 'BDD', clause: itemText.slice(0, 220) });
-      } else if (/\b(?:WHEN|WHILE)\b[^.]+?\bSHALL\b|\bIF\b[^.]+?\bTHEN\b[^.]+?\bSHALL\b/i.test(itemText)) {
-        rawClauses.push({ kind: 'EARS', clause: itemText.slice(0, 220) });
+      const unbackticked = itemText.replace(/`[^`]*`/g, '');
+      const allowSpecMatch =
+        section === 'spec' || /^(?:given|when|while|if)\s+/i.test(unbackticked.trim());
+      if (allowSpecMatch) {
+        if (/\bGiven\s+[\s\S]+\bWhen\s+[\s\S]+\bThen\s+/i.test(unbackticked)) {
+          rawClauses.push({ kind: 'BDD', clause: itemText.slice(0, 220) });
+        } else if (
+          /\b(?:WHEN|WHILE)\s+[^.]+?\bSHALL\s+|\bIF\s+[^.]+?\bTHEN\s+[^.]+?\bSHALL\s+/i.test(unbackticked)
+        ) {
+          rawClauses.push({ kind: 'EARS', clause: itemText.slice(0, 220) });
+        }
       }
     }
   }
@@ -510,15 +531,22 @@ function analyzeSpecAlignment(parsedFiles = [], prMeta = null) {
   if (outOfScope.length > 0) {
     for (const f of parsedFiles || []) {
       if ((f.additions || 0) + (f.deletions || 0) === 0) continue;
-      const normPath = String(f.path || '').toLowerCase();
+      const normPath = String(f.path || '').toLowerCase().replace(/\\/g, '/');
       for (const item of outOfScope) {
-        const backticks = [...item.matchAll(/`([^`]+)`/g)].map((m) => m[1].toLowerCase().trim());
+        const cleanToken = (t) => t.toLowerCase().trim().replace(/^[.,:;!?'"]+|[.,:;!?'"]+$/g, '').replace(/^\/+|\/+$/g, '');
+        const isPathLike = (t) =>
+          t.length >= 4 &&
+          (t.includes('/') || /\.[a-z0-9]{1,5}$/i.test(t));
+        const backticks = [...item.matchAll(/`([^`]+)`/g)].map((m) => cleanToken(m[1])).filter(isPathLike);
         const pathTokens = item
-          .toLowerCase()
           .split(/[\s,;()]+/)
-          .filter((t) => (t.includes('/') || t.endsWith('.ts') || t.endsWith('.js') || t.endsWith('.py')) && t.length >= 4);
-        const candidates = [...new Set([...backticks, ...pathTokens])].filter((c) => c.length >= 4);
-        const matchedToken = candidates.find((c) => normPath.includes(c));
+          .map(cleanToken)
+          .filter(isPathLike);
+        const candidates = [...new Set([...backticks, ...pathTokens])];
+        const matchedToken = candidates.find((c) => {
+          const esc = c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`(?:^|/)${esc}(?:/|$)`).test(normPath);
+        });
         if (matchedToken) {
           negativeSpaceViolations.push({
             path: f.path,

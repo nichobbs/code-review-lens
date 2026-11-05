@@ -4,7 +4,8 @@ Checks the draft findings in a fresh context, so the agent that raised a finding
 
 ## How to run it
 
-- When you can start a separate agent with its own context, start one verifier agent for all the `high` and `medium` findings. Never start one agent per finding, because the cost grows with the number of findings.
+- In **headless / single-turn CLI mode** (`-p` / non-interactive runs), **never** spawn an asynchronous background subagent (`invoke_subagent`) that requires ending your turn to wait for a wakeup notification—doing so stalls the single-turn CLI process before `findings.json` is written. Instead, verify the `high` and `medium` findings one at a time in the same context, and note that in the coverage section.
+- In interactive sessions where you can start a separate agent with its own context, start one verifier agent for all the `high` and `medium` findings. Never start one agent per finding, because the cost grows with the number of findings.
 - When you cannot, check the findings one at a time in the same context, and say so in the coverage note.
 - `low` and `nit` findings skip the verifier. The main agent checks them in triage step 3.
 - Give the verifier a result file, `verifier-result.json` in the scratch folder. Its final reply can reach a different agent from the one that started it, so read the result from the file. When the verifier stops and the file does not exist, check the findings in the same context, and say so in the coverage note.

@@ -342,9 +342,11 @@
       specClauses.length > 0;
     const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
     const leanSavedLinesTotal =
-      s.leanSavedLinesTotal ||
-      report?.LAYERS?.leanSavedLinesTotal ||
-      issues.reduce((acc, x) => acc + (Number(x.leanSavedLines) || 0), 0);
+      s.leanSavedLinesTotal ??
+      report?.LAYERS?.leanSavedLinesTotal ??
+      issues
+        .filter((x) => !report?.STAT?.[x.status?.state || 'open']?.r)
+        .reduce((acc, x) => acc + (Number(x.leanSavedLines) || 0), 0);
 
     const signalsHtml = hasSignals
       ? `<div class="sec">
@@ -441,16 +443,17 @@
             ? `<div style="margin:6px 0 8px;font-size:12px;color:var(--ink-2);">
                 <strong>External Callers (${blast.callers.length}):</strong>
                 ${blast.callers
-                  .map(
-                    (cl) =>
-                      `<code style="margin-right:6px;">${escapeHtml(cl.path)}${
-                        cl.owners && cl.owners.length
-                          ? ` (${escapeHtml(cl.owners.join(', '))})`
-                          : blast.unownedCallersCount > 0
-                            ? ' (unowned)'
-                            : ''
-                      }</code>`
-                  )
+                  .map((cl) => {
+                    const callerPath = typeof cl === 'string' ? cl : cl?.path || '';
+                    const callerOwners = Array.isArray(cl?.owners) ? cl.owners : [];
+                    return `<code style="margin-right:6px;">${escapeHtml(callerPath)}${
+                      callerOwners.length
+                        ? ` (${escapeHtml(callerOwners.join(', '))})`
+                        : blast.unownedCallersCount > 0 && typeof cl === 'object'
+                          ? ' (unowned)'
+                          : ''
+                    }</code>`;
+                  })
                   .join('')}
               </div>`
             : '';

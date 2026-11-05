@@ -327,17 +327,22 @@ function saveDefaultAgentConfig(agentId, options = {}) {
 function buildReviewSkillPrompt({ repo, pr, scratchDir, skillDir, headless, agentName, modelName }) {
   const skillMdPath = path.join(skillDir, 'SKILL.md');
   const findingsPath = path.join(scratchDir, 'findings.json');
+  const bundlePath = path.join(scratchDir, 'lenses-bundle.md');
   const provenanceNote =
     agentName || modelName
       ? `Record meta.review.agent as "${agentName || 'AI Agent'}"${modelName ? ` and meta.review.model as "${modelName}"` : ''} in ${findingsPath}.`
       : '';
   const lines = [
     `Review PR #${pr} in ${repo} using the crv-code-review skill at ${skillMdPath}.`,
-    `The PR metadata (pr-meta.json), unified diff (diff.patch), 4-Layer map (layers.json), and GitHub threads (github-threads.json) are already prepared in ${scratchDir}.`,
+    `The PR metadata (pr-meta.json), unified diff (diff.patch), 4-Layer map (layers.json), GitHub threads (github-threads.json), and pre-bundled lenses/references (${bundlePath}) are already prepared in ${scratchDir}.`,
     provenanceNote,
     headless
-      ? `Run non-interactively: pick the triggered lenses from ${path.join(skillDir, 'references/judge.md')}, apply each lens from ${path.join(skillDir, 'lenses')} to the diff, verify high/medium findings, and write the final ${findingsPath} following the exact schema in ${path.join(skillDir, 'references/findings.md')}.`
-      : `Follow ${skillMdPath} starting at Step 2 using the prepared files in ${scratchDir}, show the lens pick table, and write ${findingsPath}.`
+      ? `FAST HEADLESS MODE:
+1. Read ${path.join(scratchDir, 'pr-meta.json')}, ${path.join(scratchDir, 'layers.json')}, ${path.join(scratchDir, 'diff.patch')}, and ${bundlePath} (which bundles judge.md, findings.md, verifier.md, and all 14 lens files so you do not need to read each lens file separately).
+2. Evaluate all triggered lenses in a single pass and verify high/medium findings directly against <head> in the SAME turn and context.
+3. DO NOT call invoke_subagent or spawn background tasks in headless mode (async subagents will stall single-turn -p CLI execution), and DO NOT write separate intermediate lens-<name>.json files.
+4. Write the final ${findingsPath} directly following the exact schema in references/findings.md and finish.`
+      : `Follow ${skillMdPath} starting at Step 2 using the prepared files in ${scratchDir} (you may read ${bundlePath} to load all lenses and references in one read), show the lens pick table, and write ${findingsPath}.`
   ].filter(Boolean);
   return lines.join('\n');
 }

@@ -758,23 +758,27 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
   assert.equal(unbounded.hasTrigger, false);
   assert.equal(unbounded.rotRisk, true);
 
-  // CODEOWNERS parsing & matching
+  // CODEOWNERS parsing & matching (including /* single-level wildcard, **/ zero-dir glob, and inline comments)
   const codeownersRules = parseCodeowners([
     '# Core owners',
-    '/packages/api/ @platform-team @api-leads',
-    '/packages/legacy-auth/ @security-team'
+    '/packages/api/ @platform-team @api-leads # inline comment',
+    '/packages/legacy-auth/ @security-team',
+    '/packages/* @root-pkg-owner',
+    'packages/**/index.js @index-owner'
   ].join('\n'));
   assert.deepEqual(matchCodeowners('packages/api/src/user-contract.ts', codeownersRules), [
     '@platform-team',
     '@api-leads'
   ]);
+  assert.deepEqual(matchCodeowners('packages/top.js', codeownersRules), ['@root-pkg-owner']);
+  assert.deepEqual(matchCodeowners('packages/index.js', codeownersRules), ['@index-owner']);
 
   // Spec & Negative-Space Alignment + Caller Blast Radius
   const prMeta = {
     title: 'feat(api): add sessionCache to UserContract',
     body: [
       '## Summary',
-      'Adds bounded in-memory session cache.',
+      'Adds bounded in-memory session cache with `Given/When/Then` and `WHEN ... SHALL` support.',
       'Repo precedent: follows `packages/api/src/token-contract.ts`.',
       '',
       '## Acceptance Criteria',
@@ -782,7 +786,7 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
       '- Given an expired token, When session is queried, Then return 401 unauthorized',
       '',
       '## Out of scope',
-      '- Do not touch `packages/legacy-auth`'
+      '- Do not touch `test` runner or packages/legacy-auth.'
     ].join('\n')
   };
 
@@ -791,8 +795,10 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
     codeownersRules,
     callerBlastRadiusByPath: {
       'packages/api/src/user-contract.ts': {
-        callers: ['apps/web/src/auth.ts', 'apps/mobile/src/login.ts'],
-        owners: ['@web-team'],
+        callers: [
+          { path: 'apps/web/src/auth.ts', owners: ['@web-team'] },
+          { path: 'apps/mobile/src/login.ts', owners: [] }
+        ],
         unownedCallersCount: 1
       }
     }
@@ -820,12 +826,12 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
   const findingsWithLeanAndSlop = {
     meta: {
       title: 'PR #101: Add session cache',
-      summary: '**What it does.** Adds session cache.\n\n**Coverage.** 14 lenses checked.'
+      summary: '**What it does.** This is paramount and not a simple map, but a session cache.\n\n**Coverage.** 14 lenses checked.'
     },
     issues: [
       {
         id: 'M1',
-        sev: 'med',
+        sev: 'medium',
         cat: 'structure',
         verify: 'CONFIRMED',
         leanSavedLines: 42,
@@ -838,7 +844,6 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
         id: 'L1',
         sev: 'low',
         cat: 'readability',
-        verify: 'LIKELY',
         loc: 'packages/api/src/user-contract.ts:5',
         title: 'This load-bearing module is not a cache, but a session store',
         impact: '**Breaks:** Confuses readers with a single pane of glass.\n\n**Because:** Naming mixes cache and store.\n\n**Reach:** Local file.',
@@ -848,13 +853,21 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
   };
 
   const warnings = checkFindingsShape(findingsWithLeanAndSlop);
+  assert.equal(warnings.some((w) => w.includes('paramount')), true);
+  assert.equal(warnings.some((w) => w.includes('meta.summary: contains "not X, but Y"')), true);
   assert.equal(warnings.some((w) => w.includes('load-bearing')), true);
   assert.equal(warnings.some((w) => w.includes('single pane of glass')), true);
-  assert.equal(warnings.some((w) => w.includes('"not X, but Y"')), true);
+  assert.equal(warnings.some((w) => w.includes('L1: contains "not X, but Y"')), true);
 
-  const report = compileFindingsToWorkbenchReport(findingsWithLeanAndSlop, { diffText: diff, prMeta });
+  const report = compileFindingsToWorkbenchReport(findingsWithLeanAndSlop, {
+    diffText: diff,
+    prMeta,
+    layers
+  });
   assert.equal(report.SUMMARY.leanSavedLinesTotal, 42);
   assert.equal(report.LAYERS.leanSavedLinesTotal, 42);
   assert.equal(report.DATA[0].leanSavedLines, 42);
+  assert.deepEqual(report.LAYERS.contracts[0].owners, ['@platform-team', '@api-leads']);
+  assert.equal(report.LAYERS.contracts[0].callerBlastRadius.callers.length, 2);
 });
 

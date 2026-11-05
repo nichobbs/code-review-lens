@@ -25,7 +25,7 @@ const LEADS_FIX = ['**Do:**', '**Check:**'];
 const VERIFY_VALUES = new Set(['CONFIRMED', 'PLAUSIBLE']);
 
 const BANNED_SLOP_RE =
-  /\b(?:delve|tapestry|testament|underscore[sd]?|pivotal|crucial|seamlessly|holistic|paradigm|synergy|foster|elevate|beacon|landscape|interplay|intricate|meticulous|multifaceted|overarching|robust|streamline|utilize|leverage|load-bearing|fans out|poisons|evaporates|bolted on|earns its place|makes the call|leans on|sit with|the estate|closes the hole|hits a wall|single pane of glass)\b/i;
+  /\b(?:delve|tapestry|testament|underscore[sd]?|pivotal|crucial|seamlessly|holistic|paradigm|synergy|foster|elevate|beacon|landscape|interplay|intricate|meticulous|multifaceted|overarching|robust|streamline|utilize|leverage|facilitate|empower|cutting-edge|game changer|realm|paramount|transformative|embark|supercharge|harness|ever-evolving|load-bearing|fans out|poisons|evaporates|bolted on|earns its place|makes the call|leans on|sit with|the estate|closes the hole|hits a wall|single pane of glass)\b/i;
 
 const NOT_X_BUT_Y_RE = /\bnot\s+(?:just\s+|only\s+)?[^,;.]{2,35},\s*but\s+(?:rather\s+)?/i;
 
@@ -101,13 +101,19 @@ function isOpenIssue(issue) {
   return !DEFAULT_STAT[state]?.r;
 }
 
+function stripCodeSpans(s) {
+  return String(s || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/``[^`\n]+``|`[^`\n]+`/g, ' ');
+}
+
 /**
  * Validates `findings.json` against the 5-label lesson shape (`Breaks`/`Because`/`Reach` + `Do`/`Check`),
  * `verify` (`CONFIRMED` | `PLAUSIBLE`), and literal prose rules (no AI slop or figurative idioms).
  */
 function checkFindingsShape(findingsJson) {
   const warnings = [];
-  const summaryText = String(findingsJson?.meta?.summary || '');
+  const summaryText = stripCodeSpans(findingsJson?.meta?.summary || '');
   const summaryMatches = [
     ...new Set(
       [...summaryText.matchAll(new RegExp(BANNED_SLOP_RE.source, 'gi'))].map((m) => m[0].toLowerCase())
@@ -115,6 +121,9 @@ function checkFindingsShape(findingsJson) {
   ];
   for (const term of summaryMatches) {
     warnings.push(`meta.summary: contains banned AI filler or figurative idiom "${term}"`);
+  }
+  if (NOT_X_BUT_Y_RE.test(summaryText)) {
+    warnings.push('meta.summary: contains "not X, but Y" contrast (state the positive claim directly)');
   }
 
   for (const x of findingsJson?.issues || []) {
@@ -137,7 +146,7 @@ function checkFindingsShape(findingsJson) {
     if (fix.length > 500) {
       warnings.push(`${x.id}: fix is ${fix.length} chars; aim under ~450 and move detail to reasoning`);
     }
-    const prose = `${x.title || ''} ${imp} ${fix}`;
+    const prose = stripCodeSpans(`${x.title || ''} ${imp} ${fix}`);
     const slopTerms = [
       ...new Set(
         [...prose.matchAll(new RegExp(BANNED_SLOP_RE.source, 'gi'))].map((m) => m[0].toLowerCase())
@@ -247,29 +256,67 @@ function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
     revision: rev
   };
 
-  const layers =
-    findingsJson.LAYERS ||
-    (parsedFiles.length
-      ? buildLayersFromParsedDiff(parsedFiles, rawIssues, {
-          prMeta: options.prMeta || meta,
-          codeownersText: options.codeownersText,
-          callerBlastRadius: options.callerBlastRadius
-        })
-      : {
-          contracts: [],
-          flows: [],
-          testMatrix: [],
-          attentionSignals: {
-            removedGuards: [],
-            addedSymbols: [],
-            reuseCandidates: [],
-            stealthChanges: [],
-            shortcuts: [],
-            specAlignment: { outOfScope: [], repoPrecedents: [], negativeSpaceViolations: [], specClauses: [] },
-            humanFocusPrompts: []
-          }
-        });
-  if (leanSavedLinesTotal > 0 && layers && typeof layers === 'object') {
+  const precomputedLayers = options.layers || findingsJson.LAYERS || null;
+  let layers;
+  if (parsedFiles.length) {
+    const preCallerMap = {};
+    if (precomputedLayers && Array.isArray(precomputedLayers.contracts)) {
+      for (const c of precomputedLayers.contracts) {
+        if (c.path && c.callerBlastRadius) {
+          preCallerMap[c.path] = c.callerBlastRadius;
+        }
+      }
+    }
+    layers = buildLayersFromParsedDiff(parsedFiles, rawIssues, {
+      prMeta: options.prMeta || meta,
+      codeownersText: options.codeownersText,
+      codeownersRules: options.codeownersRules,
+      callerBlastRadius: options.callerBlastRadius || preCallerMap
+    });
+    if (precomputedLayers && typeof precomputedLayers === 'object') {
+      const preOwnersByPath = new Map(
+        (precomputedLayers.contracts || []).map((c) => [c.path, c.owners || []])
+      );
+      for (const c of layers.contracts || []) {
+        if ((!c.owners || c.owners.length === 0) && preOwnersByPath.has(c.path)) {
+          c.owners = preOwnersByPath.get(c.path);
+        }
+      }
+      if (precomputedLayers.attentionSignals) {
+        const preSig = precomputedLayers.attentionSignals;
+        const curSig = layers.attentionSignals || {};
+        if ((!curSig.reuseCandidates || curSig.reuseCandidates.length === 0) && Array.isArray(preSig.reuseCandidates)) {
+          curSig.reuseCandidates = preSig.reuseCandidates;
+        }
+        if (
+          (!curSig.specAlignment ||
+            ((curSig.specAlignment.outOfScope || []).length === 0 &&
+              (curSig.specAlignment.specClauses || []).length === 0)) &&
+          preSig.specAlignment
+        ) {
+          curSig.specAlignment = preSig.specAlignment;
+        }
+      }
+    }
+  } else if (precomputedLayers) {
+    layers = precomputedLayers;
+  } else {
+    layers = {
+      contracts: [],
+      flows: [],
+      testMatrix: [],
+      attentionSignals: {
+        removedGuards: [],
+        addedSymbols: [],
+        reuseCandidates: [],
+        stealthChanges: [],
+        shortcuts: [],
+        specAlignment: { outOfScope: [], repoPrecedents: [], negativeSpaceViolations: [], specClauses: [] },
+        humanFocusPrompts: []
+      }
+    };
+  }
+  if (layers && typeof layers === 'object') {
     layers.leanSavedLinesTotal = leanSavedLinesTotal;
   }
 
