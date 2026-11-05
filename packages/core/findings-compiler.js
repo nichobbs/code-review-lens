@@ -65,7 +65,7 @@ function renderParas(text) {
       };
 
       for (let line of lines) {
-        const hm = /^\*\*(What it does|Coverage)[.:]?\*\*\s*(.*)$/.exec(line);
+        const hm = /^\*\*(What it does|Human Focus|Coverage)[.:]?\*\*\s*(.*)$/.exec(line);
         if (hm) {
           flushBullets();
           parts.push(`<h3>${escapeHtml(hm[1])}</h3>`);
@@ -176,6 +176,8 @@ function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
       strength: x.strength || '',
       scope: x.scope || '',
       deps: x.deps || '',
+      suggestion: x.suggestion || '',
+      fixPrompt: x.fixPrompt || '',
       diffSlice: x.diffSlice || (parsedFiles.length && x.loc ? extractDiffSlice(parsedFiles, x.loc) : null)
     };
     return item;
@@ -209,7 +211,9 @@ function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
 
   const layers =
     findingsJson.LAYERS ||
-    (parsedFiles.length ? buildLayersFromParsedDiff(parsedFiles, rawIssues) : { contracts: [], flows: [], testMatrix: [] });
+    (parsedFiles.length
+      ? buildLayersFromParsedDiff(parsedFiles, rawIssues, { prMeta: options.prMeta || meta })
+      : { contracts: [], flows: [], testMatrix: [], attentionSignals: { removedGuards: [], addedSymbols: [], reuseCandidates: [], stealthChanges: [], humanFocusPrompts: [] } });
 
   return {
     DATA,

@@ -831,6 +831,8 @@ html, body {
 }
 
 .status-badge.hollow,
+.status-badge.tautology,
+.status-badge.internal-mock,
 .status-badge.flawed-spec {
   background: var(--s-medium-tint);
   color: var(--s-medium-ink);

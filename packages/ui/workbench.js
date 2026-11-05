@@ -164,7 +164,7 @@
     const findingsCount = report?.DATA?.length || 0;
     const contractsCount = (report?.LAYERS?.contracts?.length || 0) + (report?.LAYERS?.flows?.length || 0);
     const testsCount = report?.LAYERS?.testMatrix?.length || 0;
-    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 13;
+    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
 
     const nav = $('#layerNav');
     if (!nav) return;
@@ -325,6 +325,41 @@
       .map((p) => `<li><code>${escapeHtml(p.split(':')[0])}</code>:${escapeHtml(p.split(':').slice(1).join(':'))}</li>`)
       .join('');
 
+    const signals = report?.LAYERS?.attentionSignals || {};
+    const removedGuards = signals.removedGuards || [];
+    const stealthChanges = signals.stealthChanges || [];
+    const reuseCandidates = signals.reuseCandidates || [];
+    const hasSignals = removedGuards.length > 0 || stealthChanges.length > 0 || reuseCandidates.length > 0;
+    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
+
+    const signalsHtml = hasSignals
+      ? `<div class="sec">
+          <h4>AI Attention &amp; Guard Signals (Automated Diff Pre-Scan)</h4>
+          <div class="layer-card" style="padding:10px 14px;">
+            <ul class="prose" style="margin:0;padding-left:18px;">
+              ${removedGuards
+                .map(
+                  (g) =>
+                    `<li>🛡️ <strong>Removed Guard (${escapeHtml(g.category)}):</strong> <code>${escapeHtml(g.path)}:${g.newLine}</code> — deleted <code>${escapeHtml(g.code)}</code></li>`
+                )
+                .join('')}
+              ${stealthChanges
+                .map(
+                  (sc) =>
+                    `<li>🕵️ <strong>Unmentioned High-Blast-Radius Change:</strong> <code>${escapeHtml(sc.path)}</code> — ${escapeHtml(sc.reason)}</li>`
+                )
+                .join('')}
+              ${reuseCandidates
+                .map(
+                  (rc) =>
+                    `<li>♻️ <strong>Near-Duplicate Utility Candidate:</strong> <code>${escapeHtml(rc.name)}</code> added in <code>${escapeHtml(rc.addedIn)}</code> overlaps <code>${escapeHtml((rc.existingMatches || []).join(', '))}</code></li>`
+                )
+                .join('')}
+            </ul>
+          </div>
+        </div>`
+      : '';
+
     return `<div class="panein">
       <div class="triage-card">
         <div class="triage-card-label">
@@ -347,8 +382,10 @@
 
       <div class="prose">${s.html || ''}</div>
 
+      ${signalsHtml}
+
       <div class="sec">
-        <h4>13-Lens Verification Matrix</h4>
+        <h4>${lensesCount}-Lens Verification Matrix</h4>
         <ul class="prose">${points}</ul>
       </div>
     </div>`;
@@ -446,14 +483,28 @@
 
         const rows = scenarios
           .map((sc) => {
-            const st = sc.status || (sc.hollow ? 'hollow' : sc.mockOnly ? 'flawed-spec' : 'solid');
+            const st =
+              sc.status ||
+              (sc.hollow
+                ? 'hollow'
+                : sc.tautology
+                  ? 'tautology'
+                  : sc.internalMock
+                    ? 'internal-mock'
+                    : sc.mockOnly
+                      ? 'flawed-spec'
+                      : 'solid');
             const note =
               sc.note ||
               (sc.hollow
                 ? 'Zero assertions detected in test body'
-                : sc.mockOnly
-                  ? 'Mock-only assertions'
-                  : '');
+                : sc.tautology
+                  ? 'Oracle tautology: asserts literal constant rather than computed behavior'
+                  : sc.internalMock
+                    ? 'Mocks internal relative seam'
+                    : sc.mockOnly
+                      ? 'Mock-only assertions'
+                      : '');
             return `<tr>
               <td>${escapeHtml(sc.behavior)}${note ? `<div style="color:var(--s-high-ink);font-size:11.5px;margin-top:2px;">⚠️ ${escapeHtml(note)}</div>` : ''}</td>
               <td class="num" style="text-align:center;font-weight:700;">${sc.assertions ?? 0}</td>
@@ -546,6 +597,9 @@
           <button type="button" class="tbtn${t.action === 'dismiss' ? ' on' : ''}" data-triage="dismiss" title="Shortcut: x">
             🔇 Dismiss (Skip)
           </button>
+          <button type="button" class="btn" id="copyFixPromptBtn" title="Copy structured fix instruction for your Coding Agent">
+            🤖 Copy Agent Fix Prompt
+          </button>
         </div>
       </div>
 
@@ -572,6 +626,14 @@
       <div class="sec">
         <h4>Recommended Fix (Do · Check)</h4>
         <div class="prose fixbox">${d.fix || ''}</div>
+        ${
+          d.suggestion
+            ? `<div style="margin-top:10px;padding:10px 12px;border-radius:6px;border:1px solid var(--rule);background:var(--well);">
+                <div style="font:700 11px var(--mono);color:var(--muted);margin-bottom:4px;">SURGICAL GITHUB SUGGESTION (1-CLICK COMMITTABLE IN PR)</div>
+                <pre style="margin:0;white-space:pre-wrap;font:400 12px/1.45 var(--mono);color:var(--ink);">${escapeHtml(d.suggestion)}</pre>
+              </div>`
+            : ''
+        }
       </div>
 
       ${
@@ -640,6 +702,34 @@
     if (noteInput) {
       noteInput.addEventListener('input', () => {
         setTriageNote(currentId, noteInput.value);
+      });
+    }
+
+    const copyFixBtn = $('#copyFixPromptBtn');
+    if (copyFixBtn) {
+      copyFixBtn.addEventListener('click', async () => {
+        const issues = report?.DATA || [];
+        const d = issues.find((item) => item.id === currentId) || issues[0];
+        if (!d) return;
+        const t = getTriage(d.id);
+        const promptLines = d.fixPrompt
+          ? [d.fixPrompt, t.note ? `\nReviewer note: ${t.note}` : ''].filter(Boolean)
+          : [
+              `Fix finding ${d.id} (${String(d.sev || '').toUpperCase()}) at \`${d.loc || 'PR'}\`: ${d.title}`,
+              '',
+              stripHtmlToMd(d.impact),
+              '',
+              stripHtmlToMd(d.fix),
+              d.suggestion ? `\nSuggested replacement:\n\`\`\`\n${d.suggestion}\n\`\`\`` : '',
+              t.note ? `\nReviewer note: ${t.note}` : ''
+            ].filter(Boolean);
+        try {
+          await navigator.clipboard.writeText(promptLines.join('\n').trim());
+          copyFixBtn.textContent = '✓ Copied Agent Fix Prompt!';
+          setTimeout(() => {
+            copyFixBtn.textContent = '🤖 Copy Agent Fix Prompt';
+          }, 1800);
+        } catch (err) {}
       });
     }
 
@@ -718,7 +808,8 @@
         t.note ? `\n> **Reviewer Note:** ${t.note}\n` : '',
         stripHtmlToMd(d.impact),
         '',
-        stripHtmlToMd(d.fix)
+        stripHtmlToMd(d.fix),
+        d.suggestion ? `\n\`\`\`suggestion\n${String(d.suggestion).replace(/\r?\n$/, '')}\n\`\`\`` : ''
       ];
       if (d.mermaid) {
         bodyParts.push(

@@ -603,3 +603,117 @@ test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via 
   assert.equal(fallbackGitResult.source, 'local-git-diff');
   assert.equal(parseUnifiedDiff(fallbackGitResult.diffText).length, 3);
 });
+
+test('AI-era Human Attention Signals: removedGuards, tautology, internalMock, stealthChanges, reuseCandidates, suggestion & Human Focus', () => {
+  // 1. Verify 14th lens (ai-harness.md) exists
+  const aiHarnessLensPath = path.join(
+    __dirname,
+    '../.agents/skills/crv-code-review/lenses/ai-harness.md'
+  );
+  assert.ok(fs.existsSync(aiHarnessLensPath));
+  assert.equal(classifyFilePath('.agents/skills/crv-code-review/SKILL.md').layer, 'contracts');
+  assert.equal(
+    classifyFilePath('.agents/skills/crv-code-review/SKILL.md').category,
+    'AI Harness / Prompt Contract'
+  );
+
+  // 2. Parse a diff with a removed auth guard, duplicate added helper, internal seam mock, and oracle tautology
+  const aiDiff = [
+    'diff --git a/services/billing/src/refund-handler.ts b/services/billing/src/refund-handler.ts',
+    '@@ -10,6 +10,9 @@ export async function issueRefund(req) {',
+    '-  if (!isAuthorized(req.user)) throw new ForbiddenError("Unauthorized");',
+    '-  const payload = RefundSchema.strict().parse(req.body);',
+    '+  const payload = req.body ?? {};',
+    '+  return { ok: true, amount: payload.amount ?? 0 };',
+    ' }',
+    '+export function formatRefundCurrency(cents) {',
+    '+  return `$${(cents / 100).toFixed(2)}`;',
+    '+}',
+    'diff --git a/services/billing/src/invoice-handler.ts b/services/billing/src/invoice-handler.ts',
+    '@@ -1,3 +1,6 @@',
+    '+export function formatRefundCurrency(cents) {',
+    '+  return `$${(cents / 100).toFixed(2)}`;',
+    '+}',
+    'diff --git a/services/auth/src/permissions.ts b/services/auth/src/permissions.ts',
+    '@@ -5,3 +5,4 @@ export function checkRole(u) {',
+    '+  if (u.bypass) return true;',
+    ' }',
+    'diff --git a/services/billing/test/refund-handler.test.ts b/services/billing/test/refund-handler.test.ts',
+    '@@ -1,3 +1,15 @@',
+    '+jest.mock("../src/refund-repo");',
+    '+describe("issueRefund", () => {',
+    '+  it("tautology test", () => {',
+    '+    expect(true).toBe(true);',
+    '+  });',
+    '+  it("internal seam mock test", () => {',
+    '+    expect(mockRefundRepo.save).toHaveBeenCalled();',
+    '+  });',
+    '+});'
+  ].join('\n');
+
+  const parsed = parseUnifiedDiff(aiDiff);
+  assert.equal(parsed.length, 4);
+
+  const layers = buildLayersFromParsedDiff(parsed, [], {
+    prMeta: {
+      title: 'feat(billing): update refund and invoice handlers',
+      body: 'Updates refund-handler and invoice-handler formatting.'
+    }
+  });
+
+  // Removed guards detected in refund-handler.ts
+  assert.ok(layers.attentionSignals);
+  assert.equal(layers.attentionSignals.removedGuards.length, 2);
+  assert.equal(layers.attentionSignals.removedGuards[0].category, 'auth-permission-check');
+  assert.equal(layers.attentionSignals.removedGuards[1].category, 'schema-validation');
+
+  // Near-duplicate utility added across two files in the same diff
+  assert.equal(layers.attentionSignals.reuseCandidates.length, 1);
+  assert.equal(layers.attentionSignals.reuseCandidates[0].name, 'formatRefundCurrency');
+  assert.equal(layers.attentionSignals.reuseCandidates[0].kind, 'duplicate-in-diff');
+
+  // Stealth change: services/auth/src/permissions.ts modified without mention in PR title/body
+  assert.equal(layers.attentionSignals.stealthChanges.length, 1);
+  assert.equal(layers.attentionSignals.stealthChanges[0].path, 'services/auth/src/permissions.ts');
+
+  // Behavioral Test Matrix: tautology and internalMock detected
+  assert.equal(layers.testMatrix.length, 1);
+  const testCases = layers.testMatrix[0].cases;
+  assert.equal(testCases.length, 2);
+  assert.equal(testCases[0].tautology, true);
+  assert.equal(testCases[0].status, 'tautology');
+  assert.equal(testCases[1].internalMock, true);
+  assert.equal(testCases[1].status, 'internal-mock');
+
+  // 3. Verify `**Human Focus.**`, `suggestion`, and `fixPrompt` compile and serialize to GitHub comments
+  const findingsWithHumanFocus = {
+    meta: {
+      title: 'PR #99: Billing refund refactor',
+      summary:
+        '**What it does.** Updates refund handler.\n\n**Human Focus.**\n- Confirm whether `isAuthorized` was intentionally removed at `refund-handler.ts:10`.\n\n**Coverage.** 14 lenses checked.',
+      review: { repo: 'acme/billing', pr: 99, head: '12345678' }
+    },
+    issues: [
+      {
+        id: 'H1',
+        sev: 'high',
+        cat: 'security, correctness',
+        verify: 'CONFIRMED',
+        loc: 'services/billing/src/refund-handler.ts:12',
+        title: 'Removed isAuthorized guard lets unauthenticated callers issue refunds',
+        impact: '**Breaks:** Anyone can trigger refunds.\n\n**Because:** `refund-handler.ts:12` deleted `isAuthorized`.\n\n**Reach:** Public endpoint.',
+        fix: '**Do:** Restore `if (!isAuthorized(req.user)) throw new ForbiddenError()`.\n\n**Check:** Unauthenticated test returns 403.',
+        suggestion: '  if (!isAuthorized(req.user)) throw new ForbiddenError("Unauthorized");\n  const payload = RefundSchema.strict().parse(req.body);',
+        fixPrompt: 'Restore the removed isAuthorized and RefundSchema.strict().parse guards in services/billing/src/refund-handler.ts:12.'
+      }
+    ]
+  };
+
+  const compiled = compileFindingsToWorkbenchReport(findingsWithHumanFocus, { diffText: aiDiff });
+  assert.match(compiled.SUMMARY.html, /<h3>Human Focus<\/h3>/);
+  assert.equal(compiled.DATA[0].suggestion.includes('ForbiddenError'), true);
+  assert.equal(compiled.DATA[0].fixPrompt.includes('RefundSchema.strict()'), true);
+
+  const ghComment = serializeFindingComment(compiled.DATA[0], { action: 'block' }, { head: '12345678', pr: 99 });
+  assert.match(ghComment, /```suggestion\n {2}if \(!isAuthorized\(req\.user\)\)/);
+});

@@ -18,6 +18,8 @@ Every lens writes findings in one shape. After the last lens, the review triages
 | `earlier` | Optional. One object per earlier review thread or PR comment that raised the same point: `who` (the author login GitHub shows, such as `Copilot`), `loc` (the thread's `path:line`, or empty for a PR comment) and `url` (its `html_url`). The report marks the finding "Also raised by" that reviewer |
 | `guide` | Standards findings only. The rule id and the file |
 | `mermaid` | Optional flowchart source, four or five nodes, for a high finding; a Before and After flowchart for a design candidate |
+| `suggestion` | Optional. Exact replacement code for the line at `loc` when the fix is a 1–10 line surgical edit; serialized as a GitHub ```` ```suggestion ```` block so the author can commit it in one click |
+| `fixPrompt` | Optional. A self-contained instruction for a coding agent (`Fix <id> at <loc>: ...`) so a reviewer can hand the finding to an agent in one click |
 | `strength` | Design candidates only: `Strong`, `Worth exploring` or `Speculative` |
 | `scope` | Design candidates only: `This PR`, `Separate ticket`, `Follow-up` or `Optional` |
 | `deps` | Design candidates only: `in-process`, `local-substitutable`, `remote-owned` or `external` |
@@ -89,6 +91,7 @@ A lens never reports above its maximum. When a lens finds a failure above its ma
 | `correctness` | `high` |
 | `adversarial` | `high` |
 | `security` | `high` |
+| `ai-harness` | `high` |
 | `data` | `high` |
 | `contract` | `high` |
 | `infra` | `high` |

@@ -15,7 +15,7 @@ Picks the lenses for this change, shows the pick, and waits for the reviewer bef
     - `structure` runs when the diff changes code. Files that instruct an agent, such as `AGENTS.md`, `CLAUDE.md`, skill files and prompt files, count as code.
     - `standards` runs when at least one standard from the scan covers a changed file. A documentation file counts, because a repository can have standards for documents. It also runs when the diff adds or edits a standards or instruction file, such as `AGENTS.md`, `CLAUDE.md` or `.github/instructions/*.md`, because the scan at `<base>` cannot see a new one.
     - `architecture` runs when the diff changes code in a shared package (a library other modules import), changes an exported interface, or changes code in two or more modules, such as two packages or a package and a service.
-3. **On a trigger:** `security`, `tests`, `contract`, `data`, `infra`, `operability`, `performance`, `docs`, when a changed path or the diff matches a row below.
+3. **On a trigger:** `security`, `ai-harness`, `tests`, `contract`, `data`, `infra`, `operability`, `performance`, `docs`, when a changed path or the diff matches a row below.
 
 ## Triggers
 
@@ -24,6 +24,7 @@ Before matching, leave out lockfiles, `**/generated/**` and `**/dist/**`. When t
 | Lens | Path patterns | Content signals in the diff |
 | --- | --- | --- |
 | `security` | auth, token, jwt, crypto, secret, iam, policy, middleware, interceptor, cors, csrf, cookie, session, `Dockerfile`, lockfiles, `pnpm-workspace.yaml`, `.npmrc`, `.env` | `process.env`, `verify(`, `exec(`, `eval(`, `path.join`, `readFile`, SQL built from strings, `dangerouslySetInnerHTML`, `pull_request_target`, `${{ github.event.`, `rejectUnauthorized`, `onlyBuiltDependencies` |
+| `ai-harness` | `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.agents/`, `.claude/`, `prompts/`, `mcp*`, agent or LLM orchestration files | `generateText`, `streamText`, `chat.completions`, `response_format`, `Output.object`, `systemPrompt`, `system_prompt`, `invoke_subagent`, `define_subagent`, `call_mcp_tool`, `BypassSandbox` |
 | `tests` | `*.test.*`, `*.spec.*`, `__tests__/`, API request collections such as Bruno | source changed in a folder that has tests, with no test changed |
 | `contract` | `openapi*`, `*.proto`, `*.graphql`, event and Zod schema files, a package's public entry file such as `packages/*/src/index.ts` | an exported signature, payload field or schema field changed, `deprecated`, `BREAKING` |
 | `data` | `migrations/`, `dao/`, `alembic`, `flyway`, `knex`, repositories, persistence models, message handlers such as Pub/Sub subscribers | `transaction`, `batch`, `upsert`, `ALTER TABLE`, `DROP COLUMN`, an idempotency key, a Firestore, DynamoDB or BigQuery client |
@@ -36,7 +37,7 @@ Lockfiles count for `security` only, except `.terraform.lock.hcl`, which counts 
 
 ## Order
 
-Every triggered lens runs. The lenses from the first two tiers run first, then the triggered lenses in this order: `security`, `data`, `contract`, `infra`, `tests`, `operability`, `performance`, `docs`.
+Every triggered lens runs. The lenses from the first two tiers run first, then the triggered lenses in this order: `security`, `ai-harness`, `data`, `contract`, `infra`, `tests`, `operability`, `performance`, `docs`.
 
 When more than seven lenses run, say so in the pick. A long run uses more of the agent's context, so the reviewer may want to remove some lenses.
 

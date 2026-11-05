@@ -11,8 +11,9 @@ Checks the change for ways an attacker or a careless caller reaches data or acti
 - Missing input that passes: an auth or tenant check that allows the request when the token or the tenant is absent. TLS verification turned off, such as `rejectUnauthorized: false`.
 - Secrets and personal data: a key, token or personal field in code, logs, error messages, URLs or test fixtures. A log line, error or response that includes a whole request, its headers, a config object or `process.env`.
 - Cryptography: a weak algorithm, a hard-coded key, or randomness from a non-cryptographic source for a security value.
-- Configuration: a permission, CORS rule or network rule wider than the change needs, or a debug setting left on. A suppression of a security rule (`noqa`, `eslint-disable`, `checkov:skip`, `trivy:ignore`) with no reason for that line.
-- Dependencies: a new package, or a version change, with a known vulnerability or from an unexpected source. A new `onlyBuiltDependencies` entry, which lets a package run install scripts, with no reason given.
+- Configuration: a permission, CORS rule or network rule wider than the change needs, or a debug setting left on. A suppression of a security rule (`noqa`, `eslint-disable`, `checkov:skip`, `trivy:ignore`) with no reason for that line. Also check `attentionSignals.removedGuards` in `<scratch>/layers.json` for deleted auth or schema-validation guards.
+- Dependencies & slopsquatting: a new package, or a version change, with a known vulnerability, from an unexpected source, or with a hallucinated/slopsquatted package name that does not match the official namespace or is never imported in production code. A new `onlyBuiltDependencies` entry, which lets a package run install scripts, with no reason given.
+- Unvalidated LLM or tool output: model completions or external tool responses passed into shell commands, file paths, queries, or HTML sinks without validation (coordinate with the `ai-harness` lens when it runs).
 
 ## Never reports
 
