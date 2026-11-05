@@ -111,7 +111,7 @@ function main() {
       String(targetPr),
       ...repoArgs,
       '--json',
-      'number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,files,reviews,comments,statusCheckRollup'
+      'number,title,state,body,url,baseRefName,baseRefOid,headRefName,headRefOid,files,reviews,comments,statusCheckRollup'
     ]);
     prMeta = JSON.parse(prMetaRaw);
     fs.writeFileSync(path.join(absScratch, 'pr-meta.json'), JSON.stringify(prMeta, null, 2));
@@ -136,6 +136,12 @@ function main() {
     diffText = fetchedDiff.diffText;
     diffSource = fetchedDiff.source;
     fs.writeFileSync(path.join(absScratch, 'diff.patch'), diffText);
+
+    if (!diffText.trim()) {
+      console.error(
+        `⚠️  Warning: PR #${prNum} in ${resolvedRepo} ("${prMeta.title || ''}", state: ${prMeta.state || 'UNKNOWN'}) has an empty diff (0 changed lines). If you meant a different repository, run inside that repo or pass --repo <owner/repo>.`
+      );
+    }
 
     if (resolvedRepo && prNum) {
       try {

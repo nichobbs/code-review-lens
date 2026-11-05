@@ -46,14 +46,22 @@ function readDotEnv(cwd) {
 }
 
 /**
- * Reads `.crvrc.json` or `crv.config.json` in `cwd` (walking up to git root) or `~/.config/crv/config.json`.
+ * Reads local `.crvrc.json` or `crv.config.json` in `cwd` (or global `~/.config/crv/config.json` when `includeGlobal: true`).
  */
-function readConfigFiles(cwd) {
-  const candidates = [
-    { path: path.join(cwd, '.crvrc.json'), source: '.crvrc.json' },
-    { path: path.join(cwd, 'crv.config.json'), source: 'crv.config.json' },
-    { path: path.join(os.homedir(), '.config', 'crv', 'config.json'), source: '~/.config/crv/config.json' }
-  ];
+function readConfigFiles(cwd, { includeLocal = true, includeGlobal = true } = {}) {
+  const candidates = [];
+  if (includeLocal) {
+    candidates.push(
+      { path: path.join(cwd, '.crvrc.json'), source: '.crvrc.json' },
+      { path: path.join(cwd, 'crv.config.json'), source: 'crv.config.json' }
+    );
+  }
+  if (includeGlobal) {
+    candidates.push({
+      path: path.join(os.homedir(), '.config', 'crv', 'config.json'),
+      source: '~/.config/crv/config.json'
+    });
+  }
 
   for (const c of candidates) {
     if (fs.existsSync(c.path)) {
@@ -117,9 +125,9 @@ function resolveRepoConfig(options = {}) {
     return { repo: dotEnvRepo, source: '.env' };
   }
 
-  const fileCfg = readConfigFiles(cwd);
-  if (fileCfg) {
-    return { repo: fileCfg.repo, source: fileCfg.source };
+  const localFileCfg = readConfigFiles(cwd, { includeLocal: true, includeGlobal: false });
+  if (localFileCfg) {
+    return { repo: localFileCfg.repo, source: localFileCfg.source };
   }
 
   if (options.detectGit !== false) {
@@ -127,6 +135,11 @@ function resolveRepoConfig(options = {}) {
     if (gitRepo) {
       return { repo: gitRepo, source: 'git remote (origin)' };
     }
+  }
+
+  const globalFileCfg = readConfigFiles(cwd, { includeLocal: false, includeGlobal: true });
+  if (globalFileCfg) {
+    return { repo: globalFileCfg.repo, source: globalFileCfg.source };
   }
 
   const fallback = parseGitHubRepoSlug(options.reportRepo);

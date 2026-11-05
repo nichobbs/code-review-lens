@@ -150,7 +150,7 @@ function installSkill(flags) {
   const vendoredCoreTarget = path.join(targetSkillDir, 'scripts', 'lib', 'core');
   copyDirRecursive(sourceCoreDir, vendoredCoreTarget);
 
-  console.log(`✓ Installed "crv-code-review" skill (13 lenses + references + self-contained scripts) to:\n  ${targetSkillDir}`);
+  console.log(`✓ Installed "crv-code-review" skill (14 lenses + references + self-contained scripts) to:\n  ${targetSkillDir}`);
   return targetSkillDir;
 }
 
@@ -210,7 +210,9 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     loadLivePrFromGitHub(targetPr, null);
   }
 
-  const scratchDir = path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNum}`);
+  // Avoid nesting .crv-skills/crv-code-review/.crv-skills/crv-code-review if invoked inside .crv-skills
+  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
+  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNum}`);
   const skillDir = path.resolve(__dirname, '../../../.agents/skills/crv-code-review');
   const prepScript = path.join(skillDir, 'scripts', 'prepare_pr.mjs');
 
@@ -241,7 +243,7 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   const modelBadge = agentCfg.model ? `, model: ${agentCfg.model}` : '';
   const effortBadge = agentCfg.effort ? `, effort: ${agentCfg.effort}` : '';
   console.log(
-    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 13-lens crv-code-review skill...\n`
+    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 14-lens crv-code-review skill...\n`
   );
   spawnSync(agentCfg.spec.bin, agentArgs, { stdio: 'inherit' });
 }

@@ -228,9 +228,10 @@ async function listRecentPrsAsync(explicitRepo, limit = 10) {
 }
 
 function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hydrated }) {
+  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
   if (!diffText) {
     const diffCandidates = [
-      path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
+      path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
     ];
     const stagedDiffPath = diffCandidates.find((p) => fs.existsSync(p));
     if (stagedDiffPath) {
@@ -238,16 +239,19 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
     }
   }
 
-  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json
+  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json matching this repo
   const scratchCandidates = [
-    path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`)
+    path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}/findings.json`)
   ];
   const scratchFindingsPath = scratchCandidates.find((p) => fs.existsSync(p));
   if (scratchFindingsPath) {
     const findingsJson = JSON.parse(fs.readFileSync(scratchFindingsPath, 'utf8'));
-    const compiled = compileFindingsToWorkbenchReport(findingsJson, { diffText });
-    compiled.GITHUB_STATE = hydrated;
-    return compiled;
+    const findingsRepo = findingsJson?.meta?.review?.repo || findingsJson?.REVIEW?.repo || '';
+    if (!findingsRepo || !repo || String(findingsRepo).toLowerCase() === String(repo).toLowerCase()) {
+      const compiled = compileFindingsToWorkbenchReport(findingsJson, { diffText, prMeta });
+      compiled.GITHUB_STATE = hydrated;
+      return compiled;
+    }
   }
 
   // If loading the bundled demo fixture PR and its repo matches, enrich and return it

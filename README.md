@@ -1,6 +1,6 @@
 # Code Review Lens (`crv` — Agentic PR Review Workbench)
 
-A human-in-the-loop PR Review Workbench designed for the era of AI-authored code. It combines a 13-lens AI review skill (`crv-code-review`) with a **4-Layer Human-Leverage Review UI** backed by **native GitHub Pull Request comments and review threads**.
+A human-in-the-loop PR Review Workbench designed for the era of AI-authored code. It combines a 14-lens AI review skill (`crv-code-review`) with a **4-Layer Human-Leverage Review UI** backed by **native GitHub Pull Request comments and review threads**.
 
 ## Architecture & Packages
 
@@ -11,14 +11,14 @@ A human-in-the-loop PR Review Workbench designed for the era of AI-authored code
   - [repo-config.js](./packages/core/repo-config.js) & [agent-runner.js](./packages/core/agent-runner.js): Generic repository resolution (`--repo`, `CRV_DEFAULT_REPO`, `.crvrc.json`, `git remote origin`) and AI agent CLI orchestration (`agy`, `claude`, `gemini`, `codex`).
 - **[packages/ui](./packages/ui/index.html)**
   - [workbench.js](./packages/ui/workbench.js) & [workbench.css](./packages/ui/workbench.css): Interactive 4-Layer Workbench UI featuring:
-    1. **Layer 1: Intent, Architecture & Verification Summary** (Mermaid system architecture diagram + 13-lens verification coverage + 1-click triage presets).
+    1. **Layer 1: Intent, Architecture & Verification Summary** (Mermaid system architecture diagram + 14-lens verification coverage + 1-click triage presets).
     2. **Layer 2: Verified Risk Findings Rack** (inline diff slices around `path:line`, `🚫 Block` / `💬 Comment` / `🔇 Dismiss` triage controls, keyboard shortcuts `j`/`k`/`b`/`m`/`x`, and human reviewer notes).
     3. **Layer 3: Public Contracts, Schemas & Story-Ordered Flows** (OpenAPI specs, Pub/Sub event schemas, feature flags, ADRs, and story-ordered production flows).
     4. **Layer 4: Behavioral Test Matrix** (summarizes tested scenarios and assertion counts, flags hollow/mock-only assertions, and collapses raw `.test.ts` boilerplate by default).
 - **[packages/cli](./packages/cli/bin/crv.js)**
-  - [server.js](./packages/cli/server.js): Local HTTP server and `gh api` bridge that loads live PRs from GitHub, invokes AI coding agents for 13-lens reviews, and publishes curated reviews directly to GitHub.
+  - [server.js](./packages/cli/server.js): Local HTTP server and `gh api` bridge that loads live PRs from GitHub, invokes AI coding agents for 14-lens reviews, and publishes curated reviews directly to GitHub.
 - **[.agents/skills/crv-code-review](./.agents/skills/crv-code-review/SKILL.md)**
-  - Bundled 13-lens AI review skill (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`) with fresh-context verification.
+  - Bundled 14-lens AI review skill (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`) with fresh-context verification.
 - **[packages/extension](./packages/extension/manifest.json)**
   - Manifest V3 Chrome Extension that injects an **🛡️ Agent Workbench** button onto `https://github.com/*/*/pull/*`, scans PR comments for `<!-- crv-finding -->` threads, and opens the Side Panel alongside GitHub.
 
@@ -51,7 +51,7 @@ crv agent agy --global
 # Fetch & open any PR in the 4-Layer Workbench UI (auto-opens browser)
 crv pr 1230
 
-# Run the 13-lens AI review skill via your configured agent and open the Workbench
+# Run the 14-lens AI review skill via your configured agent and open the Workbench
 crv pr 1230 --analyze
 
 # Start with the bundled demo report
