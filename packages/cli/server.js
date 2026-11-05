@@ -8,9 +8,13 @@ const { spawn, spawnSync } = require('child_process');
 const vm = require('vm');
 const {
   hydrateFromGitHubComments,
+  parsePaginatedGhJson,
   parseUnifiedDiff,
   extractDiffSlice,
   buildLayersFromParsedDiff,
+  synthesizeUnifiedDiffFromFiles,
+  tryLocalGitDiff,
+  fetchPrDiffWithFallback,
   checkFindingsShape,
   compileFindingsToWorkbenchReport,
   resolveRepoConfig,
@@ -224,6 +228,17 @@ async function listRecentPrsAsync(explicitRepo, limit = 10) {
 }
 
 function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hydrated }) {
+  if (!diffText) {
+    const diffCandidates = [
+      path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/diff.patch`),
+      path.resolve(process.cwd(), `.tu-skills/tu-code-review/${prNumInt}/diff.patch`)
+    ];
+    const stagedDiffPath = diffCandidates.find((p) => fs.existsSync(p));
+    if (stagedDiffPath) {
+      diffText = fs.readFileSync(stagedDiffPath, 'utf8');
+    }
+  }
+
   // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json
   const scratchCandidates = [
     path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`),
@@ -417,16 +432,24 @@ function loadLivePrFromGitHub(prInput, explicitRepo) {
     if (m) repo = m[1];
   }
 
-  const diffRes = spawnSync('gh', ['pr', 'diff', String(prNumInt), ...(repo ? ['--repo', repo] : [])], {
-    encoding: 'utf8',
-    maxBuffer: 25 * 1024 * 1024
-  });
-  const diffText = diffRes.status === 0 ? diffRes.stdout || '' : '';
+  let diffText = '';
+  try {
+    const fetchedDiff = fetchPrDiffWithFallback({
+      pr: prNumInt,
+      repo,
+      prMeta
+    });
+    diffText = fetchedDiff.diffText;
+  } catch (e) {}
 
   let hydrated = { overviewMeta: null, findingThreads: {}, generalComments: [] };
   try {
-    const issueComments = JSON.parse(runGhApi([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate']) || '[]');
-    const reviewComments = JSON.parse(runGhApi([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate']) || '[]');
+    const issueComments = parsePaginatedGhJson(
+      runGhApi([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate', '--slurp']) || '[]'
+    );
+    const reviewComments = parsePaginatedGhJson(
+      runGhApi([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate', '--slurp']) || '[]'
+    );
     hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
   } catch (e) {}
 
@@ -438,6 +461,38 @@ function loadLivePrFromGitHub(prInput, explicitRepo) {
     hydrated,
     syncFn: syncReportWithGitHub
   });
+}
+
+async function resolvePrDiffAsync({ repo, prNumInt, prMeta, initialDiffRes }) {
+  if (initialDiffRes && initialDiffRes.status === 0 && initialDiffRes.stdout) {
+    return initialDiffRes.stdout;
+  }
+  const localDiff = tryLocalGitDiff({
+    repo,
+    pr: prNumInt,
+    baseRefOid: prMeta && (prMeta.baseRefOid || prMeta.base),
+    headRefOid: prMeta && (prMeta.headRefOid || prMeta.head),
+    baseRefName: prMeta && prMeta.baseRefName
+  });
+  if (localDiff && localDiff.trim()) {
+    return localDiff;
+  }
+  if (repo && prNumInt) {
+    try {
+      const filesRaw = await runGhApiAsync([
+        `repos/${repo}/pulls/${prNumInt}/files?per_page=100`,
+        '--paginate',
+        '--slurp'
+      ]);
+      const apiFiles = parsePaginatedGhJson(filesRaw);
+      const synthesized = synthesizeUnifiedDiffFromFiles(apiFiles, (prMeta && prMeta.files) || []);
+      if (synthesized.trim()) return synthesized;
+    } catch (e) {}
+  }
+  if (prMeta && Array.isArray(prMeta.files) && prMeta.files.length > 0) {
+    return synthesizeUnifiedDiffFromFiles([], prMeta.files);
+  }
+  return '';
 }
 
 /**
@@ -459,7 +514,7 @@ async function loadLivePrFromGitHubAsync(prInput, explicitRepo) {
       ],
       { maxBuffer: 15 * 1024 * 1024 }
     ),
-    spawnGhAsync(['pr', 'diff', String(prNumInt), ...repoArgs], { maxBuffer: 25 * 1024 * 1024 })
+    spawnGhAsync(['pr', 'diff', String(prNumInt), ...repoArgs], { maxBuffer: 50 * 1024 * 1024 })
   ]);
 
   if (metaRes.status !== 0) {
@@ -470,15 +525,18 @@ async function loadLivePrFromGitHubAsync(prInput, explicitRepo) {
     const m = /github\.com\/([^/]+\/[^/]+)\/pull\//i.exec(prMeta.url);
     if (m) repo = m[1];
   }
-  const diffText = diffRes.status === 0 ? diffRes.stdout || '' : '';
+  const diffText = await resolvePrDiffAsync({ repo, prNumInt, prMeta, initialDiffRes: diffRes });
 
   let hydrated = { overviewMeta: null, findingThreads: {}, generalComments: [] };
   try {
     const [issueRaw, reviewRaw] = await Promise.all([
-      runGhApiAsync([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate']),
-      runGhApiAsync([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate'])
+      runGhApiAsync([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate', '--slurp']),
+      runGhApiAsync([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate', '--slurp'])
     ]);
-    hydrated = hydrateFromGitHubComments(JSON.parse(issueRaw || '[]'), JSON.parse(reviewRaw || '[]'));
+    hydrated = hydrateFromGitHubComments(
+      parsePaginatedGhJson(issueRaw || '[]'),
+      parsePaginatedGhJson(reviewRaw || '[]')
+    );
   } catch (e) {}
 
   const compiled = buildLivePrReportFromFetchedData({
@@ -502,18 +560,27 @@ function syncReportWithGitHub(report) {
   if (!repo || !pr) return { synced: false, reason: 'Missing repo or PR number in report.REVIEW' };
 
   try {
-    const issueCommentsRaw = runGhApi([`repos/${repo}/issues/${pr}/comments`, '--paginate']);
-    const reviewCommentsRaw = runGhApi([`repos/${repo}/pulls/${pr}/comments`, '--paginate']);
-    const issueComments = JSON.parse(issueCommentsRaw || '[]');
-    const reviewComments = JSON.parse(reviewCommentsRaw || '[]');
+    const issueCommentsRaw = runGhApi([`repos/${repo}/issues/${pr}/comments`, '--paginate', '--slurp']);
+    const reviewCommentsRaw = runGhApi([`repos/${repo}/pulls/${pr}/comments`, '--paginate', '--slurp']);
+    const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
+    const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
     const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
 
-    const diffRes = spawnSync('gh', ['pr', 'diff', String(pr), '--repo', repo], {
-      encoding: 'utf8',
-      maxBuffer: 25 * 1024 * 1024
-    });
-    if (diffRes.status === 0 && diffRes.stdout) {
-      const parsedFiles = parseUnifiedDiff(diffRes.stdout);
+    let diffText = '';
+    try {
+      const fetchedDiff = fetchPrDiffWithFallback({
+        pr,
+        repo,
+        prMeta: {
+          baseRefOid: report?.REVIEW?.base,
+          headRefOid: report?.REVIEW?.head
+        }
+      });
+      diffText = fetchedDiff.diffText;
+    } catch (e) {}
+
+    if (diffText) {
+      const parsedFiles = parseUnifiedDiff(diffText);
       for (const finding of report.DATA || []) {
         if (!finding.diffSlice && finding.loc) {
           finding.diffSlice = extractDiffSlice(parsedFiles, finding.loc);
@@ -538,16 +605,23 @@ async function syncReportWithGitHubAsync(report) {
 
   try {
     const [issueCommentsRaw, reviewCommentsRaw, diffRes] = await Promise.all([
-      runGhApiAsync([`repos/${repo}/issues/${pr}/comments`, '--paginate']),
-      runGhApiAsync([`repos/${repo}/pulls/${pr}/comments`, '--paginate']),
-      spawnGhAsync(['pr', 'diff', String(pr), '--repo', repo], { maxBuffer: 25 * 1024 * 1024 })
+      runGhApiAsync([`repos/${repo}/issues/${pr}/comments`, '--paginate', '--slurp']),
+      runGhApiAsync([`repos/${repo}/pulls/${pr}/comments`, '--paginate', '--slurp']),
+      spawnGhAsync(['pr', 'diff', String(pr), '--repo', repo], { maxBuffer: 50 * 1024 * 1024 })
     ]);
-    const issueComments = JSON.parse(issueCommentsRaw || '[]');
-    const reviewComments = JSON.parse(reviewCommentsRaw || '[]');
+    const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
+    const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
     const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
 
-    if (diffRes.status === 0 && diffRes.stdout) {
-      const parsedFiles = parseUnifiedDiff(diffRes.stdout);
+    const diffText = await resolvePrDiffAsync({
+      repo,
+      prNumInt: pr,
+      prMeta: { baseRefOid: report?.REVIEW?.base, headRefOid: report?.REVIEW?.head },
+      initialDiffRes: diffRes
+    });
+
+    if (diffText) {
+      const parsedFiles = parseUnifiedDiff(diffText);
       for (const finding of report.DATA || []) {
         if (!finding.diffSlice && finding.loc) {
           finding.diffSlice = extractDiffSlice(parsedFiles, finding.loc);

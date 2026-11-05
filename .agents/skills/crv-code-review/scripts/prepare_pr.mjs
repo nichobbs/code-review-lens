@@ -26,11 +26,13 @@ const {
   parseUnifiedDiff,
   buildLayersFromParsedDiff,
   hydrateFromGitHubComments,
+  parsePaginatedGhJson,
+  fetchPrDiffWithFallback,
   resolveRepoConfig
 } = require(corePath);
 
 function runGh(args) {
-  const res = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 25 * 1024 * 1024 });
+  const res = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
   if (res.status !== 0) {
     throw new Error((res.stderr || res.stdout || `gh ${args.join(' ')} failed`).trim());
   }
@@ -72,6 +74,7 @@ function main() {
   fs.mkdirSync(absScratch, { recursive: true });
 
   let diffText = '';
+  let diffSource = 'diff-file';
   let hydratedThreads = { overviewMeta: null, findingThreads: {}, generalComments: [] };
 
   if (diffPath) {
@@ -110,20 +113,34 @@ function main() {
     const prMeta = JSON.parse(prMetaRaw);
     fs.writeFileSync(path.join(absScratch, 'pr-meta.json'), JSON.stringify(prMeta, null, 2));
 
-    diffText = runGh(['pr', 'diff', String(targetPr), ...repoArgs]);
-    fs.writeFileSync(path.join(absScratch, 'diff.patch'), diffText);
-
     const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(prMeta.url || '');
     const resolvedRepo = (urlMatch ? urlMatch[1] : null) || activeRepo;
     const prNum = prMeta.number || (urlMatch ? urlMatch[2] : targetPr);
 
+    const fetchedDiff = fetchPrDiffWithFallback({
+      pr: targetPr,
+      repo: resolvedRepo,
+      repoArgs,
+      prMeta,
+      onFallback: (errMsg) => {
+        if (/too_large|HTTP 406|exceeded the maximum number of lines/i.test(errMsg)) {
+          console.error(
+            `ℹ PR #${prNum} diff exceeded GitHub's 20,000-line REST diff limit (HTTP 406); falling back to local git / per-file PR API...`
+          );
+        }
+      }
+    });
+    diffText = fetchedDiff.diffText;
+    diffSource = fetchedDiff.source;
+    fs.writeFileSync(path.join(absScratch, 'diff.patch'), diffText);
+
     if (resolvedRepo && prNum) {
       try {
-        const issueComments = JSON.parse(
-          runGh(['api', `repos/${resolvedRepo}/issues/${prNum}/comments`, '--paginate']) || '[]'
+        const issueComments = parsePaginatedGhJson(
+          runGh(['api', `repos/${resolvedRepo}/issues/${prNum}/comments`, '--paginate', '--slurp']) || '[]'
         );
-        const reviewComments = JSON.parse(
-          runGh(['api', `repos/${resolvedRepo}/pulls/${prNum}/comments`, '--paginate']) || '[]'
+        const reviewComments = parsePaginatedGhJson(
+          runGh(['api', `repos/${resolvedRepo}/pulls/${prNum}/comments`, '--paginate', '--slurp']) || '[]'
         );
         hydratedThreads = hydrateFromGitHubComments(issueComments, reviewComments);
       } catch (err) {
@@ -149,6 +166,7 @@ function main() {
     JSON.stringify(
       {
         scratchDir: absScratch,
+        diffSource,
         filesTotal: parsedFiles.length,
         contractsCount: layers.contracts.length,
         flowsCount: layers.flows.length,
