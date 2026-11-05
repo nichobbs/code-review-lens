@@ -1,7 +1,7 @@
 {
   "name": "code-review-lens",
   "version": "0.1.0",
-  "description": "Human-in-the-loop Agentic PR Review Workbench (crv — Code ReView CLI + 13-Lens Skill + GitHub Comments DB + Chrome Extension)",
+  "description": "Human-in-the-loop Agentic PR Review Workbench (crv — Code ReView CLI + 14-Lens Skill + GitHub Comments DB + Chrome Extension)",
   "repository": {
     "type": "git",
     "url": "https://github.com/nichobbs/code-review-lens.git"

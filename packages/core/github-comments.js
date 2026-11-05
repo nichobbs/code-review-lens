@@ -103,6 +103,10 @@ function serializeFindingComment(finding, triage = {}, reviewMeta = {}) {
     lines.push(fixMd, '');
   }
 
+  if (finding.suggestion && String(finding.suggestion).trim()) {
+    lines.push('```suggestion', String(finding.suggestion).replace(/\r?\n$/, ''), '```', '');
+  }
+
   if (finding.mermaid) {
     lines.push(
       '<details>',

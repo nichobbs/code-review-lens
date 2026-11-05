@@ -75,6 +75,7 @@ function main() {
 
   let diffText = '';
   let diffSource = 'diff-file';
+  let prMeta = null;
   let hydratedThreads = { overviewMeta: null, findingThreads: {}, generalComments: [] };
 
   if (diffPath) {
@@ -110,7 +111,7 @@ function main() {
       '--json',
       'number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,files,reviews,comments,statusCheckRollup'
     ]);
-    const prMeta = JSON.parse(prMetaRaw);
+    prMeta = JSON.parse(prMetaRaw);
     fs.writeFileSync(path.join(absScratch, 'pr-meta.json'), JSON.stringify(prMeta, null, 2));
 
     const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(prMeta.url || '');
@@ -150,17 +151,68 @@ function main() {
   }
 
   const parsedFiles = parseUnifiedDiff(diffText);
-  const layers = buildLayersFromParsedDiff(parsedFiles, []);
+
+  // Scan repo for existing helpers matching newly added symbols (AI near-duplicate utility detection)
+  const reuseCandidates = [];
+  const allAdded = [];
+  for (const f of parsedFiles) {
+    if (Array.isArray(f.addedSymbols)) {
+      allAdded.push(...f.addedSymbols);
+    }
+  }
+  const uniqueNames = [...new Set(allAdded.map((s) => s.name).filter((n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n)))].slice(
+    0,
+    20
+  );
+  if (uniqueNames.length > 0) {
+    const pattern = `(function|const|class|def)\\s+(${uniqueNames.join('|')})\\b`;
+    const grepRes = spawnSync('git', ['grep', '-n', '-E', pattern], {
+      encoding: 'utf8',
+      timeout: 5000,
+      maxBuffer: 5 * 1024 * 1024
+    });
+    if (grepRes && grepRes.status === 0 && grepRes.stdout) {
+      const matchesByName = new Map();
+      for (const line of grepRes.stdout.split(/\r?\n/)) {
+        const m = /^([^:]+):(\d+):(.*)$/.exec(line);
+        if (!m) continue;
+        const [, matchPath, matchLine, matchText] = m;
+        if (/(^|\/)(?:test|tests|__tests__)\/|\.test\.|\.spec\./i.test(matchPath)) continue;
+        for (const symName of uniqueNames) {
+          if (new RegExp(`\\b${symName}\\b`).test(matchText)) {
+            if (!matchesByName.has(symName)) matchesByName.set(symName, []);
+            matchesByName.get(symName).push(`${matchPath}:${matchLine}`);
+          }
+        }
+      }
+      for (const sym of allAdded) {
+        const existing = (matchesByName.get(sym.name) || []).filter(
+          (loc) => !loc.startsWith(`${sym.path}:`)
+        );
+        if (existing.length > 0) {
+          reuseCandidates.push({
+            name: sym.name,
+            addedIn: `${sym.path}:${sym.line}`,
+            existingMatches: existing.slice(0, 5),
+            kind: 'repo-match'
+          });
+        }
+      }
+    }
+  }
+
+  const layers = buildLayersFromParsedDiff(parsedFiles, [], { prMeta, reuseCandidates });
 
   fs.writeFileSync(path.join(absScratch, 'layers.json'), JSON.stringify(layers, null, 2));
   fs.writeFileSync(path.join(absScratch, 'github-threads.json'), JSON.stringify(hydratedThreads, null, 2));
 
   const totalCases = layers.testMatrix.reduce((acc, f) => acc + f.cases.length, 0);
   const hollowCases = layers.testMatrix.reduce(
-    (acc, f) => acc + f.cases.filter((c) => c.hollow || c.mockOnly).length,
+    (acc, f) => acc + f.cases.filter((c) => c.hollow || c.mockOnly || c.tautology || c.internalMock).length,
     0
   );
   const testLines = layers.testMatrix.reduce((acc, f) => acc + f.collapsedLines, 0);
+  const signals = layers.attentionSignals || {};
 
   console.log(
     JSON.stringify(
@@ -175,6 +227,9 @@ function main() {
         testCasesExtracted: totalCases,
         hollowOrMockOnlyCases: hollowCases,
         configFilesCount: layers.config.length,
+        removedGuardsCount: (signals.removedGuards || []).length,
+        stealthChangesCount: (signals.stealthChanges || []).length,
+        reuseCandidatesCount: (signals.reuseCandidates || []).length,
         hydratedCrvFindings: Object.keys(hydratedThreads.findingThreads || {}).length,
         generalGitHubComments: (hydratedThreads.generalComments || []).length
       },

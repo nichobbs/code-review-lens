@@ -6,9 +6,11 @@ Checks that the changed code does what the change says it does. Runs on every re
 
 - Logic: a wrong condition, steps in the wrong order, an off-by-one, the wrong variable.
 - Edge cases: empty input, null or undefined, zero, very large values, missing keys, an empty list. A truthiness check (`!val`) where `0`, `""` or `false` is a valid value.
-- Error handling: an error that is swallowed, retried with no limit, or returned with the wrong status. A `catch` that returns a default value or success, even when it logs. Exceptions: a comment that documents a not-found contract, or a named helper whose job is to ignore the error.
+- Error handling: an error that is swallowed, retried with no limit, or returned with the wrong status. A `catch` that returns a default value or success, even when it logs. Silent fallback expressions (`?? 0`, `?? ''`, `|| {}`, `catch { return [] }`) that fabricate a valid-looking value when a missing record, failed parse, or upstream error should fail explicitly. Exceptions: a comment that documents a not-found contract, or a named helper whose job is to ignore the error.
 - Sibling parity: a new branch, handler or endpoint next to an existing sibling. Check that it runs the same validation, authorisation and guards as the sibling.
-- Removed guards: a guard, retry, timeout or workaround that the diff deletes and does not move. Check what the callers still rely on.
+- Removed guards: a guard, retry, timeout or workaround that the diff deletes and does not move. Inspect `attentionSignals.removedGuards` in `<scratch>/layers.json` first and check what the callers still rely on.
+- Hallucinated API or SDK semantics: an option, flag, method or return shape passed to a framework or SDK call that does not exist or behaves differently in the version declared in `package.json` or lockfiles.
+- Partial-refactor drift: when the diff updates a signature, enum, or invariant across several files, grep for remaining callers or handlers in the same flow that the change missed.
 - Promises: a promise that is not awaited, returned or caught, so its error is lost and the handler can finish before the work does.
 - Callers: grep for the callers of each changed function, and check that each still gets what it expects.
 - Intent: the PR description or linked ticket says what should change. A change that does something else, or only part of it, is a finding. So is a write, network call or configuration change in a change described as a refactor or as read-only. Exceptions: logging, metrics, cache invalidation, and effects that the feature clearly needs.

@@ -34,7 +34,7 @@ USAGE:
   crv agent [agy|claude|gemini|codex] [-m <model>] [-g] Inspect or set the default AI agent harness, model & effort
   crv model [model-name | default] [--global]           Inspect or set the default model (e.g. claude-opus-4-6)
   crv effort [low|medium|high|xhigh|max|default] [-g]   Inspect or set the default reasoning effort
-  crv install-skill [--global | --dir <path>]           Install the 13-lens crv-code-review AI skill
+  crv install-skill [--global | --dir <path>]           Install the 14-lens crv-code-review AI skill
   crv demo [options]                                    Launch Workbench with bundled demo fixture
 
 OPTIONS:
@@ -42,7 +42,7 @@ OPTIONS:
   --agent <name>          AI agent CLI harness to use (agy, claude, gemini, codex)
   -m, --model <model>     Model to pass to the AI agent CLI (e.g. claude-opus-4-6, sonnet, gemini-2.5-pro)
   --effort <level>        Reasoning effort for agy/claude (low, medium, high, xhigh, max)
-  --analyze               Run the full 13-lens AI agent review before opening the Workbench
+  --analyze               Run the full 14-lens AI agent review before opening the Workbench
   --headless              Run the AI agent non-interactively (-p mode) when analyzing
   --interactive           Force interactive agent session when running with --analyze
   --diff <diff.patch>     Attach unified diff file to extract inline code slices & Layer 4 Test Matrix

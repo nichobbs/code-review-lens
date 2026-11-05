@@ -25,7 +25,10 @@ const CONTRACT_PATTERNS = [
   /\.graphql$/i,
   /\.proto$/i,
   /^docs\/design\//i,
-  /adr-\d+/i
+  /adr-\d+/i,
+  /(^|\/)(?:SKILL|AGENTS|CLAUDE)\.md$/i,
+  /\.cursorrules$/i,
+  /mcp\.json$/i
 ];
 
 const TEST_PATTERNS = [
@@ -57,6 +60,8 @@ function classifyFilePath(filePath) {
   if (CONTRACT_PATTERNS.some((re) => re.test(norm))) {
     let subcat = 'Contract / Schema';
     if (/docs\/design|adr-/i.test(norm)) subcat = 'ADR / Solution Design';
+    else if (/(^|\/)(?:SKILL|AGENTS|CLAUDE)\.md$|\.cursorrules$|mcp\.json$/i.test(norm))
+      subcat = 'AI Harness / Prompt Contract';
     else if (/openapi/i.test(norm)) subcat = 'OpenAPI Contract';
     else if (/feature-flag/i.test(norm)) subcat = 'Feature Flag Contract';
     else if (/topic|event|status|model/i.test(norm)) subcat = 'Domain / Event Schema';
@@ -200,6 +205,10 @@ function parseUnifiedDiff(diffText) {
 
     if (classification.layer === 'tests') {
       fileEntry.testMatrix = extractTestCasesFromHunks(filePath, hunks);
+      fileEntry.internalMocks = extractInternalMocksFromHunks(hunks);
+    } else if (classification.layer === 'flows' || classification.layer === 'contracts') {
+      fileEntry.removedGuards = extractRemovedGuardsFromHunks(filePath, hunks);
+      fileEntry.addedSymbols = extractAddedSymbolsFromHunks(filePath, hunks);
     }
 
     files.push(fileEntry);
@@ -208,15 +217,154 @@ function parseUnifiedDiff(diffText) {
   return files;
 }
 
+const IGNORED_SYMBOL_NAMES = new Set([
+  'main',
+  'init',
+  'constructor',
+  'render',
+  'handler',
+  'index',
+  'anonymous',
+  'setup',
+  'teardown',
+  'default',
+  'execute'
+]);
+
+/**
+ * Detects defensive guards, validation checks, auth checks, schema strictness,
+ * or error handling removed in non-test diff hunks without an equivalent replacement.
+ */
+function extractRemovedGuardsFromHunks(filePath, hunks) {
+  const removed = [];
+  for (const hunk of hunks || []) {
+    const addedLines = (hunk.lines || [])
+      .filter((l) => l.type === 'add')
+      .map((l) => String(l.content || '').trim());
+    const addedJoined = addedLines.join('\n');
+
+    for (const l of hunk.lines || []) {
+      if (l.type !== 'del') continue;
+      const trimmed = String(l.content || '').trim();
+      if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) {
+        continue;
+      }
+
+      let category = null;
+      if (/\b(?:isAuthorized|hasPermission|hasRole|requireAuth|verifyToken|checkAuth|canAccess|isAdmin|assertAuth)\b/i.test(trimmed)) {
+        if (!/\b(?:isAuthorized|hasPermission|hasRole|requireAuth|verifyToken|checkAuth|canAccess|isAdmin|assertAuth)\b/i.test(addedJoined)) {
+          category = 'auth-permission-check';
+        }
+      } else if (/\bif\s*\([^)]+\)\s*(?:\{\s*)?(?:throw\b|return\b)/.test(trimmed)) {
+        if (!addedLines.includes(trimmed) && !/\bif\s*\([^)]+\)\s*(?:\{\s*)?throw\b/.test(addedJoined)) {
+          category = 'early-return-or-throw';
+        }
+      } else if (/^throw\s+new\s+[A-Za-z0-9_$]+/.test(trimmed)) {
+        if (!/\bthrow\s+new\b/.test(addedJoined)) {
+          category = 'throw-guard';
+        }
+      } else if (/\.(?:strict|safeParse|parse)\s*\(/.test(trimmed)) {
+        if (!/\.(?:strict|safeParse|parse)\s*\(/.test(addedJoined)) {
+          category = 'schema-validation';
+        }
+      } else if (/\b(?:timeout|AbortSignal|signal|maxRetries)\s*:/.test(trimmed)) {
+        if (!/\b(?:timeout|AbortSignal|signal|maxRetries)\s*:/.test(addedJoined)) {
+          category = 'timeout-or-retry-guard';
+        }
+      }
+
+      if (category) {
+        removed.push({
+          path: filePath,
+          oldLine: l.oldNumber,
+          newLine: hunk.newStart || l.oldNumber,
+          category,
+          code: trimmed.slice(0, 140)
+        });
+      }
+    }
+  }
+  return removed;
+}
+
+/**
+ * Extracts newly declared function/class/helper symbol names in production hunks
+ * so `prepare_pr.mjs` and the `structure` lens can check for near-duplicate utilities.
+ */
+function extractAddedSymbolsFromHunks(filePath, hunks) {
+  const deletedNames = new Set();
+  const added = [];
+  const seenAdded = new Set();
+
+  const patterns = [
+    /(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/,
+    /(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/,
+    /(?:export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/,
+    /^\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/
+  ];
+
+  for (const hunk of hunks || []) {
+    for (const l of hunk.lines || []) {
+      const text = String(l.content || '');
+      for (const re of patterns) {
+        const m = re.exec(text);
+        if (m && m[1]) {
+          if (l.type === 'del') {
+            deletedNames.add(m[1]);
+          } else if (l.type === 'add') {
+            const name = m[1];
+            if (name.length >= 4 && !IGNORED_SYMBOL_NAMES.has(name) && !seenAdded.has(name)) {
+              seenAdded.add(name);
+              added.push({ name, path: filePath, line: l.newNumber });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return added.filter((s) => !deletedNames.has(s.name));
+}
+
+/**
+ * Extracts relative internal module paths mocked in a test file (`jest.mock('./...')`, `vi.mock('../...')`).
+ */
+function extractInternalMocksFromHunks(hunks) {
+  const mocks = [];
+  const seen = new Set();
+  const re = /\b(?:jest|vi|sinon)\.(?:mock|doMock)\s*\(\s*(['"`])(\.\.?\/[^'"`]+)\1|\bmock\.module\s*\(\s*(['"`])(\.\.?\/[^'"`]+)\3/g;
+  for (const hunk of hunks || []) {
+    for (const l of hunk.lines || []) {
+      if (l.type === 'del') continue;
+      const text = String(l.content || '');
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        const modPath = m[2] || m[4];
+        if (modPath && !seen.has(modPath)) {
+          seen.add(modPath);
+          mocks.push(modPath);
+        }
+      }
+    }
+  }
+  return mocks;
+}
+
 /**
  * Extracts a Behavioral Test Matrix from test file diff hunks:
- * finds `describe(...)`, `it(...)`, `test(...)` blocks and counts `expect(...)` / `assert` calls
- * so humans can immediately see *what behaviors are tested* and *whether assertions exist*.
+ * finds `describe(...)`, `it(...)`, `test(...)` blocks and counts `expect(...)` / `assert` calls,
+ * flagging hollow tests (`assertions === 0`), mock-only tests (`mockOnly`), oracle tautologies (`tautology`),
+ * and internal seam mocks (`internalMock`).
  */
 function extractTestCasesFromHunks(filePath, hunks) {
   const cases = [];
   let currentSuite = '';
   let currentCase = null;
+  const internalMocks = extractInternalMocksFromHunks(hunks);
+
+  const literalTautologyRe =
+    /\bexpect\s*\(\s*(true|false|null|undefined|\d+|'[^']*'|"[^"]*")\s*\)\s*\.\s*(?:toBe|toEqual|toStrictEqual|toBeTruthy|toBeFalsy)\s*\(\s*\1?\s*\)|\bassert(?:\.strictEqual|\.equal)?\s*\(\s*(true|false|\d+|'[^']*'|"[^"]*")\s*(?:,\s*\2)?\s*\)/;
 
   for (const hunk of hunks) {
     for (const l of hunk.lines) {
@@ -236,17 +384,22 @@ function extractTestCasesFromHunks(filePath, hunks) {
           behavior: itMatch[2],
           line: l.newNumber,
           assertions: 0,
+          mockAssertions: 0,
+          tautologyAssertions: 0,
           verifiedTargets: []
         };
       }
 
       if (currentCase) {
-        const expectMatches = text.match(/\b(?:expect|assert)\s*\(/g);
+        const expectMatches = text.match(/\b(?:expect|assert(?:\.[a-zA-Z]+)?)\s*\(/g);
         if (expectMatches) {
           currentCase.assertions += expectMatches.length;
         }
         if (/\btoHaveBeenCalled|\btoHaveBeenCalledWith/.test(text)) {
           currentCase.mockAssertions = (currentCase.mockAssertions || 0) + 1;
+        }
+        if (literalTautologyRe.test(text)) {
+          currentCase.tautologyAssertions = (currentCase.tautologyAssertions || 0) + 1;
         }
         const targetMatch = /\b(?:expect|assert)\s*\(\s*([a-zA-Z0-9_.]+)\s*\)/.exec(text);
         if (targetMatch && !currentCase.verifiedTargets.includes(targetMatch[1])) {
@@ -256,11 +409,20 @@ function extractTestCasesFromHunks(filePath, hunks) {
     }
   }
   if (currentCase) cases.push(currentCase);
-  return cases.map((c) => ({
-    ...c,
-    hollow: c.assertions === 0,
-    mockOnly: c.assertions > 0 && c.mockAssertions === c.assertions
-  }));
+  return cases.map((c) => {
+    const hollow = c.assertions === 0;
+    const mockOnly = c.assertions > 0 && c.mockAssertions === c.assertions;
+    const tautology = c.assertions > 0 && c.tautologyAssertions === c.assertions;
+    const internalMock = internalMocks.length > 0 && (mockOnly || c.mockAssertions > 0);
+    return {
+      ...c,
+      hollow,
+      mockOnly,
+      tautology,
+      internalMock,
+      internalMockPaths: internalMock ? internalMocks : []
+    };
+  });
 }
 
 function summarizeContractDiff(fileObj) {
@@ -296,10 +458,114 @@ function formatHunksAsRawDiff(fileObj) {
 }
 
 /**
- * Builds the 4-Layer `LAYERS` object (`contracts`, `flows`, `testMatrix`, `config`)
+ * Computes Human Attention Signals across parsed files:
+ * - `removedGuards`: deleted validation/auth/schema/timeout guards in production hunks
+ * - `addedSymbols`: newly introduced functions/classes in production hunks
+ * - `reuseCandidates`: newly added symbols that duplicate existing repo helpers or appear in multiple diff files
+ * - `stealthChanges`: high-blast-radius files (contracts, auth, security, migrations) changed without mention in PR description
+ * - `humanFocusPrompts`: concise review prompts for Layer 1
+ */
+function analyzeAttentionSignals(parsedFiles = [], options = {}) {
+  const removedGuards = [];
+  const addedSymbols = [];
+  const symbolToFiles = new Map();
+
+  for (const f of parsedFiles || []) {
+    if (Array.isArray(f.removedGuards)) {
+      removedGuards.push(...f.removedGuards);
+    }
+    if (Array.isArray(f.addedSymbols)) {
+      for (const sym of f.addedSymbols) {
+        addedSymbols.push(sym);
+        if (!symbolToFiles.has(sym.name)) symbolToFiles.set(sym.name, []);
+        symbolToFiles.get(sym.name).push(sym);
+      }
+    }
+  }
+
+  const reuseCandidates = Array.isArray(options.reuseCandidates) ? [...options.reuseCandidates] : [];
+  const existingReuseNames = new Set(reuseCandidates.map((r) => `${r.name}@${r.addedIn}`));
+
+  for (const [name, locs] of symbolToFiles.entries()) {
+    if (locs.length > 1) {
+      const key = `${name}@${locs[0].path}:${locs[0].line}`;
+      if (!existingReuseNames.has(key)) {
+        reuseCandidates.push({
+          name,
+          addedIn: `${locs[0].path}:${locs[0].line}`,
+          existingMatches: locs.slice(1).map((l) => `${l.path}:${l.line}`),
+          kind: 'duplicate-in-diff'
+        });
+      }
+    }
+  }
+
+  const stealthChanges = [];
+  const prMeta = options.prMeta || null;
+  const claimText = prMeta
+    ? `${prMeta.title || ''}\n${prMeta.body || ''}`.toLowerCase()
+    : '';
+
+  if (claimText.trim().length >= 12) {
+    for (const f of parsedFiles || []) {
+      const isHighBlastRadius =
+        f.layer === 'contracts' ||
+        /(?:^|\/)(?:auth|security|permissions?|migrations?|rbac|acl|billing|payment|webhook|middleware|firestore\.rules)/i.test(
+          f.path
+        );
+      if (!isHighBlastRadius) continue;
+      if ((f.additions || 0) + (f.deletions || 0) === 0) continue;
+
+      const tokens = String(f.path || '')
+        .toLowerCase()
+        .split(/[/.\\_-]+/)
+        .filter((t) => t.length >= 4 && !['index', 'src', 'lib', 'packages', 'services', 'apps', 'test', 'spec', 'json', 'yaml'].includes(t));
+
+      const mentioned = tokens.length === 0 || tokens.some((tok) => claimText.includes(tok));
+      if (!mentioned) {
+        stealthChanges.push({
+          path: f.path,
+          layer: f.layer,
+          category: f.category,
+          additions: f.additions || 0,
+          deletions: f.deletions || 0,
+          reason: `High-blast-radius ${f.category || f.layer} modified (+${f.additions || 0}/-${f.deletions || 0}) without mention in PR title/description`
+        });
+      }
+    }
+  }
+
+  const humanFocusPrompts = [];
+  if (removedGuards.length > 0) {
+    humanFocusPrompts.push(
+      `Inspect ${removedGuards.length} removed guard(s) (${removedGuards.map((g) => `${g.path}:${g.newLine}`).slice(0, 3).join(', ')}) to confirm defensive checks were not silently dropped.`
+    );
+  }
+  if (stealthChanges.length > 0) {
+    humanFocusPrompts.push(
+      `Verify ${stealthChanges.length} unmentioned contract/security change(s) (${stealthChanges.map((s) => s.path).slice(0, 3).join(', ')}) not described in the PR summary.`
+    );
+  }
+  if (reuseCandidates.length > 0) {
+    humanFocusPrompts.push(
+      `Check ${reuseCandidates.length} newly added helper(s) (${reuseCandidates.map((r) => `\`${r.name}\``).slice(0, 3).join(', ')}) that overlap existing symbols.`
+    );
+  }
+
+  return {
+    removedGuards,
+    addedSymbols,
+    reuseCandidates,
+    stealthChanges,
+    humanFocusPrompts
+  };
+}
+
+/**
+ * Builds the 4-Layer `LAYERS` object (`contracts`, `flows`, `testMatrix`, `config`, `attentionSignals`)
  * from parsed diff files and cross-references findings by file path.
  */
-function buildLayersFromParsedDiff(parsedFiles, issues = []) {
+function buildLayersFromParsedDiff(parsedFiles, issues = [], options = {}) {
   const findingsByFile = new Map();
   for (const issue of issues || []) {
     const file = String(issue.loc || '').replace(/:(\d+)(?:-(\d+))?$/, '').trim();
@@ -334,6 +600,7 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
         deletions: f.deletions,
         summary,
         diffSummary: summarizeContractDiff(f),
+        removedGuards: f.removedGuards || [],
         findings: linkedFindings,
         linkedFindings
       });
@@ -347,6 +614,7 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
           files: [],
           additions: 0,
           deletions: 0,
+          removedGuardsCount: 0,
           findings: [],
           linkedFindings: [],
           summary: '',
@@ -357,6 +625,7 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
       group.files.push(f.path);
       group.additions += f.additions;
       group.deletions += f.deletions;
+      group.removedGuardsCount += (f.removedGuards || []).length;
       for (const id of linkedFindings) {
         if (!group.findings.includes(id)) {
           group.findings.push(id);
@@ -365,28 +634,44 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
       }
     } else if (f.layer === 'tests') {
       const cases = f.testMatrix || [];
+      const internalMocks = f.internalMocks || [];
       const mappedCases = cases.map((c) => {
-        const status = c.hollow ? 'hollow' : c.mockOnly ? 'flawed-spec' : 'solid';
+        const status = c.hollow
+          ? 'hollow'
+          : c.tautology
+            ? 'tautology'
+            : c.internalMock
+              ? 'internal-mock'
+              : c.mockOnly
+                ? 'flawed-spec'
+                : 'solid';
         const note = c.hollow
           ? 'Zero assertions detected in test body'
-          : c.mockOnly
-            ? `Mock-only assertions (${(c.verifiedTargets || []).join(', ') || 'spies'})`
-            : (c.verifiedTargets || []).length
-              ? `Targets: ${c.verifiedTargets.join(', ')}`
-              : '';
+          : c.tautology
+            ? 'Oracle tautology: asserts literal constant rather than computed behavior'
+            : c.internalMock
+              ? `Mocks internal relative seam (${(c.internalMockPaths || internalMocks).join(', ')})`
+              : c.mockOnly
+                ? `Mock-only assertions (${(c.verifiedTargets || []).join(', ') || 'spies'})`
+                : (c.verifiedTargets || []).length
+                  ? `Targets: ${c.verifiedTargets.join(', ')}`
+                  : '';
         return {
           behavior: c.behavior,
           assertions: c.assertions,
           hollow: c.hollow,
           mockOnly: c.mockOnly,
+          tautology: Boolean(c.tautology),
+          internalMock: Boolean(c.internalMock),
+          internalMockPaths: c.internalMockPaths || [],
           targets: c.verifiedTargets,
           status,
           note
         };
       });
       const assertionsCount = mappedCases.reduce((sum, c) => sum + (c.assertions || 0), 0);
-      const hasHollow = mappedCases.some((c) => c.hollow);
-      const hasMockOnly = mappedCases.some((c) => c.mockOnly);
+      const hasHollow = mappedCases.some((c) => c.hollow || c.tautology);
+      const hasMockOnly = mappedCases.some((c) => c.mockOnly || c.internalMock);
       const suiteStatus = hasHollow
         ? 'gap'
         : hasMockOnly || linkedFindings.length > 0
@@ -399,6 +684,7 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
         collapsedLines: f.additions + f.deletions,
         totalCases: mappedCases.length,
         assertionsCount,
+        internalMocks,
         status: suiteStatus,
         findings: linkedFindings,
         linkedFindings,
@@ -424,7 +710,9 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
     };
   });
 
-  return { contracts, flows, testMatrix, config };
+  const attentionSignals = analyzeAttentionSignals(parsedFiles, options);
+
+  return { contracts, flows, testMatrix, config, attentionSignals };
 }
 
 function inferSuiteFromPath(filePath) {
@@ -730,7 +1018,11 @@ module.exports = {
   classifyFilePath,
   inferFlowName,
   parseUnifiedDiff,
+  extractRemovedGuardsFromHunks,
+  extractAddedSymbolsFromHunks,
+  extractInternalMocksFromHunks,
   extractTestCasesFromHunks,
+  analyzeAttentionSignals,
   buildLayersFromParsedDiff,
   extractDiffSlice,
   synthesizeUnifiedDiffFromFiles,

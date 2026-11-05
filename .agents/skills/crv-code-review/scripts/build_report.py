@@ -150,7 +150,7 @@ def paras(text, split_at=520):
                 out.append(("ul", list(bullet_buf)))
                 bullet_buf.clear()
             for line in lines:
-                hm = re.match(r"^\*\*(What it does|Coverage)[.:]?\*\*\s*(.*)$", line)
+                hm = re.match(r"^\*\*(What it does|Human Focus|Coverage)[.:]?\*\*\s*(.*)$", line)
                 if hm:
                     flush_bullets()
                     out.append(("h3", hm.group(1)))
