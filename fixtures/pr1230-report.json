@@ -135,15 +135,15 @@
           },
           {
             "who": "Copilot",
-            "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts:115",
+            "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/service-handler.ts:115",
             "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854375"
           }
         ],
-        "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10",
+        "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/models.ts:10",
         "title": "Partner Ingestion misses reactivation and reuses idempotency_key on 2nd close",
-        "impact": "**Breaks:** When a closed member re-onboards, Acme Core never receives an `ACTIVE` ingestion update, and if the member closes their account a second time, the second `member_closed` call sends the same `idempotency_key` as the first closure.\n\n**Because:** `consume-member-onoffboard-tu-ingestion/models.ts:10-14` and `api-module.ts:787` exclude `member_activated` (the only event emitted when `reactivateExistingMember` updates HubSpot), and `consume-member-onoffboard-tu-ingestion/service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}`.\n\n**Reach:** Every closed member who reactivates via `POST /v1/member/onboard`, and every member who closes their account more than once.",
-        "fix": "**Do:** Add `member_activated` to `api-module.ts:787`, `models.ts:10`, and `service-handler.ts:69` (mapping it to `ACTIVE`), and include `event.idempotencyKey` in the SHA-256 hash input at `service-handler.ts:124`.\n\n**Check:** Add unit tests in `consume-member-onoffboard-tu-ingestion/service-handler.test.ts` verifying `member_activated` sends `status: \"ACTIVE\"` and two `member_closed` events produce distinct `idempotency_key` values.",
-        "reasoning": "Contradicts `member-closure-beta-launch.md:135, 343, 356`, which specifies that `consume-member-onoffboard-tu-ingestion` notifies acme on reactivation. Verifier confirmed: `services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10` and `api-module.ts:787` exclude `member_activated`, and `service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}` so a second closure reuses the same `idempotency_key`."
+        "impact": "**Breaks:** When a closed member re-onboards, Acme Core never receives an `ACTIVE` ingestion update, and if the member closes their account a second time, the second `member_closed` call sends the same `idempotency_key` as the first closure.\n\n**Because:** `consume-member-onoffboard-partner-ingestion/models.ts:10-14` and `api-module.ts:787` exclude `member_activated` (the only event emitted when `reactivateExistingMember` updates HubSpot), and `consume-member-onoffboard-partner-ingestion/service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}`.\n\n**Reach:** Every closed member who reactivates via `POST /v1/member/onboard`, and every member who closes their account more than once.",
+        "fix": "**Do:** Add `member_activated` to `api-module.ts:787`, `models.ts:10`, and `service-handler.ts:69` (mapping it to `ACTIVE`), and include `event.idempotencyKey` in the SHA-256 hash input at `service-handler.ts:124`.\n\n**Check:** Add unit tests in `consume-member-onoffboard-partner-ingestion/service-handler.test.ts` verifying `member_activated` sends `status: \"ACTIVE\"` and two `member_closed` events produce distinct `idempotency_key` values.",
+        "reasoning": "Contradicts `member-closure-beta-launch.md:135, 343, 356`, which specifies that `consume-member-onoffboard-partner-ingestion` notifies acme on reactivation. Verifier confirmed: `services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/models.ts:10` and `api-module.ts:787` exclude `member_activated`, and `service-handler.ts:124` hashes only `${event.data.memberId}-${partnerAccountId}-${event.eventName}` so a second closure reuses the same `idempotency_key`."
       },
       {
         "id": "H6",
@@ -663,18 +663,18 @@
         },
         {
           "who": "Copilot",
-          "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts:115",
+          "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/service-handler.ts:115",
           "url": "https://github.com/acme/loyalty-platform/pull/1230#discussion_r4395854375"
         }
       ],
       "src": [],
       "tag": "",
       "guide": "",
-      "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10",
+      "loc": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/models.ts:10",
       "title": "Partner Ingestion misses reactivation and reuses idempotency_key on 2nd close",
-      "impact": "<p><strong>Breaks:</strong> When a closed member re-onboards, Acme Core never receives an <code>ACTIVE</code> ingestion update, and if the member closes their account a second time, the second <code>member_closed</code> call sends the same <code>idempotency_key</code> as the first closure.</p><p><strong>Because:</strong> <code>consume-member-onoffboard-tu-ingestion/models.ts:10-14</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code> (the only event emitted when <code>reactivateExistingMember</code> updates HubSpot), and <code>consume-member-onoffboard-tu-ingestion/service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code>.</p><p><strong>Reach:</strong> Every closed member who reactivates via <code>POST /v1/member/onboard</code>, and every member who closes their account more than once.</p>",
-      "fix": "<p><strong>Do:</strong> Add <code>member_activated</code> to <code>api-module.ts:787</code>, <code>models.ts:10</code>, and <code>service-handler.ts:69</code> (mapping it to <code>ACTIVE</code>), and include <code>event.idempotencyKey</code> in the SHA-256 hash input at <code>service-handler.ts:124</code>.</p><p><strong>Check:</strong> Add unit tests in <code>consume-member-onoffboard-tu-ingestion/service-handler.test.ts</code> verifying <code>member_activated</code> sends <code>status: \"ACTIVE\"</code> and two <code>member_closed</code> events produce distinct <code>idempotency_key</code> values.</p>",
-      "reasoning": "<p>Contradicts <code>member-closure-beta-launch.md:135, 343, 356</code>, which specifies that <code>consume-member-onoffboard-tu-ingestion</code> notifies acme on reactivation. Verifier confirmed: <code>services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts:10</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code>, and <code>service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code> so a second closure reuses the same <code>idempotency_key</code>.</p>",
+      "impact": "<p><strong>Breaks:</strong> When a closed member re-onboards, Acme Core never receives an <code>ACTIVE</code> ingestion update, and if the member closes their account a second time, the second <code>member_closed</code> call sends the same <code>idempotency_key</code> as the first closure.</p><p><strong>Because:</strong> <code>consume-member-onoffboard-partner-ingestion/models.ts:10-14</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code> (the only event emitted when <code>reactivateExistingMember</code> updates HubSpot), and <code>consume-member-onoffboard-partner-ingestion/service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code>.</p><p><strong>Reach:</strong> Every closed member who reactivates via <code>POST /v1/member/onboard</code>, and every member who closes their account more than once.</p>",
+      "fix": "<p><strong>Do:</strong> Add <code>member_activated</code> to <code>api-module.ts:787</code>, <code>models.ts:10</code>, and <code>service-handler.ts:69</code> (mapping it to <code>ACTIVE</code>), and include <code>event.idempotencyKey</code> in the SHA-256 hash input at <code>service-handler.ts:124</code>.</p><p><strong>Check:</strong> Add unit tests in <code>consume-member-onoffboard-partner-ingestion/service-handler.test.ts</code> verifying <code>member_activated</code> sends <code>status: \"ACTIVE\"</code> and two <code>member_closed</code> events produce distinct <code>idempotency_key</code> values.</p>",
+      "reasoning": "<p>Contradicts <code>member-closure-beta-launch.md:135, 343, 356</code>, which specifies that <code>consume-member-onoffboard-partner-ingestion</code> notifies acme on reactivation. Verifier confirmed: <code>services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/models.ts:10</code> and <code>api-module.ts:787</code> exclude <code>member_activated</code>, and <code>service-handler.ts:124</code> hashes only <code>${event.data.memberId}-${partnerAccountId}-${event.eventName}</code> so a second closure reuses the same <code>idempotency_key</code>.</p>",
       "mermaid": "",
       "html": "",
       "isNew": false,
@@ -683,7 +683,7 @@
       "scope": "",
       "deps": "",
       "diffSlice": {
-        "path": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/models.ts",
+        "path": "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/models.ts",
         "targetLine": 10,
         "hunkHeader": "@@ -6,9 +6,12 @@ export const SUPPORTED_EVENTS =",
         "lines": [
@@ -1529,7 +1529,7 @@
     "label": "acme/loyalty-platform #1230"
   },
   "XMETA": {
-    "path": "/workspace/loyalty-platform/.tu-skills/tu-code-review/pr1230-review.html",
+    "path": "/workspace/loyalty-platform/.crv-skills/crv-code-review/pr1230-review.html",
     "head": "f5d2bc057b3194c6b04a6004d4a4e3c8e22c8b22",
     "title": "PR #1230: feat(loyalty-member-services): member closure lifecycle and multi-membership status evaluation [LP-1230]"
   },
@@ -1653,7 +1653,7 @@
           "services/loyalty/internal-services/src/functions/hubspot-webhook/lib/pipelines/membership/membership-pipeline.ts",
           "services/loyalty/internal-services/src/functions/derive-member-status/service-handler.ts",
           "services/loyalty/internal-services/src/functions/consume-member-account-status-firestore/service-handler.ts",
-          "services/loyalty/internal-services/src/functions/consume-member-onoffboard-tu-ingestion/service-handler.ts"
+          "services/loyalty/internal-services/src/functions/consume-member-onoffboard-partner-ingestion/service-handler.ts"
         ],
         "linkedFindings": [
           "H3",

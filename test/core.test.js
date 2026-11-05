@@ -17,6 +17,10 @@ const {
   inferFlowName,
   parseUnifiedDiff,
   buildLayersFromParsedDiff,
+  extractShortcutsFromHunks,
+  parseCodeowners,
+  matchCodeowners,
+  analyzeSpecAlignment,
   extractDiffSlice,
   synthesizeUnifiedDiffFromFiles,
   fetchPrDiffWithFallback,
@@ -545,10 +549,10 @@ test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via 
 
   const fallbackApiResult = fetchPrDiffWithFallback({
     pr: 1480,
-    repo: 'transurban/cx-integration-hub',
+    repo: 'acme/cx-integration-hub',
     prMeta: {
       number: 1480,
-      url: 'https://github.com/transurban/cx-integration-hub/pull/1480',
+      url: 'https://github.com/acme/cx-integration-hub/pull/1480',
       baseRefOid: 'aaaa1111',
       headRefOid: 'bbbb2222'
     },
@@ -577,7 +581,7 @@ test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via 
   // 4. fetchPrDiffWithFallback uses local-git-diff when inside the git repo with commits present
   const fallbackGitResult = fetchPrDiffWithFallback({
     pr: 1480,
-    repo: 'transurban/cx-integration-hub',
+    repo: 'acme/cx-integration-hub',
     prMeta: {
       number: 1480,
       baseRefOid: 'aaaa1111',
@@ -717,3 +721,140 @@ test('AI-era Human Attention Signals: removedGuards, tautology, internalMock, st
   const ghComment = serializeFindingComment(compiled.DATA[0], { action: 'block' }, { head: '12345678', pr: 99 });
   assert.match(ghComment, /```suggestion\n {2}if \(!isAuthorized\(req\.user\)\)/);
 });
+
+test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast Radius, Lean Cuttable Lines, and ESL Slop Linter', () => {
+  const diff = [
+    'diff --git a/packages/api/src/user-contract.ts b/packages/api/src/user-contract.ts',
+    '@@ -1,4 +1,9 @@',
+    ' export interface UserContract {',
+    '   id: string;',
+    '+  // shortcut: <1000 active sessions, migrate to Redis cluster when concurrent users exceed 1000',
+    '+  sessionCache?: Record<string, string>;',
+    '+  // TODO: clean up legacy token field later',
+    '+  legacyToken?: string;',
+    ' }',
+    'diff --git a/packages/legacy-auth/src/session.ts b/packages/legacy-auth/src/session.ts',
+    '@@ -10,3 +10,4 @@ export function verifyLegacySession(t) {',
+    '+  return Boolean(t);',
+    ' }',
+    'diff --git a/packages/api/test/user-contract.test.ts b/packages/api/test/user-contract.test.ts',
+    '@@ -1,3 +1,8 @@',
+    '+describe("UserContract session cache", () => {',
+    '+  it("caches active session when user logs in", () => {',
+    '+    expect(createSession("u1").id).toBe("u1");',
+    '+  });',
+    '+});'
+  ].join('\n');
+
+  const parsed = parseUnifiedDiff(diff);
+  const shortcuts = extractShortcutsFromHunks(parsed);
+  assert.equal(shortcuts.length, 2);
+  const bounded = shortcuts.find((s) => s.kind === 'shortcut');
+  const unbounded = shortcuts.find((s) => s.kind === 'todo');
+  assert.ok(bounded);
+  assert.equal(bounded.hasTrigger, true);
+  assert.equal(bounded.rotRisk, false);
+  assert.ok(unbounded);
+  assert.equal(unbounded.hasTrigger, false);
+  assert.equal(unbounded.rotRisk, true);
+
+  // CODEOWNERS parsing & matching
+  const codeownersRules = parseCodeowners([
+    '# Core owners',
+    '/packages/api/ @platform-team @api-leads',
+    '/packages/legacy-auth/ @security-team'
+  ].join('\n'));
+  assert.deepEqual(matchCodeowners('packages/api/src/user-contract.ts', codeownersRules), [
+    '@platform-team',
+    '@api-leads'
+  ]);
+
+  // Spec & Negative-Space Alignment + Caller Blast Radius
+  const prMeta = {
+    title: 'feat(api): add sessionCache to UserContract',
+    body: [
+      '## Summary',
+      'Adds bounded in-memory session cache.',
+      'Repo precedent: follows `packages/api/src/token-contract.ts`.',
+      '',
+      '## Acceptance Criteria',
+      '- WHEN user logs in, the system SHALL cache active session in memory',
+      '- Given an expired token, When session is queried, Then return 401 unauthorized',
+      '',
+      '## Out of scope',
+      '- Do not touch `packages/legacy-auth`'
+    ].join('\n')
+  };
+
+  const layers = buildLayersFromParsedDiff(parsed, [], {
+    prMeta,
+    codeownersRules,
+    callerBlastRadiusByPath: {
+      'packages/api/src/user-contract.ts': {
+        callers: ['apps/web/src/auth.ts', 'apps/mobile/src/login.ts'],
+        owners: ['@web-team'],
+        unownedCallersCount: 1
+      }
+    }
+  });
+
+  // Verify shortcuts & specAlignment in attentionSignals
+  assert.equal(layers.attentionSignals.shortcuts.length, 2);
+  const spec = layers.attentionSignals.specAlignment;
+  assert.ok(spec);
+  assert.equal(spec.outOfScope.length, 1);
+  assert.equal(spec.negativeSpaceViolations.length, 1);
+  assert.equal(spec.negativeSpaceViolations[0].path, 'packages/legacy-auth/src/session.ts');
+  assert.equal(spec.repoPrecedents.length, 1);
+  assert.equal(spec.specClauses.length, 2);
+  assert.equal(spec.specClauses[0].covered, true);
+  assert.equal(spec.specClauses[1].covered, false);
+
+  // Verify contract owners & callerBlastRadius in Layer 3
+  assert.equal(layers.contracts.length, 1);
+  assert.deepEqual(layers.contracts[0].owners, ['@platform-team', '@api-leads']);
+  assert.equal(layers.contracts[0].callerBlastRadius.callers.length, 2);
+  assert.equal(layers.contracts[0].callerBlastRadius.unownedCallersCount, 1);
+
+  // Verify LeanSavedLines total & ESL Slop Linter in findings-compiler
+  const findingsWithLeanAndSlop = {
+    meta: {
+      title: 'PR #101: Add session cache',
+      summary: '**What it does.** Adds session cache.\n\n**Coverage.** 14 lenses checked.'
+    },
+    issues: [
+      {
+        id: 'M1',
+        sev: 'med',
+        cat: 'structure',
+        verify: 'CONFIRMED',
+        leanSavedLines: 42,
+        loc: 'packages/api/src/user-contract.ts:3',
+        title: 'Pass-through wrapper adds 42 lines without changing shape',
+        impact: '**Breaks:** Callers must maintain two identical interfaces (verified: packages/api/src/user-contract.ts:3).\n\n**Because:** `UserContract` duplicates `SessionRecord`.\n\n**Reach:** 2 callers.',
+        fix: '**Do:** Delete the pass-through wrapper.\n\n**Check:** `npm test` passes.'
+      },
+      {
+        id: 'L1',
+        sev: 'low',
+        cat: 'readability',
+        verify: 'LIKELY',
+        loc: 'packages/api/src/user-contract.ts:5',
+        title: 'This load-bearing module is not a cache, but a session store',
+        impact: '**Breaks:** Confuses readers with a single pane of glass.\n\n**Because:** Naming mixes cache and store.\n\n**Reach:** Local file.',
+        fix: '**Do:** Rename field.\n\n**Check:** Build succeeds.'
+      }
+    ]
+  };
+
+  const warnings = checkFindingsShape(findingsWithLeanAndSlop);
+  assert.equal(warnings.some((w) => w.includes('load-bearing')), true);
+  assert.equal(warnings.some((w) => w.includes('single pane of glass')), true);
+  assert.equal(warnings.some((w) => w.includes('"not X, but Y"')), true);
+
+  const report = compileFindingsToWorkbenchReport(findingsWithLeanAndSlop, { diffText: diff, prMeta });
+  assert.equal(report.SUMMARY.leanSavedLinesTotal, 42);
+  assert.equal(report.LAYERS.leanSavedLinesTotal, 42);
+  assert.equal(report.DATA[0].leanSavedLines, 42);
+});
+

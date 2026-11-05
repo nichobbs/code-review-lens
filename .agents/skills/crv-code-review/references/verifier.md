@@ -34,7 +34,9 @@ Write one JSON array to <result file>, one object per finding, then reply with t
 
 - CONFIRMED: the trigger is in the diff, and a concrete input or sequence reaches the failure.
 - REFUTED: a line you quote shows the claim is wrong, a guard or caller already handles the case,
-  the diff already fixes it, or the point is style only.
+  the diff already fixes it, a bounded `// shortcut: <ceiling>, <upgrade>` comment in the diff
+  explicitly documents a non-bug scale/structure limit whose `<ceiling>` holds under expected load,
+  or the point is style only.
 - PLAUSIBLE: anything else, such as a failure that depends on a caller, configuration or input
   you could not verify.
 

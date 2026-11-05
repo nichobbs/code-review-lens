@@ -20,6 +20,7 @@ Every lens writes findings in one shape. After the last lens, the review triages
 | `mermaid` | Optional flowchart source, four or five nodes, for a high finding; a Before and After flowchart for a design candidate |
 | `suggestion` | Optional. Exact replacement code for the line at `loc` when the fix is a 1–10 line surgical edit; serialized as a GitHub ```` ```suggestion ```` block so the author can commit it in one click |
 | `fixPrompt` | Optional. A self-contained instruction for a coding agent (`Fix <id> at <loc>: ...`) so a reviewer can hand the finding to an agent in one click |
+| `leanSavedLines` | Optional positive integer. Estimated number of lines removable when the finding deletes dead/YAGNI code, collapses a pass-through wrapper, or reuses an existing helper |
 | `strength` | Design candidates only: `Strong`, `Worth exploring` or `Speculative` |
 | `scope` | Design candidates only: `This PR`, `Separate ticket`, `Follow-up` or `Optional` |
 | `deps` | Design candidates only: `in-process`, `local-substitutable`, `remote-owned` or `external` |
@@ -146,16 +147,37 @@ These rules come from the `no-ai-slop` skill by Peter Yang (MIT licence, notice 
 2. Concrete over abstract: `path:line`, numbers, names, the mechanism. A sentence that could move to another PR unchanged is filler. Cut it.
 3. One word per concept, within a finding and across the report.
 4. No contrast setups ("not X, but Y"), no colon reveals, no throat-clearing openers, no claims that something is important, no asides that tell the reader what matters, no summary endings.
-5. No unnamed authority, such as "best practice says" or "experts agree". Name the standard, the doc or the line, or cut the claim.
-6. None of the words in the list below.
+5. No unnamed authority, such as "best practice says" or "experts agree". Name the standard, the doc or the line, or cut the claim. When stating a fact about an external caller, upstream service, or config in `reasoning` or `meta.summary`, tag verified facts with `(verified: <path:line>)` and unverified assumptions with `(inferred)`.
+6. None of the banned AI filler words or figurative idioms below. Use literal English so ESL readers and engineers under time pressure never have to decode metaphors.
 7. Em dashes only where they read better than a comma or a full stop.
 8. Bold only for the five labels.
 
 ```text
 delve, foster, leverage, utilize, facilitate, empower, streamline, robust, cutting-edge,
-paradigm shift, game changer, tapestry, realm, beacon, multifaceted, meticulous, intricate,
-paramount, transformative, elevate, embark, supercharge, harness, ever-evolving
+paradigm, synergy, game changer, tapestry, testament, underscore, pivotal, crucial,
+seamlessly, holistic, realm, beacon, landscape, interplay, multifaceted, meticulous,
+intricate, overarching, paramount, transformative, elevate, embark, supercharge, harness,
+ever-evolving
 ```
+
+### Literal prose replacements (never use the left column)
+
+| Figurative idiom (banned) | Literal replacement |
+| --- | --- |
+| `X bites when...` | `X fails when...` or `X throws when...` |
+| `load-bearing` | `required for X to work` |
+| `fans out to N services` | `calls N services` or `publishes to N topics` |
+| `poisons the queue / cache` | `leaves an invalid message in the queue` or `writes a corrupt entry to the cache` |
+| `evaporates` | `is lost` or `is dropped` |
+| `bolted on` | `added separately from` |
+| `earns its place` | `is needed because` |
+| `makes the call` | `decides` |
+| `leans on` | `depends on` or `calls` |
+| `sit with` | `belong in` |
+| `the estate` | `the repositories` or `the services` |
+| `closes the hole` | `fixes the bug` or `blocks the bypass` |
+| `hits a wall` | `reaches the limit` or `times out` |
+| `single pane of glass` | `one view` or `one dashboard` |
 
 ## The report file
 

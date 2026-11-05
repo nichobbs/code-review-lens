@@ -27,8 +27,8 @@ const UI_DIR = path.resolve(__dirname, '../ui');
 const DEFAULT_FIXTURE = path.resolve(__dirname, '../../fixtures/pr1230-report.json');
 
 /**
- * Extracts a report object from a Workbench `.json`, a raw `tu-code-review` `findings.json`,
- * or a `tu-code-review` `.html` file.
+ * Extracts a report object from a Workbench `.json`, a raw `crv-code-review` `findings.json`,
+ * or a `crv-code-review` `.html` file.
  */
 function loadReportFile(filePath, options = {}) {
   const resolved = path.resolve(filePath || DEFAULT_FIXTURE);
@@ -58,7 +58,7 @@ function loadReportFile(filePath, options = {}) {
   if (initMatch) {
     return JSON.parse(initMatch[1]);
   }
-  // Parse tu-code-review single-file HTML report
+  // Parse crv-code-review single-file HTML report
   const lines = content.split('\n');
   const dataLineIdx = lines.findIndex((l) => l.startsWith('const DATA=['));
   if (dataLineIdx === -1) {
@@ -230,8 +230,7 @@ async function listRecentPrsAsync(explicitRepo, limit = 10) {
 function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hydrated }) {
   if (!diffText) {
     const diffCandidates = [
-      path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/diff.patch`),
-      path.resolve(process.cwd(), `.tu-skills/tu-code-review/${prNumInt}/diff.patch`)
+      path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
     ];
     const stagedDiffPath = diffCandidates.find((p) => fs.existsSync(p));
     if (stagedDiffPath) {
@@ -241,8 +240,7 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
 
   // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json
   const scratchCandidates = [
-    path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`),
-    path.resolve(process.cwd(), `.tu-skills/tu-code-review/${prNumInt}/findings.json`)
+    path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`)
   ];
   const scratchFindingsPath = scratchCandidates.find((p) => fs.existsSync(p));
   if (scratchFindingsPath) {
@@ -296,12 +294,12 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
       loc,
       title: `Existing GitHub thread by @${gc.author} on ${path.basename(gc.path)}`,
       impact: `**Breaks:** Existing review thread raised on GitHub by \`@${gc.author}\`.\n\n**Because:** ${(gc.body || '').replace(/\s+/g, ' ').slice(0, 260)}\n\n**Reach:** Inline thread at \`${loc}\`.`,
-      fix: `**Do:** Inspect thread at \`${loc}\` or run the 13-lens \`crv-code-review\` agent skill for full verification.\n\n**Check:** Resolve thread on GitHub once addressed.`
+      fix: `**Do:** Inspect thread at \`${loc}\` or run the 14-lens \`crv-code-review\` agent skill for full verification.\n\n**Check:** Resolve thread on GitHub once addressed.`
     });
   }
 
   // Flag any hollow or mock-only tests automatically from Layer 4
-  const preLayers = buildLayersFromParsedDiff(parsedFiles, []);
+  const preLayers = buildLayersFromParsedDiff(parsedFiles, [], { prMeta });
   let testIdx = 1;
   for (const tm of preLayers.testMatrix) {
     for (const c of tm.cases) {
@@ -344,7 +342,7 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
         base: prMeta.baseRefOid,
         head: prMeta.headRefOid,
         agent: 'CRV Live Diff Analyzer',
-        model: '4-Layer Pre-Scan (Run crv-code-review skill for full 13-lens deep review)',
+        model: '4-Layer Pre-Scan (Run crv-code-review skill for full 14-lens deep review)',
         lenses: ['contract-classifier', 'flow-grouper', 'test-matrix']
       },
       summary: [
@@ -353,7 +351,7 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
         (prMeta.body || '').trim()
           ? `### Author PR Description\n\n${prMeta.body.trim().slice(0, 1200)}`
           : '',
-        `**Coverage.** Pre-scanned ${parsedFiles.length} changed files into ${preLayers.contracts.length} contract file(s), ${preLayers.flows.length} production flow group(s), and ${preLayers.testMatrix.length} test file(s). Ask Antigravity in chat: \`Review ${prMeta.url} with crv-code-review\` to run the full 13-lens + verifier agent analysis.`
+        `**Coverage.** Pre-scanned ${parsedFiles.length} changed files into ${preLayers.contracts.length} contract file(s), ${preLayers.flows.length} production flow group(s), and ${preLayers.testMatrix.length} test file(s). Ask Antigravity in chat: \`Review ${prMeta.url} with crv-code-review\` to run the full 14-lens + verifier agent analysis.`
       ]
         .filter(Boolean)
         .join('\n\n'),

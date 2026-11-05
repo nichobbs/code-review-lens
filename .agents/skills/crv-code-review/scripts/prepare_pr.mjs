@@ -25,6 +25,8 @@ const corePath = fs.existsSync(vendoredCorePath) ? vendoredCorePath : monorepoCo
 const {
   parseUnifiedDiff,
   buildLayersFromParsedDiff,
+  parseCodeowners,
+  matchCodeowners,
   hydrateFromGitHubComments,
   parsePaginatedGhJson,
   fetchPrDiffWithFallback,
@@ -201,7 +203,59 @@ function main() {
     }
   }
 
-  const layers = buildLayersFromParsedDiff(parsedFiles, [], { prMeta, reuseCandidates });
+  // Discover CODEOWNERS if present in the repo
+  let codeownersText = '';
+  for (const cand of ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']) {
+    const absCand = path.resolve(process.cwd(), cand);
+    if (fs.existsSync(absCand)) {
+      codeownersText = fs.readFileSync(absCand, 'utf8');
+      break;
+    }
+  }
+  const codeownersRules = codeownersText ? parseCodeowners(codeownersText) : [];
+
+  // Compute Caller Blast Radius for modified contract files
+  const callerBlastRadius = {};
+  for (const f of parsedFiles) {
+    if (f.layer !== 'contracts') continue;
+    const baseStem = path.basename(f.path).replace(/\.[a-z0-9]+$/i, '');
+    const contractSyms = (f.addedSymbols || []).map((s) => s.name);
+    const searchTokens = [...new Set([...contractSyms, baseStem])].filter(
+      (t) => /^[A-Za-z0-9_-]{4,}$/.test(t) && !['index', 'models', 'schema', 'types'].includes(t.toLowerCase())
+    );
+    if (searchTokens.length === 0) continue;
+    const tokPattern = searchTokens.slice(0, 6).join('|');
+    const cGrep = spawnSync('git', ['grep', '-l', '-E', tokPattern], {
+      encoding: 'utf8',
+      timeout: 4000,
+      maxBuffer: 2 * 1024 * 1024
+    });
+    if (cGrep && cGrep.status === 0 && cGrep.stdout) {
+      const callerFiles = cGrep.stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && l !== f.path && !/(^|\/)(?:test|tests|__tests__)\/|\.test\.|\.spec\./i.test(l))
+        .slice(0, 8);
+      if (callerFiles.length > 0) {
+        const callers = callerFiles.map((cp) => {
+          const owners = codeownersRules.length ? matchCodeowners(cp, codeownersRules) : [];
+          return { path: cp, owners };
+        });
+        callerBlastRadius[f.path] = {
+          symbols: searchTokens.slice(0, 4),
+          callers,
+          unownedCallersCount: codeownersRules.length ? callers.filter((c) => c.owners.length === 0).length : 0
+        };
+      }
+    }
+  }
+
+  const layers = buildLayersFromParsedDiff(parsedFiles, [], {
+    prMeta,
+    reuseCandidates,
+    codeownersRules,
+    callerBlastRadius
+  });
 
   fs.writeFileSync(path.join(absScratch, 'layers.json'), JSON.stringify(layers, null, 2));
   fs.writeFileSync(path.join(absScratch, 'github-threads.json'), JSON.stringify(hydratedThreads, null, 2));
@@ -213,6 +267,8 @@ function main() {
   );
   const testLines = layers.testMatrix.reduce((acc, f) => acc + f.collapsedLines, 0);
   const signals = layers.attentionSignals || {};
+  const shortcuts = signals.shortcuts || [];
+  const specAlignment = signals.specAlignment || {};
 
   console.log(
     JSON.stringify(
@@ -230,6 +286,9 @@ function main() {
         removedGuardsCount: (signals.removedGuards || []).length,
         stealthChangesCount: (signals.stealthChanges || []).length,
         reuseCandidatesCount: (signals.reuseCandidates || []).length,
+        shortcutsCount: shortcuts.length,
+        rotRiskShortcutsCount: shortcuts.filter((s) => s.rotRisk).length,
+        negativeSpaceViolationsCount: (specAlignment.negativeSpaceViolations || []).length,
         hydratedCrvFindings: Object.keys(hydratedThreads.findingThreads || {}).length,
         generalGitHubComments: (hydratedThreads.generalComments || []).length
       },

@@ -329,14 +329,34 @@
     const removedGuards = signals.removedGuards || [];
     const stealthChanges = signals.stealthChanges || [];
     const reuseCandidates = signals.reuseCandidates || [];
-    const hasSignals = removedGuards.length > 0 || stealthChanges.length > 0 || reuseCandidates.length > 0;
+    const shortcuts = signals.shortcuts || [];
+    const specAlignment = signals.specAlignment || {};
+    const negViolations = specAlignment.negativeSpaceViolations || [];
+    const specClauses = specAlignment.specClauses || [];
+    const hasSignals =
+      removedGuards.length > 0 ||
+      stealthChanges.length > 0 ||
+      reuseCandidates.length > 0 ||
+      shortcuts.length > 0 ||
+      negViolations.length > 0 ||
+      specClauses.length > 0;
     const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
+    const leanSavedLinesTotal =
+      s.leanSavedLinesTotal ||
+      report?.LAYERS?.leanSavedLinesTotal ||
+      issues.reduce((acc, x) => acc + (Number(x.leanSavedLines) || 0), 0);
 
     const signalsHtml = hasSignals
       ? `<div class="sec">
-          <h4>AI Attention &amp; Guard Signals (Automated Diff Pre-Scan)</h4>
+          <h4>AI Attention, Spec Alignment &amp; Shortcut Ledger (Automated Diff Pre-Scan)</h4>
           <div class="layer-card" style="padding:10px 14px;">
             <ul class="prose" style="margin:0;padding-left:18px;">
+              ${negViolations
+                .map(
+                  (nv) =>
+                    `<li>🚫 <strong>Negative-Space / Out-of-Scope Violation:</strong> <code>${escapeHtml(nv.path)}</code> — ${escapeHtml(nv.reason)}</li>`
+                )
+                .join('')}
               ${removedGuards
                 .map(
                   (g) =>
@@ -353,6 +373,20 @@
                 .map(
                   (rc) =>
                     `<li>♻️ <strong>Near-Duplicate Utility Candidate:</strong> <code>${escapeHtml(rc.name)}</code> added in <code>${escapeHtml(rc.addedIn)}</code> overlaps <code>${escapeHtml((rc.existingMatches || []).join(', '))}</code></li>`
+                )
+                .join('')}
+              ${shortcuts
+                .map((sh) =>
+                  sh.hasTrigger
+                    ? `<li>📌 <strong>Bounded Shortcut (<code>${escapeHtml(sh.marker)}</code>):</strong> <code>${escapeHtml(sh.path)}:${sh.line}</code> — ceiling: <em>${escapeHtml(sh.ceiling)}</em> → upgrade: <em>${escapeHtml(sh.upgrade)}</em></li>`
+                    : `<li>⚠️ <strong>Unbounded Deferral / Rot Risk (<code>${escapeHtml(sh.marker)}</code>):</strong> <code>${escapeHtml(sh.path)}:${sh.line}</code> — <code>${escapeHtml(sh.text)}</code> (missing ceiling &amp; upgrade trigger)</li>`
+                )
+                .join('')}
+              ${specClauses
+                .map((cl) =>
+                  cl.covered
+                    ? `<li>✅ <strong>${escapeHtml(cl.kind)} Clause Covered:</strong> ${escapeHtml(cl.clause)} <code>(${escapeHtml((cl.matchedTests || [])[0] || 'tested')})</code></li>`
+                    : `<li>⚠️ <strong>Uncovered ${escapeHtml(cl.kind)} Clause:</strong> ${escapeHtml(cl.clause)} — no matching test detected in Layer 4</li>`
                 )
                 .join('')}
             </ul>
@@ -374,6 +408,7 @@
       <div class="fhead">
         <div class="fmeta">
           <span class="verify-pill">${escapeHtml(verifyText)}</span>
+          ${leanSavedLinesTotal > 0 ? `<span class="tpill">✂️ Lean: -${leanSavedLinesTotal} lines cuttable</span>` : ''}
           <span>Agent: <strong>${escapeHtml(rev.agent || 'Antigravity')}</strong> (${escapeHtml(rev.model || 'Claude Opus 4.6')})</span>
           <span>Head: <code>${escapeHtml((rev.head || '').slice(0, 8))}</code></span>
         </div>
@@ -399,15 +434,39 @@
       .map((c) => {
         const diffSum = c.diffSummary || c.summary || '';
         const linked = c.linkedFindings || c.findings || [];
+        const owners = c.owners || [];
+        const blast = c.callerBlastRadius || null;
+        const blastHtml =
+          blast && Array.isArray(blast.callers) && blast.callers.length > 0
+            ? `<div style="margin:6px 0 8px;font-size:12px;color:var(--ink-2);">
+                <strong>External Callers (${blast.callers.length}):</strong>
+                ${blast.callers
+                  .map(
+                    (cl) =>
+                      `<code style="margin-right:6px;">${escapeHtml(cl.path)}${
+                        cl.owners && cl.owners.length
+                          ? ` (${escapeHtml(cl.owners.join(', '))})`
+                          : blast.unownedCallersCount > 0
+                            ? ' (unowned)'
+                            : ''
+                      }</code>`
+                  )
+                  .join('')}
+              </div>`
+            : '';
         return `<div class="layer-card">
           <div class="layer-card-header">
             <h3 class="layer-card-title"><code>${escapeHtml(c.path)}</code></h3>
-            <span class="status-badge solid">${escapeHtml(c.category || 'Contract')}</span>
+            <div style="display:flex;gap:6px;align-items:center;">
+              ${owners.length ? `<span class="tpill">${escapeHtml(owners.join(', '))}</span>` : ''}
+              <span class="status-badge solid">${escapeHtml(c.category || 'Contract')}</span>
+            </div>
           </div>
           <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(c.summary || '')}</p>
           ${diffSum ? `<div style="font:400 12px var(--mono);background:var(--well);padding:6px 10px;border-radius:4px;margin-bottom:8px;">
             ${escapeHtml(diffSum)}
           </div>` : ''}
+          ${blastHtml}
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;">
             <strong style="color:var(--muted)">Linked Findings:</strong>
             ${linked.length
@@ -607,6 +666,7 @@
         <div class="fmeta">
           <span class="badge">${escapeHtml(d.id)} · ${escapeHtml(sevMeta.l)}</span>
           ${d.verify ? `<span class="verify-pill">✓ ${escapeHtml(d.verify)}</span>` : ''}
+          ${d.leanSavedLines > 0 ? `<span class="tpill">✂️ -${d.leanSavedLines} lines cuttable</span>` : ''}
           <span>Lenses: <strong>${escapeHtml(d.cat || 'general')}</strong></span>
           ${earlierLinks}
         </div>

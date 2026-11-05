@@ -200,12 +200,25 @@ def review_result(findings):
 
 LEADS_IMPACT = ("**Breaks:**", "**Because:**", "**Reach:**")
 LEADS_FIX = ("**Do:**", "**Check:**")
+SLOP_RE = re.compile(
+    r"\b(?:delve|tapestry|testament|underscore[sd]?|pivotal|crucial|seamlessly|holistic|"
+    r"paradigm|synergy|foster|elevate|beacon|landscape|interplay|intricate|meticulous|"
+    r"multifaceted|overarching|robust|streamline|utilize|leverage|load-bearing|fans out|"
+    r"poisons|evaporates|bolted on|earns its place|makes the call|leans on|sit with|"
+    r"the estate|closes the hole|hits a wall|single pane of glass)\b",
+    re.IGNORECASE,
+)
+NOT_X_BUT_Y_RE = re.compile(r"\bnot\s+(?:just\s+|only\s+)?[^,;.]{2,35},\s*but\s+(?:rather\s+)?", re.IGNORECASE)
 
 def shape_warnings(findings):
     """Warn per issue when impact/fix stray from the lesson shape (references/findings.md,
-    "Write each finding as one lesson"). Warnings only, so older findings files still build.
-    Resolved issues are skipped: nobody acts on them."""
+    "Write each finding as one lesson") or contain banned AI filler / figurative idioms.
+    Warnings only, so older findings files still build. Resolved issues are skipped."""
     msgs = []
+    summary_text = (findings.get("meta") or {}).get("summary") or ""
+    sm = SLOP_RE.search(summary_text)
+    if sm:
+        msgs.append("meta.summary: contains banned AI filler or figurative idiom '%s'" % sm.group(0))
     for x in findings.get("issues", []):
         if not is_open(x):
             continue
@@ -220,9 +233,15 @@ def shape_warnings(findings):
             msgs.append("%s: impact is %d chars; aim under ~700 and move detail to `reasoning`" % (x["id"], len(imp)))
         if len(fix) > 500:
             msgs.append("%s: fix is %d chars; aim under ~450 and move detail to `reasoning`" % (x["id"], len(fix)))
+        prose = " ".join([x.get("title") or "", imp, fix])
+        m_slop = SLOP_RE.search(prose)
+        if m_slop:
+            msgs.append("%s: contains banned AI filler or figurative idiom '%s' (use literal prose)" % (x["id"], m_slop.group(0)))
+        if NOT_X_BUT_Y_RE.search(prose):
+            msgs.append("%s: contains 'not X, but Y' contrast (state the positive claim directly)" % x["id"])
     if msgs:
         print("SHAPE: %d problem(s) in findings.json: the lesson shape (Breaks/Because/Reach + Do/Check,\n"
-              "       long reasoning in `reasoning`), or verify. See references/findings.md.\n  %s"
+              "       long reasoning in `reasoning`), verify, or literal prose rules. See references/findings.md.\n  %s"
               % (len(msgs), "\n  ".join(msgs)), file=sys.stderr)
     return len(msgs)
 
@@ -1106,7 +1125,7 @@ $('#markDone').onclick=markCurrent;
 $('#ovbtn').onclick=()=>{select(SUMMARY?OV:RV);if(narrow())document.body.classList.add('show-detail');updateBack();};
 $('#back').onclick=()=>{document.body.classList.remove('show-detail');updateBack();};
 // Rack width: stored per viewer as a fraction of the window; the finding pane keeps at least 420px.
-(function(){const app=$('.app'),rz=$('#resizer'),RK='tu-code-review:rack-width',MIN=280,PANE=420;let f=null;
+(function(){const app=$('.app'),rz=$('#resizer'),RK='crv-code-review:rack-width',MIN=280,PANE=420;let f=null;
   function apply(x){if(x==null){app.style.removeProperty('--rack-w');return null;}
     const w=app.getBoundingClientRect().width;if(!w)return x;const px=Math.max(MIN,Math.min(w-PANE,x*w));
     app.style.setProperty('--rack-w',(px/w*100).toFixed(2)+'%');rz.setAttribute('aria-valuenow',String(Math.round(px/w*100)));return px/w;}

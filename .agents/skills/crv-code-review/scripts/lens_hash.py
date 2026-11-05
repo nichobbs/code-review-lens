@@ -1,6 +1,6 @@
 """lens_hash.py — one SHA-256 over the text a review follows.
 
-lens_hash(skill_dir) hashes lenses/*.md and references/*.md under the tu-code-review folder, in
+lens_hash(skill_dir) hashes lenses/*.md and references/*.md under the crv-code-review folder, in
 sorted relative-path order, so two copies with the same text give the same hash.
 """
 import hashlib
@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def lens_hash(skill_dir):
-    """skill_dir: the tu-code-review folder. Returns 64 hex characters."""
+    """skill_dir: the crv-code-review folder. Returns 64 hex characters."""
     root = Path(skill_dir).resolve()
     files = list((root / "lenses").glob("*.md")) + list((root / "references").glob("*.md"))
     digest = hashlib.sha256()
