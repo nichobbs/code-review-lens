@@ -246,6 +246,38 @@ function extractTestCasesFromHunks(filePath, hunks) {
   }));
 }
 
+function summarizeContractDiff(fileObj) {
+  const highlights = [];
+  for (const h of fileObj.hunks || []) {
+    for (const l of h.lines || []) {
+      if (l.type === 'add' || l.type === 'del') {
+        const trimmed = String(l.content || '').trim();
+        if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) continue;
+        const prefix = l.type === 'add' ? '+' : '-';
+        highlights.push(`${prefix} ${trimmed}`);
+        if (highlights.length >= 2) break;
+      }
+    }
+    if (highlights.length >= 2) break;
+  }
+  if (highlights.length > 0) {
+    return highlights.join(' ; ').slice(0, 180);
+  }
+  return `+${fileObj.additions || 0} / -${fileObj.deletions || 0} lines changed in ${fileObj.category || 'contract'}.`;
+}
+
+function formatHunksAsRawDiff(fileObj) {
+  const out = [];
+  for (const h of fileObj.hunks || []) {
+    if (h.header) out.push(h.header);
+    for (const l of h.lines || []) {
+      const prefix = l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' ';
+      out.push(`${prefix}${l.content}`);
+    }
+  }
+  return out.join('\n');
+}
+
 /**
  * Builds the 4-Layer `LAYERS` object (`contracts`, `flows`, `testMatrix`, `config`)
  * from parsed diff files and cross-references findings by file path.
@@ -253,7 +285,7 @@ function extractTestCasesFromHunks(filePath, hunks) {
 function buildLayersFromParsedDiff(parsedFiles, issues = []) {
   const findingsByFile = new Map();
   for (const issue of issues || []) {
-    const file = String(issue.loc || '').split(':')[0].trim();
+    const file = String(issue.loc || '').replace(/:(\d+)(?:-(\d+))?$/, '').trim();
     if (!file) continue;
     if (!findingsByFile.has(file)) findingsByFile.set(file, []);
     findingsByFile.get(file).push(issue.id);
@@ -277,24 +309,31 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
   for (const f of parsedFiles || []) {
     const linkedFindings = findMatchingIds(f.path);
     if (f.layer === 'contracts') {
+      const summary = `${f.category} (+${f.additions} / -${f.deletions})`;
       contracts.push({
         path: f.path,
         category: f.category,
         additions: f.additions,
         deletions: f.deletions,
-        summary: `${f.category} (+${f.additions} / -${f.deletions})`,
-        findings: linkedFindings
+        summary,
+        diffSummary: summarizeContractDiff(f),
+        findings: linkedFindings,
+        linkedFindings
       });
     } else if (f.layer === 'flows') {
       const flowName = f.category || inferFlowName(f.path);
       if (!flowsMap.has(flowName)) {
         flowsMap.set(flowName, {
+          id: `flow-${flowsMap.size + 1}`,
           name: flowName,
+          title: flowName,
           files: [],
           additions: 0,
           deletions: 0,
           findings: [],
-          summary: ''
+          linkedFindings: [],
+          summary: '',
+          description: ''
         });
       }
       const group = flowsMap.get(flowName);
@@ -302,21 +341,53 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
       group.additions += f.additions;
       group.deletions += f.deletions;
       for (const id of linkedFindings) {
-        if (!group.findings.includes(id)) group.findings.push(id);
+        if (!group.findings.includes(id)) {
+          group.findings.push(id);
+          group.linkedFindings.push(id);
+        }
       }
     } else if (f.layer === 'tests') {
       const cases = f.testMatrix || [];
-      testMatrix.push({
-        file: f.path,
-        suite: inferSuiteFromPath(f.path),
-        collapsedLines: f.additions + f.deletions,
-        cases: cases.map((c) => ({
+      const mappedCases = cases.map((c) => {
+        const status = c.hollow ? 'hollow' : c.mockOnly ? 'flawed-spec' : 'solid';
+        const note = c.hollow
+          ? 'Zero assertions detected in test body'
+          : c.mockOnly
+            ? `Mock-only assertions (${(c.verifiedTargets || []).join(', ') || 'spies'})`
+            : (c.verifiedTargets || []).length
+              ? `Targets: ${c.verifiedTargets.join(', ')}`
+              : '';
+        return {
           behavior: c.behavior,
           assertions: c.assertions,
           hollow: c.hollow,
           mockOnly: c.mockOnly,
-          targets: c.verifiedTargets
-        }))
+          targets: c.verifiedTargets,
+          status,
+          note
+        };
+      });
+      const assertionsCount = mappedCases.reduce((sum, c) => sum + (c.assertions || 0), 0);
+      const hasHollow = mappedCases.some((c) => c.hollow);
+      const hasMockOnly = mappedCases.some((c) => c.mockOnly);
+      const suiteStatus = hasHollow
+        ? 'gap'
+        : hasMockOnly || linkedFindings.length > 0
+          ? 'warning'
+          : 'solid';
+
+      testMatrix.push({
+        file: f.path,
+        suite: cases[0]?.suite || inferSuiteFromPath(f.path),
+        collapsedLines: f.additions + f.deletions,
+        totalCases: mappedCases.length,
+        assertionsCount,
+        status: suiteStatus,
+        findings: linkedFindings,
+        linkedFindings,
+        rawDiff: formatHunksAsRawDiff(f),
+        cases: mappedCases,
+        scenarios: mappedCases
       });
     } else {
       config.push({
@@ -327,10 +398,14 @@ function buildLayersFromParsedDiff(parsedFiles, issues = []) {
     }
   }
 
-  const flows = Array.from(flowsMap.values()).map((g) => ({
-    ...g,
-    summary: `${g.files.length} changed file(s) (+${g.additions} / -${g.deletions})`
-  }));
+  const flows = Array.from(flowsMap.values()).map((g) => {
+    const desc = `${g.files.length} changed file(s) (+${g.additions} / -${g.deletions})`;
+    return {
+      ...g,
+      summary: desc,
+      description: desc
+    };
+  });
 
   return { contracts, flows, testMatrix, config };
 }

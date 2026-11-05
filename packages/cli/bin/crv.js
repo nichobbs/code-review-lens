@@ -44,6 +44,7 @@ OPTIONS:
   --effort <level>        Reasoning effort for agy/claude (low, medium, high, xhigh, max)
   --analyze               Run the full 13-lens AI agent review before opening the Workbench
   --headless              Run the AI agent non-interactively (-p mode) when analyzing
+  --interactive           Force interactive agent session when running with --analyze
   --diff <diff.patch>     Attach unified diff file to extract inline code slices & Layer 4 Test Matrix
   --out <path.html>       Output file path for export-html
   --sync                  Hydrate existing <!-- crv-finding --> & <!-- crv-meta --> threads from GitHub
@@ -72,6 +73,7 @@ function parseArgs(argv) {
     open: true,
     analyze: false,
     headless: false,
+    interactive: false,
     help: false,
     version: false,
     repo: null,
@@ -93,6 +95,7 @@ function parseArgs(argv) {
     else if (a === '--sync') flags.sync = true;
     else if (a === '--analyze') flags.analyze = true;
     else if (a === '--headless') flags.headless = true;
+    else if (a === '--interactive' || a === '-i') flags.interactive = true;
     else if (a === '--open') flags.open = true;
     else if (a === '--no-open') flags.open = false;
     else if (a === '--global' || a === '-g') flags.global = true;
@@ -219,18 +222,19 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     throw new Error(`Failed to stage PR #${prNum} via prepare_pr.mjs`);
   }
 
+  const useHeadless = Boolean(flags.headless || (flags.analyze && !flags.interactive));
   const prompt = buildReviewSkillPrompt({
     repo,
     pr: prNum,
     scratchDir,
     skillDir,
-    headless: flags.headless,
+    headless: useHeadless,
     agentName: agentCfg.spec.name,
     modelName: agentCfg.model || undefined
   });
 
   const modelOpts = { model: agentCfg.model, effort: agentCfg.effort };
-  const agentArgs = flags.headless
+  const agentArgs = useHeadless
     ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir, modelOpts)
     : agentCfg.spec.buildInteractiveArgs(prompt, skillDir, modelOpts);
 

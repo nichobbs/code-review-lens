@@ -100,7 +100,7 @@ def _tag_text(text, pattern):
 def from_embedded(text):
     """Path 1: the verbatim findings dict the builder embedded."""
     m = re.search(
-        r'<script[^>]*id=["\']crv-findings["\'][^>]*>(.*?)</script>', text, re.S
+        r'<script[^>]*id=["\'](?:crv|tu)-findings["\'][^>]*>(.*?)</script>', text, re.S
     )
     if not m:
         return None
