@@ -5,6 +5,20 @@ const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
 
+const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** Strict `owner/repo` check (no path traversal, no `..`, no whitespace). */
+function isValidRepoSlug(slug) {
+  if (typeof slug !== 'string' || !REPO_SLUG_RE.test(slug)) return false;
+  return slug.split('/').every((part) => part !== '.' && part !== '..');
+}
+
+/** Positive integer PR number (accepts numeric strings). */
+function parsePrNumber(value) {
+  const n = typeof value === 'number' ? value : /^\d{1,9}$/.test(String(value).trim()) ? Number(value) : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 /**
  * Parses a GitHub `owner/repo` slug from a git remote URL (HTTPS or SSH) or plain `owner/repo` string.
  */
@@ -15,11 +29,11 @@ function parseGitHubRepoSlug(input) {
 
   // Match https://github.com/owner/repo(.git) or git@github.com:owner/repo(.git)
   const urlMatch = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?(?:\/.*)?$/i.exec(trimmed);
-  if (urlMatch) return urlMatch[1];
+  if (urlMatch) return isValidRepoSlug(urlMatch[1]) ? urlMatch[1] : null;
 
   // Match plain owner/repo or owner/repo#number
   const slugMatch = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#\d+)?$/.exec(trimmed);
-  if (slugMatch) return slugMatch[1];
+  if (slugMatch) return isValidRepoSlug(slugMatch[1]) ? slugMatch[1] : null;
 
   return null;
 }
@@ -162,7 +176,55 @@ function saveDefaultRepoConfig(repoSlug, options = {}) {
   return { repo: valid, configPath: targetPath, path: targetPath };
 }
 
+/**
+ * Logins whose `<!-- crv-* -->` PR comment markers are honoured (see hydrateFromGitHubComments).
+ * Sources: the authenticated `gh` user (`options.ghLogin`), `CRV_TRUSTED_REVIEWERS` (comma separated),
+ * `trustedReviewers` in the USER-level `~/.config/crv/config.json`, and `github-actions[bot]`.
+ * The checkout's own `.crvrc.json` is deliberately NOT consulted: it belongs to the repo under review.
+ */
+function resolveTrustedAuthors(options = {}) {
+  const env = options.env || process.env;
+  const logins = new Set(['github-actions[bot]']);
+  const sources = ['default bot'];
+  const add = (list, src) => {
+    let added = false;
+    for (const l of list) {
+      const v = String(l || '').trim().toLowerCase();
+      if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\[bot\])?$/.test(v)) {
+        logins.add(v);
+        added = true;
+      }
+    }
+    if (added) sources.push(src);
+  };
+  if (options.ghLogin) add([options.ghLogin], 'gh user');
+  add(String(env.CRV_TRUSTED_REVIEWERS || '').split(','), 'env:CRV_TRUSTED_REVIEWERS');
+  try {
+    const userCfg = path.join(options.homeDir || os.homedir(), '.config', 'crv', 'config.json');
+    if (fs.existsSync(userCfg)) {
+      const parsed = JSON.parse(fs.readFileSync(userCfg, 'utf8')) || {};
+      if (Array.isArray(parsed.trustedReviewers)) add(parsed.trustedReviewers, '~/.config/crv/config.json');
+    }
+  } catch (e) {}
+  return { logins: Array.from(logins), sources };
+}
+
+/** Sync lookup of the authenticated gh user (CLI/skill use; the server uses an async variant). */
+function detectGhLogin() {
+  try {
+    const res = spawnSync('gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', timeout: 5000 });
+    const login = res.status === 0 ? String(res.stdout || '').trim() : '';
+    return login || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 module.exports = {
+  isValidRepoSlug,
+  parsePrNumber,
+  resolveTrustedAuthors,
+  detectGhLogin,
   parseGitHubRepoSlug,
   detectGitRemoteRepo,
   resolveRepoConfig,

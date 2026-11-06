@@ -5,5 +5,4 @@ dist/
 .env.*
 .crvrc.json
 .crv-skills/
-.tu-skills/
 fixtures/last-submitted-review.json

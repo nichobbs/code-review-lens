@@ -1,5 +1,7 @@
 'use strict';
 
+const { sanitizeReport } = require('../ui/sanitize.js');
+
 const { parseUnifiedDiff, extractDiffSlice, buildLayersFromParsedDiff } = require('./diff-classifier');
 
 const DEFAULT_SEV = {
@@ -127,12 +129,13 @@ function checkFindingsShape(findingsJson) {
 }
 
 /**
- * Compiles a `tu-code-review` `findings.json` (`{ meta, issues }`) and optional unified diff
+ * Compiles a `crv-code-review` `findings.json` (`{ meta, issues }`) and optional unified diff
  * into the full 4-Layer Workbench report schema.
  */
 function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
   if (findingsJson && Array.isArray(findingsJson.DATA) && findingsJson.SUMMARY) {
-    return findingsJson;
+    // Already compiled (possibly by a third party): treat its HTML fields as untrusted.
+    return sanitizeReport(findingsJson);
   }
 
   const meta = findingsJson?.meta || {};

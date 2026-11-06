@@ -19,7 +19,28 @@
     return `${API_BASE}${route}`;
   }
 
-  let report = window.__CRV_INITIAL_REPORT__ || null;
+  const { sanitizeHtml, sanitizeReport } = window.CrvSanitize;
+
+  // Per-session API token: injected into the served index.html, or handed to a pinned extension via /api/session.
+  let sessionToken = document.querySelector('meta[name="crv-session-token"]')?.content || '';
+
+  async function ensureSessionToken() {
+    if (sessionToken || !IS_EXTENSION_PAGE) return sessionToken;
+    try {
+      const res = await fetch(apiUrl('/api/session'));
+      if (res.ok) sessionToken = (await res.json()).token || '';
+    } catch (e) {}
+    return sessionToken;
+  }
+
+  /** fetch() for crv API routes: always sends the session token. */
+  async function apiFetch(route, init = {}) {
+    await ensureSessionToken();
+    const headers = { ...(init.headers || {}), ...(sessionToken ? { 'X-CRV-Token': sessionToken } : {}) };
+    return fetch(apiUrl(route), { ...init, headers });
+  }
+
+  let report = window.__CRV_INITIAL_REPORT__ ? sanitizeReport(window.__CRV_INITIAL_REPORT__) : null;
   let activeLayer = 'findings'; // 'overview' | 'findings' | 'contracts' | 'tests'
   let activeTab = 'todo';       // 'todo' | 'triaged' | 'all'
   let activeFilter = 'all';
@@ -178,7 +199,7 @@
     const findingsCount = report?.DATA?.length || 0;
     const contractsCount = (report?.LAYERS?.contracts?.length || 0) + (report?.LAYERS?.flows?.length || 0);
     const testsCount = report?.LAYERS?.testMatrix?.length || 0;
-    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 13;
+    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
 
     const nav = $('#layerNav');
     if (!nav) return;
@@ -284,10 +305,10 @@
     try {
       mermaid.initialize({
         startOnLoad: false,
-        securityLevel: 'loose',
+        securityLevel: 'strict',
         theme: isDark ? 'dark' : 'neutral',
         fontFamily: '"Open Sans", system-ui, sans-serif',
-        flowchart: { useMaxWidth: true, htmlLabels: true },
+        flowchart: { useMaxWidth: true, htmlLabels: false },
         sequence: { useMaxWidth: true },
         state: { useMaxWidth: true },
         class: { useMaxWidth: true },
@@ -308,7 +329,7 @@
         const sign = l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' ';
         const ln = l.newNumber ?? l.oldNumber ?? '';
         return `<tr class="${rowClass}">
-          <td class="ln num">${ln}</td>
+          <td class="ln num">${escapeHtml(ln)}</td>
           <td class="sign">${sign}</td>
           <td class="code">${escapeHtml(l.content)}</td>
         </tr>`;
@@ -339,6 +360,41 @@
       .map((p) => `<li><code>${escapeHtml(p.split(':')[0])}</code>:${escapeHtml(p.split(':').slice(1).join(':'))}</li>`)
       .join('');
 
+    const signals = report?.LAYERS?.attentionSignals || {};
+    const removedGuards = signals.removedGuards || [];
+    const stealthChanges = signals.stealthChanges || [];
+    const reuseCandidates = signals.reuseCandidates || [];
+    const hasSignals = removedGuards.length > 0 || stealthChanges.length > 0 || reuseCandidates.length > 0;
+    const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
+
+    const signalsHtml = hasSignals
+      ? `<div class="sec">
+          <h4>AI Attention &amp; Guard Signals (Automated Diff Pre-Scan)</h4>
+          <div class="layer-card" style="padding:10px 14px;">
+            <ul class="prose" style="margin:0;padding-left:18px;">
+              ${removedGuards
+                .map(
+                  (g) =>
+                    `<li>🛡️ <strong>Removed Guard (${escapeHtml(g.category)}):</strong> <code>${escapeHtml(g.path)}:${g.newLine}</code> — deleted <code>${escapeHtml(g.code)}</code></li>`
+                )
+                .join('')}
+              ${stealthChanges
+                .map(
+                  (sc) =>
+                    `<li>🕵️ <strong>Unmentioned High-Blast-Radius Change:</strong> <code>${escapeHtml(sc.path)}</code> — ${escapeHtml(sc.reason)}</li>`
+                )
+                .join('')}
+              ${reuseCandidates
+                .map(
+                  (rc) =>
+                    `<li>♻️ <strong>Near-Duplicate Utility Candidate:</strong> <code>${escapeHtml(rc.name)}</code> added in <code>${escapeHtml(rc.addedIn)}</code> overlaps <code>${escapeHtml((rc.existingMatches || []).join(', '))}</code></li>`
+                )
+                .join('')}
+            </ul>
+          </div>
+        </div>`
+      : '';
+
     return `<div class="panein">
       <div class="triage-card">
         <div class="triage-card-label">
@@ -359,10 +415,12 @@
         <h2 class="ftitle">Layer 1: Intent, Architecture & Verification Summary</h2>
       </div>
 
-      <div class="prose">${s.html || ''}</div>
+      <div class="prose">${sanitizeHtml(s.html)}</div>
+
+      ${signalsHtml}
 
       <div class="sec">
-        <h4>13-Lens Verification Matrix</h4>
+        <h4>${lensesCount}-Lens Verification Matrix</h4>
         <ul class="prose">${points}</ul>
       </div>
     </div>`;
@@ -460,14 +518,28 @@
 
         const rows = scenarios
           .map((sc) => {
-            const st = sc.status || (sc.hollow ? 'hollow' : sc.mockOnly ? 'flawed-spec' : 'solid');
+            const st =
+              sc.status ||
+              (sc.hollow
+                ? 'hollow'
+                : sc.tautology
+                  ? 'tautology'
+                  : sc.internalMock
+                    ? 'internal-mock'
+                    : sc.mockOnly
+                      ? 'flawed-spec'
+                      : 'solid');
             const note =
               sc.note ||
               (sc.hollow
                 ? 'Zero assertions detected in test body'
-                : sc.mockOnly
-                  ? 'Mock-only assertions'
-                  : '');
+                : sc.tautology
+                  ? 'Oracle tautology: asserts literal constant rather than computed behavior'
+                  : sc.internalMock
+                    ? 'Mocks internal relative seam'
+                    : sc.mockOnly
+                      ? 'Mock-only assertions'
+                      : '');
             return `<tr>
               <td>${escapeHtml(sc.behavior)}${note ? `<div style="color:var(--s-high-ink);font-size:11.5px;margin-top:2px;">⚠️ ${escapeHtml(note)}</div>` : ''}</td>
               <td class="num" style="text-align:center;font-weight:700;">${sc.assertions ?? 0}</td>
@@ -560,6 +632,9 @@
           <button type="button" class="tbtn${t.action === 'dismiss' ? ' on' : ''}" data-triage="dismiss" title="Shortcut: x">
             🔇 Dismiss (Skip)
           </button>
+          <button type="button" class="btn" id="copyFixPromptBtn" title="Copy structured fix instruction for your Coding Agent">
+            🤖 Copy Agent Fix Prompt
+          </button>
         </div>
       </div>
 
@@ -578,21 +653,29 @@
 
       <div class="sec">
         <h4>Impact (Breaks · Because · Reach)</h4>
-        <div class="prose">${d.impact || ''}</div>
+        <div class="prose">${sanitizeHtml(d.impact)}</div>
       </div>
 
       ${mermaidHtml}
 
       <div class="sec">
         <h4>Recommended Fix (Do · Check)</h4>
-        <div class="prose fixbox">${d.fix || ''}</div>
+        <div class="prose fixbox">${sanitizeHtml(d.fix)}</div>
+        ${
+          d.suggestion
+            ? `<div style="margin-top:10px;padding:10px 12px;border-radius:6px;border:1px solid var(--rule);background:var(--well);">
+                <div style="font:700 11px var(--mono);color:var(--muted);margin-bottom:4px;">SURGICAL GITHUB SUGGESTION (1-CLICK COMMITTABLE IN PR)</div>
+                <pre style="margin:0;white-space:pre-wrap;font:400 12px/1.45 var(--mono);color:var(--ink);">${escapeHtml(d.suggestion)}</pre>
+              </div>`
+            : ''
+        }
       </div>
 
       ${
         d.reasoning
           ? `<div class="sec">
               <h4>Verifier & Evidence</h4>
-              <div class="prose">${d.reasoning}</div>
+              <div class="prose">${sanitizeHtml(d.reasoning)}</div>
             </div>`
           : ''
       }
@@ -654,6 +737,34 @@
     if (noteInput) {
       noteInput.addEventListener('input', () => {
         setTriageNote(currentId, noteInput.value);
+      });
+    }
+
+    const copyFixBtn = $('#copyFixPromptBtn');
+    if (copyFixBtn) {
+      copyFixBtn.addEventListener('click', async () => {
+        const issues = report?.DATA || [];
+        const d = issues.find((item) => item.id === currentId) || issues[0];
+        if (!d) return;
+        const t = getTriage(d.id);
+        const promptLines = d.fixPrompt
+          ? [d.fixPrompt, t.note ? `\nReviewer note: ${t.note}` : ''].filter(Boolean)
+          : [
+              `Fix finding ${d.id} (${String(d.sev || '').toUpperCase()}) at \`${d.loc || 'PR'}\`: ${d.title}`,
+              '',
+              stripHtmlToMd(d.impact),
+              '',
+              stripHtmlToMd(d.fix),
+              d.suggestion ? `\nSuggested replacement:\n\`\`\`\n${d.suggestion}\n\`\`\`` : '',
+              t.note ? `\nReviewer note: ${t.note}` : ''
+            ].filter(Boolean);
+        try {
+          await navigator.clipboard.writeText(promptLines.join('\n').trim());
+          copyFixBtn.textContent = '✓ Copied Agent Fix Prompt!';
+          setTimeout(() => {
+            copyFixBtn.textContent = '🤖 Copy Agent Fix Prompt';
+          }, 1800);
+        } catch (err) {}
       });
     }
 
@@ -732,7 +843,8 @@
         t.note ? `\n> **Reviewer Note:** ${t.note}\n` : '',
         stripHtmlToMd(d.impact),
         '',
-        stripHtmlToMd(d.fix)
+        stripHtmlToMd(d.fix),
+        d.suggestion ? `\n\`\`\`suggestion\n${String(d.suggestion).replace(/\r?\n$/, '')}\n\`\`\`` : ''
       ];
       if (d.mermaid) {
         bodyParts.push(
@@ -901,7 +1013,11 @@
 
   function buildStandaloneExtensionReport(prData) {
     if (!prData || (!prData.repo && !prData.pr)) return null;
-    const findings = Array.isArray(prData.findings) ? prData.findings : [];
+    const scraped = Array.isArray(prData.findings) ? prData.findings : [];
+    // Scraped markers can be typed by anyone: only findings authored by the signed-in GitHub user are shown.
+    // (Use the local server / `gh api` flow for full, author-verified multi-reviewer state.)
+    const findings = scraped.filter((f) => f && f.trusted === true);
+    const ignoredCount = scraped.length - findings.length;
     const mappedData = findings.map((f, index) => ({
       id: f.id || `F${index + 1}`,
       sev: f.sev || 'medium',
@@ -910,9 +1026,9 @@
       suggestedTriage: f.action === 'block' ? 'block' : f.action === 'dismiss' ? 'dismiss' : 'comment',
       title: f.title || `${f.id || 'Finding'} (${f.loc || 'inline comment'})`,
       loc: f.loc || '',
-      impact: f.impact || (f.body ? `<p>${escapeHtml(f.body)}</p>` : '<p>Published PR review thread discovered on GitHub.</p>'),
-      fix: f.fix || '',
-      reasoning: f.reasoning || ''
+      impact: f.body ? `<p>${escapeHtml(String(f.body).slice(0, 4000))}</p>` : '<p>Published PR review thread discovered on GitHub.</p>',
+      fix: '',
+      reasoning: ''
     }));
 
     const prTitle = prData.title
@@ -941,7 +1057,7 @@
       },
       SUMMARY: {
         overview: mappedData.length
-          ? `<p>Loaded <strong>${mappedData.length}</strong> published <code>crv-finding</code> review thread(s) directly from the active GitHub Pull Request tab in standalone browser mode.</p><p>To decompose full diffs or run the 13-lens AI review agent, run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> or import a <code>report.json</code> file using <strong>📂 Import JSON</strong> above.</p>`
+          ? `<p>Loaded <strong>${mappedData.length}</strong> published <code>crv-finding</code> review thread(s) authored by you from the active GitHub Pull Request tab in standalone browser mode.${ignoredCount ? ` ${ignoredCount} marker(s) from other authors were ignored as unverified.` : ''}</p><p>To decompose full diffs or run the 14-lens AI review agent, run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> or import a <code>report.json</code> file using <strong>📂 Import JSON</strong> above.</p>`
           : `<p>Connected to <strong>${escapeHtml(prData.repo)}#${escapeHtml(String(prData.pr))}</strong> in standalone Chrome Extension mode (local CLI server is offline).</p><p>Run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> in your terminal or click <strong>📂 Import JSON</strong> in the top bar to load a compiled review report.</p>`
       },
       DATA: mappedData,
@@ -1023,24 +1139,39 @@
       IS_EXTENSION_PAGE && new URLSearchParams(window.location.search).get('mode') === 'standalone';
 
     if (!report && preferExtensionStorage) {
-      report = await loadExtensionStoredReport();
+      const stored = sanitizeReport(await loadExtensionStoredReport());
+      // Prefer the local server (author-verified `gh api` data) when it already holds the same PR.
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1500);
+        const res = await apiFetch('/api/report', { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          const live = sanitizeReport(await res.json());
+          if (!stored || (live?.REVIEW?.repo === stored.REVIEW?.repo && live?.REVIEW?.pr === stored.REVIEW?.pr)) {
+            report = live;
+            ghConnected = true;
+          }
+        }
+      } catch (e) {}
+      if (!report) report = stored;
     }
 
     if (!report) {
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 1500);
-        const res = await fetch(apiUrl('/api/report'), { signal: controller.signal });
+        const res = await apiFetch('/api/report', { signal: controller.signal });
         clearTimeout(timer);
         if (res.ok) {
-          report = await res.json();
+          report = sanitizeReport(await res.json());
           ghConnected = true;
         }
       } catch (e) {}
     }
 
     if (!report && IS_EXTENSION_PAGE) {
-      report = await loadExtensionStoredReport();
+      report = sanitizeReport(await loadExtensionStoredReport());
     }
 
     currentId = report?.DATA?.[0]?.id || OV;
@@ -1064,7 +1195,7 @@
         try {
           const text = await file.text();
           const parsed = JSON.parse(text);
-          report = normalizeImportedJson(parsed);
+          report = sanitizeReport(normalizeImportedJson(parsed));
           currentId = report?.DATA?.[0]?.id || OV;
           activeLayer = report?.DATA?.length ? 'findings' : 'overview';
           loadTriage();
@@ -1158,7 +1289,7 @@
       if (!prInput) return;
       try {
         if (statusEl) statusEl.textContent = `Fetching PR ${prInput} & decomposing 4 Layers via gh...`;
-        const res = await fetch(apiUrl('/api/github/load-pr'), {
+        const res = await apiFetch('/api/github/load-pr', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prInput, repo: explicitRepo || undefined })
@@ -1167,7 +1298,7 @@
         if (!res.ok || !data.ok) {
           throw new Error(data.error || 'Failed to load PR');
         }
-        report = data.report;
+        report = sanitizeReport(data.report);
         currentId = report?.DATA?.[0]?.id || OV;
         activeLayer = report?.DATA?.length ? 'findings' : 'overview';
         loadTriage();
@@ -1199,7 +1330,7 @@
       const sourceBadge = $('#repoSourceBadge');
       const repoLabel = $('#recentPrsRepoLabel');
       try {
-        const res = await fetch(apiUrl('/api/github/repo-config'));
+        const res = await apiFetch('/api/github/repo-config');
         const data = await res.json();
         if (res.ok && data.ok) {
           if (repoInput && !repoInput.value) repoInput.value = data.repo || report?.REVIEW?.repo || '';
@@ -1218,7 +1349,7 @@
       const effortSelect = $('#effortSelectInput');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const aRes = await fetch(apiUrl('/api/github/agent-config'));
+        const aRes = await apiFetch('/api/github/agent-config');
         const aData = await aRes.json();
         if (aRes.ok && aData.ok) {
           if (agentSelect && aData.agent) agentSelect.value = aData.agent;
@@ -1241,9 +1372,9 @@
         const repoParam = (explicitRepoOverride ?? $('#repoConfigInput')?.value ?? '').trim();
         listEl.innerHTML = `<div style="font-size:12px;color:var(--muted);">Loading recent PRs from GitHub via gh cli...</div>`;
         const url = repoParam
-          ? apiUrl(`/api/github/list-prs?repo=${encodeURIComponent(repoParam)}`)
-          : apiUrl('/api/github/list-prs');
-        const res = await fetch(url);
+          ? `/api/github/list-prs?repo=${encodeURIComponent(repoParam)}`
+          : '/api/github/list-prs';
+        const res = await apiFetch(url);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Unavailable');
         if (data.repo && repoLabel) repoLabel.textContent = data.repo;
@@ -1286,7 +1417,7 @@
       const sourceBadge = $('#repoSourceBadge');
       if (!repoVal) return;
       try {
-        const res = await fetch(apiUrl('/api/github/repo-config'), {
+        const res = await apiFetch('/api/github/repo-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ repo: repoVal })
@@ -1308,7 +1439,7 @@
       const statusEl = $('#loadPrStatus');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const res = await fetch(apiUrl('/api/github/agent-config'), {
+        const res = await apiFetch('/api/github/agent-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1388,7 +1519,7 @@
       const payload = buildGitHubPreviewPayload();
       try {
         statusEl.textContent = 'Publishing review to GitHub via local gh bridge...';
-        const res = await fetch(apiUrl('/api/github/submit-review'), {
+        const res = await apiFetch('/api/github/submit-review', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1410,12 +1541,12 @@
 
     if (ghConnected && typeof EventSource !== 'undefined') {
       try {
-        const es = new EventSource(apiUrl('/api/events'));
+        const es = new EventSource(apiUrl(`/api/events?token=${encodeURIComponent(sessionToken)}`));
         es.addEventListener('report-updated', async () => {
           try {
-            const rRes = await fetch(apiUrl('/api/report'));
+            const rRes = await apiFetch('/api/report');
             if (rRes.ok) {
-              report = await rRes.json();
+              report = sanitizeReport(await rRes.json());
               loadTriage();
               renderHeader();
               renderRack();

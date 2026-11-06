@@ -8,8 +8,9 @@ const { spawn, spawnSync } = require('child_process');
 const pkg = require('../../../package.json');
 const {
   loadReportFile,
-  loadLivePrFromGitHub,
-  syncReportWithGitHub,
+  loadLivePrFromGitHubAsync,
+  syncReportWithGitHubAsync,
+  parsePrTargetInput,
   buildStandaloneHtml,
   createWorkbenchServer
 } = require('../server');
@@ -49,6 +50,7 @@ OPTIONS:
   --out <path.html>       Output file path for export-html
   --sync                  Hydrate existing <!-- crv-finding --> & <!-- crv-meta --> threads from GitHub
   --publish               Enable live GitHub PR review publishing from the Workbench UI
+  --allow-approve         Additionally allow APPROVE reviews to be posted (off by default; with --publish)
   --port <number>         Preferred local server port (default: 4320; auto-increments if busy)
   --no-open               Do not automatically open the Workbench URL in your browser
   -g, --global            Save repo/agent/model config to ~/.config/crv/config.json or install skill globally
@@ -72,6 +74,7 @@ function parseArgs(argv) {
     global: false,
     open: true,
     analyze: false,
+    allowApprove: false,
     headless: false,
     interactive: false,
     help: false,
@@ -94,6 +97,7 @@ function parseArgs(argv) {
     else if (a === '--publish') flags.publish = true;
     else if (a === '--sync') flags.sync = true;
     else if (a === '--analyze') flags.analyze = true;
+    else if (a === '--allow-approve') flags.allowApprove = true;
     else if (a === '--headless') flags.headless = true;
     else if (a === '--interactive' || a === '-i') flags.interactive = true;
     else if (a === '--open') flags.open = true;
@@ -150,7 +154,7 @@ function installSkill(flags) {
   const vendoredCoreTarget = path.join(targetSkillDir, 'scripts', 'lib', 'core');
   copyDirRecursive(sourceCoreDir, vendoredCoreTarget);
 
-  console.log(`✓ Installed "crv-code-review" skill (13 lenses + references + self-contained scripts) to:\n  ${targetSkillDir}`);
+  console.log(`✓ Installed "crv-code-review" skill (14 lenses + references + self-contained scripts) to:\n  ${targetSkillDir}`);
   return targetSkillDir;
 }
 
@@ -160,6 +164,7 @@ function openBrowser(url) {
   const args = platform === 'win32' ? ['/c', 'start', url] : [url];
   try {
     const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    child.on('error', () => {}); // e.g. xdg-open missing on headless machines: not fatal
     child.unref();
   } catch (e) {}
 }
@@ -200,15 +205,9 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   }
 
   // Extract PR number and repo
-  const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i.exec(String(targetPr));
-  const shortMatch = /^([^/]+\/[^#]+)#(\d+)$/.exec(String(targetPr));
-  const repo = (urlMatch && urlMatch[1]) || (shortMatch && shortMatch[1]) || resolvedRepo.repo;
-  const prNum = (urlMatch && urlMatch[2]) || (shortMatch && shortMatch[2]) || String(targetPr).replace(/^#/, '');
-
-  if (!repo) {
-    // Trigger the standard friendly missing-repo error
-    loadLivePrFromGitHub(targetPr, null);
-  }
+  // Strict parsing: repo must be owner/name, PR a positive integer (throws a friendly error otherwise)
+  const { repo, prNumInt } = parsePrTargetInput(targetPr, resolvedRepo.repo);
+  const prNum = String(prNumInt);
 
   const scratchDir = path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNum}`);
   const skillDir = path.resolve(__dirname, '../../../.agents/skills/crv-code-review');
@@ -233,7 +232,7 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     modelName: agentCfg.model || undefined
   });
 
-  const modelOpts = { model: agentCfg.model, effort: agentCfg.effort };
+  const modelOpts = { model: agentCfg.model, effort: agentCfg.effort, scratchDir };
   const agentArgs = useHeadless
     ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir, modelOpts)
     : agentCfg.spec.buildInteractiveArgs(prompt, skillDir, modelOpts);
@@ -241,12 +240,12 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   const modelBadge = agentCfg.model ? `, model: ${agentCfg.model}` : '';
   const effortBadge = agentCfg.effort ? `, effort: ${agentCfg.effort}` : '';
   console.log(
-    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 13-lens crv-code-review skill...\n`
+    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 14-lens crv-code-review skill...\n`
   );
   spawnSync(agentCfg.spec.bin, agentArgs, { stdio: 'inherit' });
 }
 
-function main() {
+async function main() {
   const { cmd, flags } = parseArgs(process.argv);
 
   if (flags.version) {
@@ -339,7 +338,7 @@ function main() {
 
   let report;
   const isDirectPrShortcut =
-    /^\d+$/.test(cmd) || /^[^/]+\/[^#]+#\d+$/.test(cmd) || /^https:\/\/github\.com\//.test(cmd);
+    /^\d+$/.test(cmd) || /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(cmd) || /^https:\/\/github\.com\//.test(cmd);
 
   if (
     cmd === 'pr' ||
@@ -347,7 +346,7 @@ function main() {
     isDirectPrShortcut ||
     (flags.reportPath &&
       (/^\d+$/.test(flags.reportPath) ||
-        /^[^/]+\/[^#]+#\d+$/.test(flags.reportPath) ||
+        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(flags.reportPath) ||
         /^https:\/\/github\.com\//.test(flags.reportPath)))
   ) {
     const targetPr = isDirectPrShortcut ? cmd : flags.reportPath;
@@ -359,17 +358,17 @@ function main() {
       runAgentAnalysisOnPr(targetPr, flags);
     }
     const resolved = resolveRepoConfig({ explicitRepo: flags.repo });
-    if (resolved.repo || /^https?:\/\//i.test(targetPr) || /^[^/]+\/[^#]+#\d+$/.test(targetPr)) {
+    if (resolved.repo || /^https?:\/\//i.test(targetPr) || /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(targetPr)) {
       console.log(
         `Fetching PR ${targetPr}${resolved.repo ? ` (${resolved.repo} via ${resolved.source})` : ''} via gh cli...`
       );
     }
-    report = loadLivePrFromGitHub(targetPr, flags.repo || resolved.repo);
+    report = await loadLivePrFromGitHubAsync(targetPr, flags.repo || resolved.repo);
   } else {
     report = loadReportFile(flags.reportPath, { diffPath: flags.diffPath });
     if (flags.sync) {
       console.log('Syncing PR comments & diff slices from GitHub via gh cli...');
-      const syncRes = syncReportWithGitHub(report);
+      const syncRes = await syncReportWithGitHubAsync(report);
       console.log(syncRes.synced ? '✓ Synced with GitHub PR threads.' : `ℹ Skipped live sync (${syncRes.reason})`);
     }
   }
@@ -379,7 +378,8 @@ function main() {
   const { server } = createWorkbenchServer({
     report,
     publish: flags.publish,
-    explicitRepo: flags.repo
+    explicitRepo: flags.repo,
+    allowApprove: flags.allowApprove
   });
 
   listenWithFallback(server, flags.port, 10, (boundPort) => {
@@ -396,12 +396,10 @@ function main() {
   });
 }
 
-try {
-  main();
-} catch (err) {
+main().catch((err) => {
   console.error(`\n❌ ${err.message || err}\n`);
   if (process.env.DEBUG) {
     console.error(err.stack);
   }
   process.exit(1);
-}
+});

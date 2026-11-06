@@ -1,7 +1,7 @@
 {
   "name": "code-review-lens",
   "version": "0.1.0",
-  "description": "Human-in-the-loop Agentic PR Review Workbench (crv — Code ReView CLI + 14-Lens Skill + GitHub Comments DB + Chrome Extension)",
+  "description": "Human-in-the-loop Agentic PR Review Workbench (crv \u2014 Code ReView CLI + 14-Lens Skill + GitHub Comments DB + Chrome Extension)",
   "repository": {
     "type": "git",
     "url": "https://github.com/nichobbs/code-review-lens.git"
@@ -23,7 +23,11 @@
     "export-html": "node ./packages/cli/bin/crv.js export-html",
     "install-skill": "node ./packages/cli/bin/crv.js install-skill",
     "sync-extension": "node ./scripts/sync-extension-workbench.js",
-    "test": "node --test ./test/*.test.js"
+    "test": "node --test ./test/*.test.js",
+    "check-sync": "node ./scripts/sync-extension-workbench.js --check",
+    "lint": "node ./scripts/lint.js",
+    "audit": "npm audit --omit=dev --audit-level=moderate",
+    "ci": "npm run lint && npm run check-sync && npm test && node .agents/skills/crv-code-review/scripts/test_report.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

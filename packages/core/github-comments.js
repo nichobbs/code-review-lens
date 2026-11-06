@@ -59,6 +59,29 @@ function parseLoc(loc) {
   };
 }
 
+const MAX_COMMENT_CHARS = 60000; // GitHub rejects bodies over 65536; keep headroom
+
+/** Marker JSON lives inside an HTML comment: `<`/`>` must never appear raw (a `-->` would end it early). */
+function markerJson(obj) {
+  return JSON.stringify(obj).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+}
+
+function oneLine(s) {
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** Escapes text for use inside a Markdown table cell. */
+function mdCell(s) {
+  return oneLine(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/</g, '&lt;');
+}
+
+function capComment(body, limit = MAX_COMMENT_CHARS) {
+  const text = String(body);
+  if (text.length <= limit) return text;
+  const note = '\n\n_…truncated by Agentic PR Review Workbench (GitHub comment size limit)._';
+  return text.slice(0, limit - note.length) + note;
+}
+
 /**
  * Serializes a single finding + human triage state into a GitHub inline review comment body.
  */
@@ -84,8 +107,8 @@ function serializeFindingComment(finding, triage = {}, reviewMeta = {}) {
   };
 
   const lines = [
-    `<!-- crv-finding: ${JSON.stringify(metadata)} -->`,
-    `### ${sevBadge} \`${finding.id}\` — ${finding.title}${verifyTag}${actionTag}`,
+    `<!-- crv-finding: ${markerJson(metadata)} -->`,
+    `### ${sevBadge} \`${oneLine(finding.id)}\` — ${oneLine(finding.title)}${verifyTag}${actionTag}`,
     ''
   ];
 
@@ -134,18 +157,82 @@ function serializeFindingComment(finding, triage = {}, reviewMeta = {}) {
   return lines.join('\n').trim();
 }
 
+const ACTIONS = new Set(['block', 'comment', 'dismiss', 'pending']);
+const SEVERITIES = new Set(['high', 'medium', 'low', 'struct', 'nit', 'ci']);
+const ID_RE = /^[A-Za-z0-9_.-]{1,40}$/;
+const SHA_RE = /^[0-9a-f]{7,40}$/i;
+
+function str(v, max = 300) {
+  return typeof v === 'string' ? v.slice(0, max) : '';
+}
+
+/**
+ * Marker JSON comes from a PR comment, i.e. untrusted input. Only a fixed set of typed fields is
+ * kept: unknown keys (such as `impact`/`fix`/`reasoning` HTML) are dropped, ids/enums are validated.
+ */
+function sanitizeFindingMeta(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (typeof raw.id !== 'string' || !ID_RE.test(raw.id)) return null;
+  return {
+    v: 1,
+    id: raw.id,
+    sev: SEVERITIES.has(raw.sev) ? raw.sev : 'medium',
+    cat: str(raw.cat, 120),
+    verify: str(raw.verify, 20),
+    action: ACTIONS.has(raw.action) ? raw.action : 'comment',
+    loc: str(raw.loc, 400),
+    title: str(raw.title, 300),
+    head: SHA_RE.test(str(raw.head, 64)) ? raw.head : '',
+    pr: Number.isInteger(raw.pr) && raw.pr > 0 ? raw.pr : null,
+    updatedAt: str(raw.updatedAt, 40)
+  };
+}
+
+function sanitizeOverviewMeta(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const counts = {};
+  for (const a of ACTIONS) {
+    counts[a] = Number.isInteger(raw.counts && raw.counts[a]) ? Math.max(0, raw.counts[a]) : 0;
+  }
+  const triage = {};
+  if (raw.triage && typeof raw.triage === 'object' && !Array.isArray(raw.triage)) {
+    for (const [id, t] of Object.entries(raw.triage).slice(0, 500)) {
+      if (!ID_RE.test(id) || !t || typeof t !== 'object') continue;
+      triage[id] = {
+        action: ACTIONS.has(t.action) ? t.action : 'pending',
+        done: t.done === true,
+        note: str(t.note, 2000)
+      };
+    }
+  }
+  return {
+    v: 1,
+    repo: str(raw.repo, 140),
+    pr: Number.isInteger(raw.pr) && raw.pr > 0 ? raw.pr : null,
+    base: SHA_RE.test(str(raw.base, 64)) ? raw.base : '',
+    head: SHA_RE.test(str(raw.head, 64)) ? raw.head : '',
+    agent: str(raw.agent, 80),
+    model: str(raw.model, 80),
+    counts,
+    triage,
+    updatedAt: str(raw.updatedAt, 40)
+  };
+}
+
 /**
  * Parses a GitHub review comment body to extract `crv-finding` metadata if present.
+ * NOTE: parsing alone does not prove who wrote the marker; `hydrateFromGitHubComments` gates on author.
  */
 function parseFindingComment(commentBody) {
   if (!commentBody || typeof commentBody !== 'string') return null;
   const match = CRV_FINDING_REGEX.exec(commentBody);
   if (!match) return null;
   try {
-    const meta = JSON.parse(match[1]);
+    const meta = sanitizeFindingMeta(JSON.parse(match[1]));
+    if (!meta) return null;
     const reviewerNoteMatch = />\s*\*\*Reviewer Note:\*\*\s*([\s\S]*?)(?:\n\n|\n[^>]|\s*$)/.exec(commentBody);
     const note = reviewerNoteMatch
-      ? reviewerNoteMatch[1].replace(/\n>\s?/g, '\n').trim()
+      ? reviewerNoteMatch[1].replace(/\n>\s?/g, '\n').trim().slice(0, 2000)
       : '';
     return { meta, note };
   } catch (err) {
@@ -172,68 +259,96 @@ function serializeOverviewComment(report, triageMap = {}, reviewerSummary = '') 
     };
   }
 
-  const metaPayload = {
-    v: 1,
-    repo: report.REVIEW?.repo || '',
-    pr: report.REVIEW?.pr || null,
-    base: report.REVIEW?.base || '',
-    head: report.REVIEW?.head || report.XMETA?.head || '',
-    agent: report.REVIEW?.agent || 'Antigravity',
-    model: report.REVIEW?.model || '',
-    counts,
-    triage: triagedState,
-    updatedAt: new Date().toISOString()
-  };
-
-  const lines = [
-    `<!-- crv-meta: ${JSON.stringify(metaPayload)} -->`,
-    `## 🛡️ Agentic PR Review Workbench — ${report.PR?.label || `PR #${metaPayload.pr || ''}`}`,
-    ''
-  ];
-
-  if (reviewerSummary && reviewerSummary.trim()) {
-    lines.push(reviewerSummary.trim(), '');
-  }
-
-  lines.push(
-    `| Triage Status | Count | Description |`,
-    `| :--- | :---: | :--- |`,
-    `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
-    `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
-    `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
-    `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`,
-    ''
-  );
-
   const publishedIssues = issues.filter((d) => {
     const a = triageMap[d.id]?.action;
     return a === 'block' || a === 'comment';
   });
 
-  if (publishedIssues.length > 0) {
-    lines.push(
-      '### Curated Findings Published to PR Threads',
-      '',
-      '| ID | Severity | Triage | Location | Finding |',
-      '| :--- | :--- | :--- | :--- | :--- |'
-    );
-    for (const d of publishedIssues) {
-      const a = triageMap[d.id]?.action === 'block' ? '🚫 Block' : '💬 Comment';
-      const sev = SEVERITY_BADGES[d.sev] || d.sev;
-      lines.push(`| \`${d.id}\` | ${sev} | ${a} | \`${d.loc || 'PR'}\` | ${d.title} |`);
+  /** Renders the comment. GitHub caps bodies at 65536 chars, so degrade in stages (see loop below). */
+  function render({ noteLimit, withDetails, maxRows }) {
+    const triage = {};
+    for (const [id, t] of Object.entries(triagedState)) {
+      triage[id] = { ...t, note: String(t.note || '').slice(0, noteLimit) };
     }
-    lines.push('');
+    const metaPayload = {
+      v: 1,
+      repo: report.REVIEW?.repo || '',
+      pr: report.REVIEW?.pr || null,
+      base: report.REVIEW?.base || '',
+      head: report.REVIEW?.head || report.XMETA?.head || '',
+      agent: report.REVIEW?.agent || 'Antigravity',
+      model: report.REVIEW?.model || '',
+      counts,
+      triage,
+      updatedAt: new Date().toISOString()
+    };
+
+    const lines = [
+      `<!-- crv-meta: ${markerJson(metaPayload)} -->`,
+      `## 🛡️ Agentic PR Review Workbench — ${oneLine(report.PR?.label || `PR #${metaPayload.pr || ''}`)}`,
+      ''
+    ];
+
+    if (reviewerSummary && reviewerSummary.trim()) {
+      lines.push(reviewerSummary.trim(), '');
+    }
+
+    lines.push(
+      `| Triage Status | Count | Description |`,
+      `| :--- | :---: | :--- |`,
+      `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
+      `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
+      `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
+      `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`,
+      ''
+    );
+
+    if (publishedIssues.length > 0) {
+      lines.push(
+        '### Curated Findings Published to PR Threads',
+        '',
+        '| ID | Severity | Triage | Location | Finding |',
+        '| :--- | :--- | :--- | :--- | :--- |'
+      );
+      for (const d of publishedIssues.slice(0, maxRows)) {
+        const a = triageMap[d.id]?.action === 'block' ? '🚫 Block' : '💬 Comment';
+        const sev = SEVERITY_BADGES[d.sev] || mdCell(d.sev);
+        lines.push(`| \`${mdCell(d.id)}\` | ${sev} | ${a} | \`${mdCell(d.loc || 'PR')}\` | ${mdCell(d.title)} |`);
+      }
+      if (publishedIssues.length > maxRows) {
+        lines.push('', `_…and ${publishedIssues.length - maxRows} more finding(s); see the inline review threads._`);
+      }
+      lines.push('');
+    }
+
+    if (withDetails) {
+      lines.push(
+        `<details>`,
+        `<summary><strong>Architecture & Coverage Summary</strong> ( Head: <code>${escapeHtmlText((metaPayload.head || '').slice(0, 8))}</code> · Model: <code>${escapeHtmlText(metaPayload.model || 'Agent')}</code> )</summary>`,
+        '',
+        stripHtmlToMarkdown(report.SUMMARY?.html || ''),
+        '</details>'
+      );
+    }
+    return lines.join('\n').trim();
   }
 
-  lines.push(
-    `<details>`,
-    `<summary><strong>Architecture & Coverage Summary</strong> ( Head: <code>${(metaPayload.head || '').slice(0, 8)}</code> · Model: <code>${metaPayload.model || 'Agent'}</code> )</summary>`,
-    '',
-    stripHtmlToMarkdown(report.SUMMARY?.html || ''),
-    '</details>'
-  );
+  const stages = [
+    { noteLimit: 2000, withDetails: true, maxRows: Infinity },
+    { noteLimit: 300, withDetails: false, maxRows: Infinity },
+    { noteLimit: 0, withDetails: false, maxRows: 100 },
+    { noteLimit: 0, withDetails: false, maxRows: 0 }
+  ];
+  let body = '';
+  for (const stage of stages) {
+    body = render(stage);
+    if (body.length <= MAX_COMMENT_CHARS) return body;
+  }
+  return capComment(body);
+}
 
-  return lines.join('\n').trim();
+function escapeHtmlText(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /**
@@ -244,10 +359,30 @@ function parseOverviewComment(commentBody) {
   const match = CRV_META_REGEX.exec(commentBody);
   if (!match) return null;
   try {
-    return JSON.parse(match[1]);
+    return sanitizeOverviewMeta(JSON.parse(match[1]));
   } catch (err) {
     return null;
   }
+}
+
+function renderUnplacedSection(findings, triageMap) {
+  const rows = findings.map((f) => {
+    const a = triageMap[f.id]?.action === 'block' ? '🚫 Block' : '💬 Comment';
+    const note = triageMap[f.id]?.note ? ` Reviewer note: ${oneLine(triageMap[f.id].note).slice(0, 500)}` : '';
+    return `- ${a} \`${oneLine(f.id)}\` ${SEVERITY_BADGES[f.sev] || oneLine(f.sev)} - ${oneLine(f.title)}${f.loc ? ` (\`${oneLine(f.loc)}\`)` : ''}.${note}`;
+  });
+  return ['### Findings without an inline location', '', ...rows].join('\n');
+}
+
+/**
+ * GitHub rejects the WHOLE review (422) if any inline comment targets a line outside the diff.
+ * Fallback payload: keep the review event/body and move every inline comment into the body.
+ */
+function foldCommentsIntoBody(payload) {
+  const { comments = [], body = '', ...rest } = payload;
+  if (!comments.length) return payload;
+  const items = comments.map((c) => `<details><summary><code>${escapeHtmlText(`${c.path}:${c.line}`)}</code></summary>\n\n${c.body}\n\n</details>`);
+  return { ...rest, body: capComment(`${body}\n\n### Inline findings (could not be anchored to the diff)\n\n${items.join('\n\n')}`), comments: [] };
 }
 
 /**
@@ -265,20 +400,26 @@ function buildGitHubReviewPayload(report, triageMap = {}, options = {}) {
   const commitId = report.REVIEW?.head || report.XMETA?.head || undefined;
 
   const inlineComments = [];
+  const unplaced = [];
   for (const finding of published) {
     const { path, line } = parseLoc(finding.loc);
-    const body = serializeFindingComment(finding, triageMap[finding.id], report.REVIEW || {});
     if (path && line) {
       inlineComments.push({
         path,
         line,
         side: 'RIGHT',
-        body
+        body: serializeFindingComment(finding, triageMap[finding.id], report.REVIEW || {})
       });
+    } else {
+      unplaced.push(finding);
     }
   }
 
-  const body = serializeOverviewComment(report, triageMap, options.summaryNote || '');
+  let body = serializeOverviewComment(report, triageMap, options.summaryNote || '');
+  if (unplaced.length) {
+    // No `path:line` (or not parseable): GitHub cannot anchor an inline comment, so list them in the review body.
+    body = capComment(`${body}\n\n${renderUnplacedSection(unplaced, triageMap)}`);
+  }
 
   return {
     commit_id: commitId,
@@ -288,26 +429,59 @@ function buildGitHubReviewPayload(report, triageMap = {}, options = {}) {
   };
 }
 
+function hasCrvMarker(body) {
+  return typeof body === 'string' && (CRV_META_REGEX.test(body) || CRV_FINDING_REGEX.test(body));
+}
+
+function headsMatch(a, b) {
+  if (!a || !b) return true; // unknown: cannot call it stale
+  const x = String(a).toLowerCase();
+  const y = String(b).toLowerCase();
+  return x.startsWith(y) || y.startsWith(x);
+}
+
 /**
  * Reconciles existing GitHub PR comments/threads back into the Workbench state.
+ *
+ * Authenticity: `<!-- crv-* -->` markers can be typed by ANY commenter, so they are only honoured when the
+ * comment author is in `options.trustedAuthors` (case-insensitive logins: the current `gh` user, configured
+ * reviewers, bots). Deny-by-default: with no trusted authors nothing is trusted. Marker comments from other
+ * authors are kept as plain comments and counted in `untrustedMarkers`.
+ *
+ * Staleness: with `options.currentHead`, markers recorded against another commit are flagged `stale: true`.
  */
-function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
+function hydrateFromGitHubComments(issueComments = [], reviewComments = [], options = {}) {
+  const trusted = new Set(Array.from(options.trustedAuthors || [], (a) => String(a).toLowerCase()));
+  const isTrusted = (c) => trusted.has(String(c?.user?.login || '').toLowerCase());
+  const currentHead = options.currentHead || '';
+  const untrustedMarkers = [];
+
   let overviewMeta = null;
+  let overviewStamp = '';
   const findingThreads = {};
   const generalComments = [];
   const generalByCommentId = new Map();
 
   for (const ic of issueComments || []) {
-    const parsed = parseOverviewComment(ic.body);
+    const markerTrusted = isTrusted(ic);
+    const parsed = markerTrusted ? parseOverviewComment(ic.body) : null;
     if (parsed) {
-      overviewMeta = {
-        ...parsed,
-        commentId: ic.id,
-        htmlUrl: ic.html_url,
-        author: ic.user?.login || 'unknown',
-        updatedAt: ic.updated_at || parsed.updatedAt
-      };
+      const stamp = String(ic.updated_at || parsed.updatedAt || '');
+      if (!overviewMeta || stamp >= overviewStamp) {
+        overviewStamp = stamp;
+        overviewMeta = {
+          ...parsed,
+          commentId: ic.id,
+          htmlUrl: ic.html_url,
+          author: ic.user?.login || 'unknown',
+          updatedAt: ic.updated_at || parsed.updatedAt,
+          stale: !headsMatch(parsed.head, currentHead)
+        };
+      }
     } else if (ic && ic.body) {
+      if (!markerTrusted && hasCrvMarker(ic.body)) {
+        untrustedMarkers.push({ id: ic.id, author: ic.user?.login || 'unknown', url: ic.html_url || '' });
+      }
       generalComments.push({
         id: ic.id,
         path: null,
@@ -322,7 +496,8 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
   }
 
   for (const rc of reviewComments || []) {
-    const parsed = parseFindingComment(rc.body);
+    const markerTrusted = isTrusted(rc);
+    const parsed = markerTrusted ? parseFindingComment(rc.body) : null;
     if (parsed && parsed.meta?.id) {
       const id = parsed.meta.id;
       const headingMatch = /^###\s+.*?`[^`]+`\s+—\s+([^\n·]+)/m.exec(rc.body || '');
@@ -339,9 +514,15 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
         note: parsed.note,
         body: rc.body || '',
         meta: parsed.meta,
+        stale: !headsMatch(parsed.meta.head, currentHead),
         replies: []
       };
-    } else if (rc.in_reply_to_id) {
+      continue;
+    }
+    if (!markerTrusted && hasCrvMarker(rc.body)) {
+      untrustedMarkers.push({ id: rc.id, author: rc.user?.login || 'unknown', url: rc.html_url || '' });
+    }
+    if (rc.in_reply_to_id) {
       const parentEntry = Object.values(findingThreads).find(
         (t) => t.commentId === rc.in_reply_to_id
       );
@@ -380,7 +561,7 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = []) {
     }
   }
 
-  return { overviewMeta, findingThreads, generalComments };
+  return { overviewMeta, findingThreads, generalComments, untrustedMarkers };
 }
 
 /**
@@ -415,5 +596,10 @@ module.exports = {
   parseOverviewComment,
   buildGitHubReviewPayload,
   hydrateFromGitHubComments,
-  parsePaginatedGhJson
+  parsePaginatedGhJson,
+  foldCommentsIntoBody,
+  capComment,
+  mdCell,
+  sanitizeFindingMeta,
+  sanitizeOverviewMeta
 };
