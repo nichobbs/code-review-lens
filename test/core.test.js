@@ -186,6 +186,10 @@ test('Standalone HTML export embeds report, styles, and Mermaid runtime cleanly'
   assert.ok(html.includes('id="crv-findings"'));
   assert.ok(html.includes('closedby="any"'));
   assert.ok(html.includes('Layer 4: Behavioral Test Matrix'));
+  assert.ok(html.includes('id="guidePanel"'));
+  assert.ok(html.includes('id="guideToggleBtn"'));
+  assert.ok(html.includes('Where Humans Add Maximum Leverage'));
+  assert.ok(html.includes('until-found'));
 });
 
 test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings.py round-trip', () => {
@@ -498,6 +502,7 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
     assert.equal(indexRes.status, 200);
     const indexHtml = await indexRes.text();
     assert.ok(indexHtml.includes('id="resizer"'));
+    assert.ok(indexHtml.includes('id="guidePanel"'));
 
     const traversalRes = await invokeServer({ method: 'GET', url: '/..%2f..%2fpackage.json' });
     assert.equal(traversalRes.status, 404);

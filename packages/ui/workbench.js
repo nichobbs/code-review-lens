@@ -189,6 +189,7 @@
 
   function renderRack() {
     renderLayerNav();
+    renderGuideRadar();
     const issues = report?.DATA || [];
     const todoCount = issues.filter((d) => !getTriage(d.id).done).length;
     const triagedCount = issues.length - todoCount;
@@ -1057,6 +1058,178 @@
     }
   }
 
+  function renderGuideRadar() {
+    const radarEl = $('#guideLiveRadar');
+    if (!radarEl) return;
+
+    const issues = report?.DATA || [];
+    const signals = report?.LAYERS?.attentionSignals || {};
+    const contracts = report?.LAYERS?.contracts || [];
+    const testMatrix = report?.LAYERS?.testMatrix || [];
+
+    const plausibleIssues = issues.filter((d) => String(d.verify || '').toUpperCase() === 'PLAUSIBLE');
+    const highIssues = issues.filter((d) => d.sev === 'high');
+    const untriagedCount = issues.filter((d) => !getTriage(d.id).done).length;
+    const removedGuards = signals.removedGuards || [];
+    const stealthChanges = signals.stealthChanges || [];
+    const shortcuts = signals.shortcuts || [];
+    const rotRiskShortcuts = shortcuts.filter((s) => s.rotRisk || !s.hasTrigger);
+    const negViolations = signals.specAlignment?.negativeSpaceViolations || [];
+    const uncoveredClauses = (signals.specAlignment?.specClauses || []).filter((c) => !c.covered);
+    const unownedCallerContracts = contracts.filter(
+      (c) => (c.callerBlastRadius?.unownedCallersCount || 0) > 0
+    );
+    const weakTestSuites = testMatrix.filter((tm) =>
+      (tm.scenarios || tm.cases || []).some(
+        (sc) => sc.hollow || sc.tautology || sc.internalMock || sc.mockOnly
+      )
+    );
+
+    const radarItems = [];
+
+    if (plausibleIssues.length > 0) {
+      const firstId = plausibleIssues[0].id;
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🔍 <strong>${plausibleIssues.length} <code>PLAUSIBLE</code> finding${plausibleIssues.length > 1 ? 's' : ''}</strong> need human domain verification (${plausibleIssues.map((x) => `<code>${escapeHtml(x.id)}</code>`).join(', ')})</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-finding="${escapeHtml(firstId)}">Inspect</button>`
+      });
+    }
+
+    if (highIssues.length > 0) {
+      const firstHigh = highIssues[0].id;
+      radarItems.push({
+        tone: 'high',
+        html: `<span>🚫 <strong>${highIssues.length} High-Severity Blocker${highIssues.length > 1 ? 's' : ''}</strong> (${untriagedCount} total untriaged)</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-finding="${escapeHtml(firstHigh)}">Review</button>`
+      });
+    }
+
+    if (removedGuards.length > 0 || negViolations.length > 0) {
+      radarItems.push({
+        tone: 'high',
+        html: `<span>🛡️ <strong>${removedGuards.length} Removed Guard${removedGuards.length === 1 ? '' : 's'} · ${negViolations.length} Scope Violation${negViolations.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    if (stealthChanges.length > 0 || rotRiskShortcuts.length > 0) {
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🕵️ <strong>${stealthChanges.length} Stealth File${stealthChanges.length === 1 ? '' : 's'} · ${rotRiskShortcuts.length} Rot-Risk TODO${rotRiskShortcuts.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    if (contracts.length > 0 || unownedCallerContracts.length > 0) {
+      radarItems.push({
+        tone: unownedCallerContracts.length > 0 ? 'warn' : 'normal',
+        html: `<span>📜 <strong>${contracts.length} Public Contract${contracts.length === 1 ? '' : 's'}</strong>${unownedCallerContracts.length > 0 ? ` (${unownedCallerContracts.length} w/ unowned callers)` : ''}</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="contracts">Layer 3</button>`
+      });
+    }
+
+    if (weakTestSuites.length > 0 || uncoveredClauses.length > 0) {
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🧪 <strong>${weakTestSuites.length} Weak/Mock-Only Suite${weakTestSuites.length === 1 ? '' : 's'} · ${uncoveredClauses.length} Uncovered Spec${uncoveredClauses.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="tests">Layer 4</button>`
+      });
+    }
+
+    if (radarItems.length === 0) {
+      radarItems.push({
+        tone: 'normal',
+        html: `<span>✅ <strong>No automated red flags</strong> — spot-check Layer 1 intent &amp; Layer 3 contracts before approving.</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    radarEl.innerHTML = `
+      <div class="guide-radar-title">
+        <span>⚡ What to Check on This PR</span>
+        <span class="num">${radarItems.length} signal${radarItems.length === 1 ? '' : 's'}</span>
+      </div>
+      <ul class="guide-radar-list">
+        ${radarItems
+          .map(
+            (it) =>
+              `<li class="guide-radar-item ${it.tone === 'high' ? 'high' : it.tone === 'warn' ? 'warn' : ''}">${it.html}</li>`
+          )
+          .join('')}
+      </ul>
+    `;
+  }
+
+  function setupGuidePanel() {
+    const appEl = $('#app');
+    const panelEl = $('#guidePanel');
+    const toggleBtn = $('#guideToggleBtn');
+    const closeBtn = $('#guideCloseBtn');
+    if (!appEl || !panelEl || !toggleBtn) return;
+
+    function setGuideOpen(isOpen, persist = true) {
+      if (isOpen) {
+        panelEl.removeAttribute('hidden');
+        appEl.classList.remove('guide-collapsed');
+        toggleBtn.setAttribute('aria-expanded', 'true');
+      } else {
+        if ('onbeforematch' in HTMLElement.prototype) {
+          panelEl.setAttribute('hidden', 'until-found');
+        } else {
+          panelEl.setAttribute('hidden', '');
+        }
+        appEl.classList.add('guide-collapsed');
+        toggleBtn.setAttribute('aria-expanded', 'false');
+      }
+      if (persist) {
+        try {
+          localStorage.setItem('crv-guide-open', isOpen ? '1' : '0');
+        } catch (e) {}
+      }
+    }
+
+    // Restore saved state (defaults to open on first visit so reviewers see what to focus on)
+    let initialOpen = true;
+    try {
+      const saved = localStorage.getItem('crv-guide-open');
+      if (saved === '0') initialOpen = false;
+    } catch (e) {}
+    setGuideOpen(initialOpen, false);
+
+    // Synchronize state when native Find-in-Page matches text inside the collapsed panel
+    // per modern-web-guidance (`search-hidden-content`)
+    panelEl.addEventListener('beforematch', () => {
+      setGuideOpen(true, true);
+    });
+
+    toggleBtn.addEventListener('click', () => {
+      const currentlyOpen = toggleBtn.getAttribute('aria-expanded') === 'true';
+      setGuideOpen(!currentlyOpen, true);
+    });
+
+    closeBtn?.addEventListener('click', () => {
+      setGuideOpen(false, true);
+    });
+
+    panelEl.addEventListener('click', (e) => {
+      const layerBtn = e.target.closest('[data-guide-layer]');
+      if (layerBtn) {
+        activeLayer = layerBtn.dataset.guideLayer;
+        renderRack();
+        renderPane();
+        return;
+      }
+      const findingBtn = e.target.closest('[data-guide-finding]');
+      if (findingBtn) {
+        currentId = findingBtn.dataset.guideFinding;
+        activeLayer = 'findings';
+        renderRack();
+        renderPane();
+      }
+    });
+  }
+
   function stepFinding(delta) {
     const issues = report?.DATA || [];
     if (!issues.length) return;
@@ -1084,6 +1257,7 @@
     renderRack();
     renderPane();
     setupDialogAndTheme();
+    setupGuidePanel();
 
     $('#layerNav')?.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-layer]');
@@ -1126,7 +1300,8 @@
         resizerEl.classList.add('drag');
         resizerEl.setPointerCapture(e.pointerId);
         const onMove = (ev) => {
-          const w = Math.max(260, Math.min(window.innerWidth - 360, ev.clientX));
+          const guideW = $('#guidePanel')?.offsetWidth || 0;
+          const w = Math.max(260, Math.min(window.innerWidth - guideW - 360, ev.clientX));
           document.documentElement.style.setProperty('--rack-w', `${w}px`);
         };
         const onUp = (ev) => {
@@ -1452,6 +1627,9 @@
       } else if (e.key === 'x' && activeLayer === 'findings') {
         e.preventDefault();
         setTriageAction(currentId, 'dismiss');
+      } else if (e.key === '?') {
+        e.preventDefault();
+        $('#guideToggleBtn')?.click();
       }
     });
   }
