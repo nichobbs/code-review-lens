@@ -171,7 +171,7 @@ function renderFindings(container, findings) {
   container.innerHTML = findings
     .map(
       (f) => `<div class="finding-item">
-        <strong>${escapeHtml(f.id || 'Finding')}</strong> (${escapeHtml(String(f.sev || 'info').toUpperCase())}) · <code>${escapeHtml(f.action || 'comment')}</code>
+        <strong>${escapeHtml(f.id || 'Finding')}</strong> (${escapeHtml(String(f.sev || 'info').toUpperCase())}) · <code>${escapeHtml(f.action || 'comment')}</code>${f.trusted ? '' : ' · <em>unverified author</em>'}
         ${f.title ? `<div style="margin-top:2px;font-weight:500;">${escapeHtml(f.title)}</div>` : ''}
         <div style="color:var(--muted);margin-top:2px;font-family:var(--mono);font-size:11px;">${escapeHtml(f.loc || '')}</div>
       </div>`
@@ -197,9 +197,13 @@ document.getElementById('openFullWorkbenchBtn')?.addEventListener('click', async
         btn.textContent = `Loading PR #${activePrInfo.pr}...`;
       }
       try {
+        // Token hand-off only works when CRV_EXTENSION_IDS pins this extension's id on the server.
+        const sessionRes = await fetch(`${activeServerOrigin}/api/session`);
+        const token = sessionRes.ok ? (await sessionRes.json()).token : null;
+        if (!token) throw new Error('No session token (set CRV_EXTENSION_IDS); open the tab and load the PR there');
         await fetch(`${activeServerOrigin}/api/github/load-pr`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-CRV-Token': token },
           body: JSON.stringify({
             prInput: String(activePrInfo.pr),
             repo: activePrInfo.repo

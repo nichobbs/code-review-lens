@@ -130,7 +130,8 @@ test('GitHub sticky overview comment round-trips crv-meta & hydrateFromGitHubCom
         user: { login: 'author' },
         created_at: '2026-10-30T03:00:00Z'
       }
-    ]
+    ],
+    { trustedAuthors: ['reviewer'] }
   );
 
   assert.equal(hydrated.overviewMeta.commentId, 101);
@@ -419,8 +420,9 @@ test('Chrome Extension standalone workbench bundle, MV3 CSP compliance, and loca
   assert.equal(isAllowedCorsOrigin('https://evil.example.com'), false);
   assert.equal(isAllowedCorsOrigin('chrome-extension://invalid-id'), false);
 
-  // 2. Bundled extension workbench sync & MV3 CSP compliance (no inline <script> tags)
-  const syncRes = syncExtensionWorkbench();
+  // 2. Bundled extension workbench is an exact, in-sync copy of packages/ui & MV3 CSP compliant (no inline <script>)
+  const syncRes = syncExtensionWorkbench({ check: true });
+  assert.deepEqual(syncRes.drifted, [], 'run `npm run sync-extension` to regenerate packages/extension/workbench');
   for (const fileName of syncRes.files) {
     assert.ok(fs.existsSync(path.join(syncRes.targetDir, fileName)));
   }
@@ -477,7 +479,8 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
   const { PassThrough } = require('node:stream');
   const report = loadReportFile(path.join(__dirname, '../fixtures/pr1230-report.json'));
   const tmpSubmitPath = path.join(os.tmpdir(), `crv-test-submit-${Date.now()}.json`);
-  const { server } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath });
+  const { server, sessionToken } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath });
+  const auth = { 'x-crv-token': sessionToken };
 
   function invokeServer({ method = 'GET', url = '/', headers = {}, body = null }) {
     return new Promise((resolve, reject) => {
@@ -520,7 +523,8 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
 
   try {
     // 1. GET /api/report
-    const repRes = await invokeServer({ method: 'GET', url: '/api/report' });
+    assert.equal((await invokeServer({ method: 'GET', url: '/api/report' })).status, 401); // token required
+    const repRes = await invokeServer({ method: 'GET', url: '/api/report', headers: auth });
     assert.equal(repRes.status, 200);
     const repData = await repRes.json();
     assert.equal(repData.REVIEW.pr, 1230);
@@ -530,10 +534,11 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
       method: 'POST',
       url: '/api/github/submit-review',
       headers: {
+        ...auth,
         'content-type': 'application/json',
         origin: 'https://evil.example.com'
       },
-      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: {} })
+      body: JSON.stringify({ repo: 'acme/loyalty-platform', pr: 1230, payload: {} })
     });
     assert.equal(csrfRes.status, 403);
 
@@ -542,10 +547,11 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
       method: 'POST',
       url: '/api/github/submit-review',
       headers: {
+        ...auth,
         'content-type': 'application/json',
         origin: 'chrome-extension://abcdefghijklmnop'
       },
-      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: { event: 'COMMENT' } })
+      body: JSON.stringify({ repo: 'acme/loyalty-platform', pr: 1230, payload: { event: 'COMMENT' } })
     });
     assert.equal(extRes.status, 200);
     const extJson = await extRes.json();

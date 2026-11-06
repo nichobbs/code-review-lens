@@ -28,7 +28,11 @@ const {
   hydrateFromGitHubComments,
   parsePaginatedGhJson,
   fetchPrDiffWithFallback,
-  resolveRepoConfig
+  resolveRepoConfig,
+  isValidRepoSlug,
+  parsePrNumber,
+  resolveTrustedAuthors,
+  detectGhLogin
 } = require(corePath);
 
 function runGh(args) {
@@ -85,11 +89,19 @@ function main() {
       fs.writeFileSync(targetDiff, diffText);
     }
   } else {
-    const shortMatch = /^([^/]+\/[^#]+)#(\d+)$/.exec(String(prInput));
+    const shortMatch = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/.exec(String(prInput));
+    if (repo && !isValidRepoSlug(repo)) {
+      console.error(`❌ Invalid --repo "${repo}". Expected owner/repo.`);
+      process.exit(1);
+    }
     const resolvedCfg = resolveRepoConfig({ explicitRepo: repo || (shortMatch && shortMatch[1]) });
     const activeRepo = resolvedCfg.repo || null;
     const targetPr = shortMatch ? shortMatch[2] : String(prInput).replace(/^#/, '');
-    const isFullUrl = /^https?:\/\//i.test(String(prInput));
+    const isFullUrl = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+\/?$/i.test(String(prInput));
+    if (!isFullUrl && !parsePrNumber(targetPr)) {
+      console.error(`❌ Invalid PR "${prInput}". Expected a number, owner/repo#number, or a https://github.com/<owner>/<repo>/pull/<n> URL.`);
+      process.exit(1);
+    }
     if (!isFullUrl && !activeRepo) {
       console.error(
         [
@@ -115,7 +127,8 @@ function main() {
     fs.writeFileSync(path.join(absScratch, 'pr-meta.json'), JSON.stringify(prMeta, null, 2));
 
     const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(prMeta.url || '');
-    const resolvedRepo = (urlMatch ? urlMatch[1] : null) || activeRepo;
+    const candidateRepo = (urlMatch ? urlMatch[1] : null) || activeRepo;
+    const resolvedRepo = isValidRepoSlug(candidateRepo) ? candidateRepo : null;
     const prNum = prMeta.number || (urlMatch ? urlMatch[2] : targetPr);
 
     const fetchedDiff = fetchPrDiffWithFallback({
@@ -143,7 +156,13 @@ function main() {
         const reviewComments = parsePaginatedGhJson(
           runGh(['api', `repos/${resolvedRepo}/pulls/${prNum}/comments`, '--paginate', '--slurp']) || '[]'
         );
-        hydratedThreads = hydrateFromGitHubComments(issueComments, reviewComments);
+        // crv markers are only honoured from the gh user, CRV_TRUSTED_REVIEWERS / user config reviewers and bots.
+        const trust = resolveTrustedAuthors({ ghLogin: detectGhLogin() });
+        hydratedThreads = hydrateFromGitHubComments(issueComments, reviewComments, {
+          trustedAuthors: trust.logins,
+          currentHead: prMeta.headRefOid
+        });
+        hydratedThreads.trustedAuthors = trust.logins;
       } catch (err) {
         hydratedThreads.syncWarning = err.message;
       }

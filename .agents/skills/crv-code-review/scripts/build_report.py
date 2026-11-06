@@ -746,7 +746,7 @@ function tcode(s){return (s||'').replace(/`([^`]+)`/g,'<code>$1</code>');}
 function outsideLi(o){return '<li>'+(o.loc?'<code>'+o.loc+'</code> ':'')+o.text+(o.ticket?' <b>'+o.ticket+'.</b>':'')+'</li>';}
 function prLink(){return PR?'<a class="prlink" href="'+PR.url+'" target="_blank" rel="noopener">'+ic('link')+PR.label+'</a>':'';}
 const dark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;
-try{mermaid.initialize({startOnLoad:false,securityLevel:'loose',theme:dark?'dark':'neutral',
+try{mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:dark?'dark':'neutral',
   fontFamily:'"Open Sans",system-ui,sans-serif',flowchart:{useMaxWidth:true,htmlLabels:true},sequence:{useMaxWidth:true},state:{useMaxWidth:true}});}catch(e){}
 let done=JSON.parse(localStorage.getItem(KEY)||'{}');
 // Comments live under their own key, so a stale check-off map never carries note text and a
@@ -1106,7 +1106,7 @@ $('#markDone').onclick=markCurrent;
 $('#ovbtn').onclick=()=>{select(SUMMARY?OV:RV);if(narrow())document.body.classList.add('show-detail');updateBack();};
 $('#back').onclick=()=>{document.body.classList.remove('show-detail');updateBack();};
 // Rack width: stored per viewer as a fraction of the window; the finding pane keeps at least 420px.
-(function(){const app=$('.app'),rz=$('#resizer'),RK='tu-code-review:rack-width',MIN=280,PANE=420;let f=null;
+(function(){const app=$('.app'),rz=$('#resizer'),RK='crv-code-review:rack-width',MIN=280,PANE=420;let f=null;
   function apply(x){if(x==null){app.style.removeProperty('--rack-w');return null;}
     const w=app.getBoundingClientRect().width;if(!w)return x;const px=Math.max(MIN,Math.min(w-PANE,x*w));
     app.style.setProperty('--rack-w',(px/w*100).toFixed(2)+'%');rz.setAttribute('aria-valuenow',String(Math.round(px/w*100)));return px/w;}
