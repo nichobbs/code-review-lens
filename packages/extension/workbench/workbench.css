@@ -90,9 +90,13 @@ html, body {
 .app {
   display: grid;
   grid-template-rows: 48px 1fr;
-  grid-template-columns: var(--rack-w, 390px) 1fr;
+  grid-template-columns: var(--rack-w, 390px) 1fr var(--guide-w, 340px);
   height: 100vh;
   overflow: hidden;
+}
+
+.app.guide-collapsed {
+  --guide-w: 0px;
 }
 
 /* Top Header Bar */
@@ -487,6 +491,11 @@ html, body {
 .triage-chip.dismiss {
   background: var(--well);
   color: var(--muted);
+}
+
+.triage-chip.fixed {
+  background: var(--ok-tint);
+  color: var(--ok);
 }
 
 /* Right Column: Detail Pane */
@@ -955,4 +964,211 @@ dialog#switchPrDialog[open] {
   max-height: 220px;
   overflow: auto;
   white-space: pre-wrap;
+}
+
+/* Collapsible Reviewer Guide & Human Focus Side Panel
+   Follows modern-web-guidance (`search-hidden-content` & `content-first-noise-reduction`):
+   borders, padding, and backgrounds live on the nested `.guide-inner` wrapper rather than
+   directly on `#guidePanel[hidden="until-found"]` so collapsing leaves zero visual remnants
+   while keeping content findable via native Find-in-Page (`beforematch`). */
+.guidecol {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.guide-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 340px;
+  border-left: 1px solid var(--rule);
+  background: var(--surface);
+}
+
+.guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--well);
+}
+
+.guide-head-title {
+  font: 700 12.5px var(--font);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.guide-close-btn {
+  height: 24px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.guide-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.guide-radar {
+  border: 1px solid var(--rule-strong);
+  border-radius: 6px;
+  padding: 10px 11px;
+  background: var(--well);
+}
+
+.guide-radar-title {
+  font: 700 11px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-ink);
+  margin: 0 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.guide-radar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guide-radar-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.guide-radar-item.warn {
+  border-color: color-mix(in srgb, var(--s-medium) 45%, var(--rule));
+  background: var(--s-medium-tint);
+}
+
+.guide-radar-item.high {
+  border-color: color-mix(in srgb, var(--s-high) 45%, var(--rule));
+  background: var(--s-high-tint);
+}
+
+.guide-section {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.guide-section > summary {
+  cursor: pointer;
+  padding: 9px 11px;
+  font: 700 12px var(--font);
+  color: var(--ink);
+  background: var(--well);
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.guide-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+.guide-section > summary::after {
+  content: "▸";
+  font-size: 11px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.guide-section[open] > summary::after {
+  transform: rotate(90deg);
+}
+
+.guide-section[open] > summary {
+  border-bottom: 1px solid var(--rule);
+}
+
+.guide-body {
+  padding: 10px 11px;
+  font-size: 12px;
+  line-height: 1.48;
+  color: var(--ink-2);
+}
+
+.guide-body p {
+  margin: 0 0 8px;
+}
+
+.guide-body p:last-child {
+  margin-bottom: 0;
+}
+
+.guide-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.guide-step {
+  padding: 7px 8px;
+  border-radius: 5px;
+  background: var(--well);
+  border: 1px solid var(--rule);
+  margin-bottom: 7px;
+}
+
+.guide-step:last-child {
+  margin-bottom: 0;
+}
+
+.guide-step-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.guide-jump-btn {
+  height: 22px;
+  padding: 0 7px;
+  font-size: 10.5px;
+}
+
+.guide-kbd-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 10px;
+  align-items: center;
+  font-size: 11.5px;
+}
+
+#guideToggleBtn[aria-expanded="true"] {
+  background: var(--active);
+  border-color: var(--accent);
+  color: var(--accent-ink);
 }

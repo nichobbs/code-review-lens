@@ -43,13 +43,15 @@ OPTIONS:
   --agent <name>          AI agent CLI harness to use (agy, claude, gemini, codex)
   -m, --model <model>     Model to pass to the AI agent CLI (e.g. claude-opus-4-6, sonnet, gemini-2.5-pro)
   --effort <level>        Reasoning effort for agy/claude (low, medium, high, xhigh, max)
+  --fast                  Fast analysis mode (uses low reasoning effort and single-pass review pack)
   --analyze               Run the full 14-lens AI agent review before opening the Workbench
   --headless              Run the AI agent non-interactively (-p mode) when analyzing
   --interactive           Force interactive agent session when running with --analyze
   --diff <diff.patch>     Attach unified diff file to extract inline code slices & Layer 4 Test Matrix
   --out <path.html>       Output file path for export-html
   --sync                  Hydrate existing <!-- crv-finding --> & <!-- crv-meta --> threads from GitHub
-  --publish               Enable live GitHub PR review publishing from the Workbench UI
+  --publish               Enable live GitHub PR review publishing from the Workbench UI (off by default)
+  --dry-run, --no-publish Explicitly keep publishing off: save the review payload locally only (the default)
   --allow-approve         Additionally allow APPROVE reviews to be posted (off by default; with --publish)
   --port <number>         Preferred local server port (default: 4320; auto-increments if busy)
   --no-open               Do not automatically open the Workbench URL in your browser
@@ -70,6 +72,8 @@ function parseArgs(argv) {
   const flags = {
     port: 4320,
     publish: false,
+    dryRun: false,
+    fast: false,
     sync: false,
     global: false,
     open: true,
@@ -94,7 +98,13 @@ function parseArgs(argv) {
     const a = args[i];
     if (a === '-h' || a === '--help' || a === 'help') flags.help = true;
     else if (a === '-v' || a === '--version' || a === 'version') flags.version = true;
-    else if (a === '--publish') flags.publish = true;
+    else if (a === '--publish') {
+      flags.publish = true;
+      flags.dryRun = false;
+    } else if (a === '--dry-run' || a === '--no-publish') {
+      flags.publish = false;
+      flags.dryRun = true;
+    } else if (a === '--fast') flags.fast = true;
     else if (a === '--sync') flags.sync = true;
     else if (a === '--analyze') flags.analyze = true;
     else if (a === '--allow-approve') flags.allowApprove = true;
@@ -209,7 +219,9 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   const { repo, prNumInt } = parsePrTargetInput(targetPr, resolvedRepo.repo);
   const prNum = String(prNumInt);
 
-  const scratchDir = path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNum}`);
+  // Avoid nesting .crv-skills/crv-code-review/.crv-skills/crv-code-review if invoked inside .crv-skills
+  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
+  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNum}`);
   const skillDir = path.resolve(__dirname, '../../../.agents/skills/crv-code-review');
   const prepScript = path.join(skillDir, 'scripts', 'prepare_pr.mjs');
 
@@ -232,13 +244,14 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     modelName: agentCfg.model || undefined
   });
 
-  const modelOpts = { model: agentCfg.model, effort: agentCfg.effort, scratchDir };
+  const effectiveEffort = flags.effort || (flags.fast ? 'low' : agentCfg.effort || (useHeadless ? 'medium' : null));
+  const modelOpts = { model: agentCfg.model, effort: effectiveEffort, scratchDir };
   const agentArgs = useHeadless
     ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir, modelOpts)
     : agentCfg.spec.buildInteractiveArgs(prompt, skillDir, modelOpts);
 
   const modelBadge = agentCfg.model ? `, model: ${agentCfg.model}` : '';
-  const effortBadge = agentCfg.effort ? `, effort: ${agentCfg.effort}` : '';
+  const effortBadge = effectiveEffort ? `, effort: ${effectiveEffort}` : '';
   console.log(
     `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 14-lens crv-code-review skill...\n`
   );
@@ -378,6 +391,7 @@ async function main() {
   const { server } = createWorkbenchServer({
     report,
     publish: flags.publish,
+    dryRun: flags.dryRun,
     explicitRepo: flags.repo,
     allowApprove: flags.allowApprove
   });
@@ -389,7 +403,7 @@ async function main() {
       `   Repo:     ${resolvedRepo.repo || 'auto'} (resolved from: ${resolvedRepo.source})`
     );
     console.log(`   PR:       ${report.XMETA?.title || 'PR Review'}`);
-    console.log(`   Findings: ${(report.DATA || []).length} (${flags.publish ? 'LIVE GitHub publish enabled' : 'Dry-run mode; pass --publish for live GitHub POST'})\n`);
+    console.log(`   Findings: ${(report.DATA || []).length} (${flags.publish ? 'LIVE GitHub publish enabled (--publish)' : 'Dry-run mode (pass --publish to post to GitHub)'})\n`);
     if (flags.open) {
       openBrowser(url);
     }

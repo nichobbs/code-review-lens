@@ -11,6 +11,7 @@
   const OV = '__overview__';
   const CONTRACTS_VIEW = '__contracts__';
   const TESTS_VIEW = '__tests__';
+  const RESOLVED_STATES = new Set(['fixed', 'external', 'dropped']);
   const IS_EXTENSION_PAGE =
     typeof window !== 'undefined' && window.location?.protocol === 'chrome-extension:';
   const API_BASE = IS_EXTENSION_PAGE ? 'http://127.0.0.1:4320' : '';
@@ -42,13 +43,34 @@
 
   let report = window.__CRV_INITIAL_REPORT__ ? sanitizeReport(window.__CRV_INITIAL_REPORT__) : null;
   let activeLayer = 'findings'; // 'overview' | 'findings' | 'contracts' | 'tests'
-  let activeTab = 'todo';       // 'todo' | 'triaged' | 'all'
+  let activeTab = 'todo';       // 'todo' | 'triaged' | 'resolved' | 'all'
   let activeFilter = 'all';
   let currentId = 'H1';
-  let triage = {};              // { [id]: { action: 'block'|'comment'|'dismiss'|'pending', note: '', done: false, ghCommentId?: number, ghUrl?: string } }
+  let triage = {};              // { [id]: { action: 'block'|'comment'|'dismiss'|'pending', note: '', done: false, ghCommentId?: number, ghThreadId?: string, ghIsResolved?: boolean, ghUrl?: string } }
   let ghConnected = false;
 
   const $ = (sel) => document.querySelector(sel);
+
+  function getFindingResolutionInfo(d) {
+    const ghThread = report?.GITHUB_STATE?.findingThreads?.[d.id] || null;
+    const rawState = d?.status?.state || ghThread?.state || '';
+    const isStateResolved = RESOLVED_STATES.has(rawState);
+    const hasOpenReReviewState = rawState === 'partial' || rawState === 'open' || rawState === 'rebutted';
+    const ghResolved = Boolean(ghThread?.isResolved);
+    const isResolved = isStateResolved || (ghResolved && !hasOpenReReviewState);
+    const needsReopen = ghResolved && hasOpenReReviewState;
+    const hasExistingThread = Boolean(ghThread?.commentId || triage[d.id]?.ghCommentId);
+    return {
+      state: rawState || (ghResolved ? 'fixed' : 'open'),
+      hasExplicitStatus: Boolean(d?.status?.state || ghThread?.state),
+      isStateResolved,
+      ghResolved,
+      isResolved,
+      needsReopen,
+      hasExistingThread,
+      ghThread
+    };
+  }
 
   function storageKey() {
     return (report && report.KEY ? report.KEY : 'crv-workbench') + ':triage-v1';
@@ -73,26 +95,38 @@
       for (const d of report.DATA) {
         const ghThread = ghThreads[d.id];
         const ghSaved = ghOverviewTriage[d.id];
+        const resInfo = getFindingResolutionInfo(d);
         if (!triage[d.id]) {
-          const action =
-            ghThread?.action ||
-            ghSaved?.action ||
-            d.suggestedTriage ||
-            (d.sev === 'high' ? 'block' : 'comment');
+          const action = resInfo.isResolved
+            ? 'dismiss'
+            : ghThread?.action ||
+              ghSaved?.action ||
+              d.suggestedTriage ||
+              (d.sev === 'high' ? 'block' : 'comment');
           const note = ghThread?.note || ghSaved?.note || '';
-          const done = Boolean(ghThread || ghSaved?.done);
+          const done = Boolean(resInfo.isResolved || ghThread || ghSaved?.done);
           triage[d.id] = {
             action,
             note,
             done,
             ghCommentId: ghThread?.commentId,
+            ghThreadId: ghThread?.threadId,
+            ghIsResolved: Boolean(ghThread?.isResolved),
             ghUrl: ghThread?.htmlUrl
           };
-        } else if (ghThread) {
-          triage[d.id].ghCommentId = ghThread.commentId;
-          triage[d.id].ghUrl = ghThread.htmlUrl;
-          if (!triage[d.id].note && ghThread.note) {
-            triage[d.id].note = ghThread.note;
+        } else {
+          if (resInfo.isStateResolved && triage[d.id].action !== 'dismiss') {
+            triage[d.id].action = 'dismiss';
+            triage[d.id].done = true;
+          }
+          if (ghThread) {
+            triage[d.id].ghCommentId = ghThread.commentId;
+            triage[d.id].ghThreadId = ghThread.threadId;
+            triage[d.id].ghIsResolved = Boolean(ghThread.isResolved);
+            triage[d.id].ghUrl = ghThread.htmlUrl;
+            if (!triage[d.id].note && ghThread.note) {
+              triage[d.id].note = ghThread.note;
+            }
           }
         }
       }
@@ -185,9 +219,35 @@
     }
   }
 
+  function formatDocumentTitle(rep) {
+    if (!rep) return 'CRV PR Review Workbench';
+    const urlMatch = /github\.com\/([^/]+\/([^/]+))\/pull\/(\d+)/i.exec(rep.PR?.url || '');
+    const rawRepo = rep.REVIEW?.repo || (urlMatch ? urlMatch[1] : '');
+    const repoShort = rawRepo ? rawRepo.split('/').pop() : urlMatch ? urlMatch[2] : '';
+    const rawTitle = String(rep.XMETA?.title || '').trim();
+    const titlePrMatch = /^PR\s*#(\d+)/i.exec(rawTitle);
+    const labelPrMatch = /#(\d+)/.exec(rep.PR?.label || '');
+    const prNum =
+      rep.REVIEW?.pr ||
+      (urlMatch ? urlMatch[3] : '') ||
+      (titlePrMatch ? titlePrMatch[1] : '') ||
+      (labelPrMatch ? labelPrMatch[1] : '');
+    const cleanTitle = rawTitle.replace(/^PR\s*#\d+\s*[:—–-]\s*/i, '').trim();
+
+    const prefixParts = [];
+    if (prNum) prefixParts.push(`#${prNum}`);
+    if (repoShort) prefixParts.push(repoShort);
+    const prefix = prefixParts.join(' · ');
+
+    if (prefix && cleanTitle) return `${prefix} — ${cleanTitle}`;
+    if (prefix) return `${prefix} — CRV Workbench`;
+    return rawTitle || 'CRV PR Review Workbench';
+  }
+
   function renderHeader() {
     if (!report) return;
     $('#prTitle').textContent = report.XMETA?.title || 'PR Review Workbench';
+    document.title = formatDocumentTitle(report);
     const prLinkHolder = $('#prLinkHolder');
     if (report.PR?.url) {
       prLinkHolder.innerHTML = `<a class="prlink" href="${escapeHtml(report.PR.url)}" target="_blank" rel="noopener">🔗 ${escapeHtml(report.PR.label || 'View PR')}</a>`;
@@ -224,16 +284,19 @@
 
   function renderRack() {
     renderLayerNav();
+    renderGuideRadar();
     const issues = report?.DATA || [];
-    const todoCount = issues.filter((d) => !getTriage(d.id).done).length;
-    const triagedCount = issues.length - todoCount;
+    const resolvedCount = issues.filter((d) => getFindingResolutionInfo(d).isResolved).length;
+    const todoCount = issues.filter((d) => !getFindingResolutionInfo(d).isResolved && !getTriage(d.id).done).length;
+    const triagedCount = issues.filter((d) => !getFindingResolutionInfo(d).isResolved && getTriage(d.id).done).length;
 
     const tabsEl = $('#tabs');
     if (tabsEl) {
       const tabs = [
         ['todo', 'Untriaged', todoCount],
         ['triaged', 'Triaged', triagedCount],
-        ['all', 'All Findings', issues.length]
+        ...(resolvedCount > 0 ? [['resolved', 'Resolved', resolvedCount]] : []),
+        ['all', 'All', issues.length]
       ];
       tabsEl.innerHTML = tabs
         .map(
@@ -262,8 +325,10 @@
 
     const filtered = issues.filter((d) => {
       if (activeFilter !== 'all' && d.sev !== activeFilter) return false;
-      if (activeTab === 'todo') return !getTriage(d.id).done;
-      if (activeTab === 'triaged') return Boolean(getTriage(d.id).done);
+      const resInfo = getFindingResolutionInfo(d);
+      if (activeTab === 'resolved') return resInfo.isResolved;
+      if (activeTab === 'todo') return !resInfo.isResolved && !getTriage(d.id).done;
+      if (activeTab === 'triaged') return !resInfo.isResolved && Boolean(getTriage(d.id).done);
       return true;
     });
 
@@ -273,22 +338,46 @@
 
     let html = '';
     if (activeTab === 'todo' && filtered.length === 0 && issues.length > 0) {
-      html += `<div class="racksep"><span>All findings triaged — showing full list</span></div>`;
+      html += `<div class="racksep"><span>All open findings triaged — showing full list</span></div>`;
     }
 
     for (const d of listToShow) {
       const t = getTriage(d.id);
+      const resInfo = getFindingResolutionInfo(d);
       const isSel = activeLayer === 'findings' && currentId === d.id;
-      const isDismissed = t.action === 'dismiss';
+      const isDismissed = t.action === 'dismiss' || resInfo.isResolved;
       const chipLabel =
-        t.action === 'block' ? 'BLOCK' : t.action === 'comment' ? 'CMT' : t.action === 'dismiss' ? 'SKIP' : '';
+        resInfo.state === 'fixed' || resInfo.state === 'external'
+          ? '✓ FIXED'
+          : resInfo.needsReopen
+            ? '🔄 REOPEN'
+            : resInfo.state === 'partial'
+              ? 'PARTIAL'
+              : resInfo.state === 'rebutted'
+                ? 'REBUTTED'
+                : t.action === 'block'
+                  ? 'BLOCK'
+                  : t.action === 'comment'
+                    ? 'CMT'
+                    : t.action === 'dismiss'
+                      ? 'SKIP'
+                      : '';
+      const chipClass =
+        resInfo.state === 'fixed' || resInfo.state === 'external'
+          ? 'fixed'
+          : resInfo.needsReopen || resInfo.state === 'rebutted'
+            ? 'block'
+            : resInfo.state === 'partial'
+              ? 'comment'
+              : t.action;
 
       html += `<div class="strip${isSel ? ' sel' : ''}${isDismissed ? ' dismissed' : ''}" data-id="${escapeHtml(d.id)}" style="${sevVars(d.sev)}">
         <span class="id num">${escapeHtml(d.id)}</span>
-        <span class="stitle">${formatInlineCode(d.title)}</span>
+        <span class="stitle">${d.isNew ? '<span class="triage-chip comment" style="margin-right:4px;">NEW</span>' : ''}${formatInlineCode(d.title)}</span>
         <span class="smeta">
+          ${resInfo.hasExistingThread ? `<span title="${resInfo.ghResolved ? 'Resolved thread on GitHub' : 'Open thread on GitHub'}">${resInfo.ghResolved ? '✅' : '💬'}</span>` : ''}
           ${t.note ? '<span title="Has human reviewer note">📝</span>' : ''}
-          ${chipLabel ? `<span class="triage-chip ${t.action}">${chipLabel}</span>` : ''}
+          ${chipLabel ? `<span class="triage-chip ${chipClass}">${chipLabel}</span>` : ''}
         </span>
       </div>`;
     }
@@ -364,14 +453,36 @@
     const removedGuards = signals.removedGuards || [];
     const stealthChanges = signals.stealthChanges || [];
     const reuseCandidates = signals.reuseCandidates || [];
-    const hasSignals = removedGuards.length > 0 || stealthChanges.length > 0 || reuseCandidates.length > 0;
+    const shortcuts = signals.shortcuts || [];
+    const specAlignment = signals.specAlignment || {};
+    const negViolations = specAlignment.negativeSpaceViolations || [];
+    const specClauses = specAlignment.specClauses || [];
+    const hasSignals =
+      removedGuards.length > 0 ||
+      stealthChanges.length > 0 ||
+      reuseCandidates.length > 0 ||
+      shortcuts.length > 0 ||
+      negViolations.length > 0 ||
+      specClauses.length > 0;
     const lensesCount = report?.LENSES?.length || report?.REVIEW?.lenses?.length || 14;
+    const leanSavedLinesTotal =
+      s.leanSavedLinesTotal ??
+      report?.LAYERS?.leanSavedLinesTotal ??
+      issues
+        .filter((x) => !report?.STAT?.[x.status?.state || 'open']?.r)
+        .reduce((acc, x) => acc + (Number(x.leanSavedLines) || 0), 0);
 
     const signalsHtml = hasSignals
       ? `<div class="sec">
-          <h4>AI Attention &amp; Guard Signals (Automated Diff Pre-Scan)</h4>
+          <h4>AI Attention, Spec Alignment &amp; Shortcut Ledger (Automated Diff Pre-Scan)</h4>
           <div class="layer-card" style="padding:10px 14px;">
             <ul class="prose" style="margin:0;padding-left:18px;">
+              ${negViolations
+                .map(
+                  (nv) =>
+                    `<li>🚫 <strong>Negative-Space / Out-of-Scope Violation:</strong> <code>${escapeHtml(nv.path)}</code> — ${escapeHtml(nv.reason)}</li>`
+                )
+                .join('')}
               ${removedGuards
                 .map(
                   (g) =>
@@ -390,8 +501,40 @@
                     `<li>♻️ <strong>Near-Duplicate Utility Candidate:</strong> <code>${escapeHtml(rc.name)}</code> added in <code>${escapeHtml(rc.addedIn)}</code> overlaps <code>${escapeHtml((rc.existingMatches || []).join(', '))}</code></li>`
                 )
                 .join('')}
+              ${shortcuts
+                .map((sh) =>
+                  sh.hasTrigger
+                    ? `<li>📌 <strong>Bounded Shortcut (<code>${escapeHtml(sh.marker)}</code>):</strong> <code>${escapeHtml(sh.path)}:${sh.line}</code> — ceiling: <em>${escapeHtml(sh.ceiling)}</em> → upgrade: <em>${escapeHtml(sh.upgrade)}</em></li>`
+                    : `<li>⚠️ <strong>Unbounded Deferral / Rot Risk (<code>${escapeHtml(sh.marker)}</code>):</strong> <code>${escapeHtml(sh.path)}:${sh.line}</code> — <code>${escapeHtml(sh.text)}</code> (missing ceiling &amp; upgrade trigger)</li>`
+                )
+                .join('')}
+              ${specClauses
+                .map((cl) =>
+                  cl.covered
+                    ? `<li>✅ <strong>${escapeHtml(cl.kind)} Clause Covered:</strong> ${escapeHtml(cl.clause)} <code>(${escapeHtml((cl.matchedTests || [])[0] || 'tested')})</code></li>`
+                    : `<li>⚠️ <strong>Uncovered ${escapeHtml(cl.kind)} Clause:</strong> ${escapeHtml(cl.clause)} — no matching test detected in Layer 4</li>`
+                )
+                .join('')}
             </ul>
           </div>
+        </div>`
+      : '';
+
+    const revInfo = report?.REV || null;
+    const revHtml = revInfo
+      ? `<div class="layer-card" style="margin-bottom:14px;border-color:var(--accent);background:var(--active);">
+          <div class="layer-card-header">
+            <h3 class="layer-card-title">🔄 Since Last Review (Revision r${escapeHtml(String(revInfo.number || 2))})</h3>
+            <span class="tpill num"><code>${escapeHtml((revInfo.reviewedCommit || '').slice(0, 8) || 'prev')}</code> → <code>${escapeHtml((revInfo.headCommit || rev.head || '').slice(0, 8) || 'HEAD')}</code></span>
+          </div>
+          ${revInfo.summaryHtml ? `<div class="prose" style="margin-top:6px;">${revInfo.summaryHtml}</div>` : ''}
+          ${
+            Array.isArray(revInfo.commits) && revInfo.commits.length > 0
+              ? `<ul style="margin:6px 0 0;padding-left:18px;font:400 12px/1.5 var(--mono);color:var(--ink-2);">
+                  ${revInfo.commits.map((c) => `<li><code>${escapeHtml(c)}</code></li>`).join('')}
+                </ul>`
+              : ''
+          }
         </div>`
       : '';
 
@@ -406,9 +549,12 @@
         </div>
       </div>
 
+      ${revHtml}
+
       <div class="fhead">
         <div class="fmeta">
           <span class="verify-pill">${escapeHtml(verifyText)}</span>
+          ${leanSavedLinesTotal > 0 ? `<span class="tpill">✂️ Lean: -${leanSavedLinesTotal} lines cuttable</span>` : ''}
           <span>Agent: <strong>${escapeHtml(rev.agent || 'Antigravity')}</strong> (${escapeHtml(rev.model || 'Claude Opus 4.6')})</span>
           <span>Head: <code>${escapeHtml((rev.head || '').slice(0, 8))}</code></span>
         </div>
@@ -434,15 +580,40 @@
       .map((c) => {
         const diffSum = c.diffSummary || c.summary || '';
         const linked = c.linkedFindings || c.findings || [];
+        const owners = c.owners || [];
+        const blast = c.callerBlastRadius || null;
+        const blastHtml =
+          blast && Array.isArray(blast.callers) && blast.callers.length > 0
+            ? `<div style="margin:6px 0 8px;font-size:12px;color:var(--ink-2);">
+                <strong>External Callers (${blast.callers.length}):</strong>
+                ${blast.callers
+                  .map((cl) => {
+                    const callerPath = typeof cl === 'string' ? cl : cl?.path || '';
+                    const callerOwners = Array.isArray(cl?.owners) ? cl.owners : [];
+                    return `<code style="margin-right:6px;">${escapeHtml(callerPath)}${
+                      callerOwners.length
+                        ? ` (${escapeHtml(callerOwners.join(', '))})`
+                        : blast.unownedCallersCount > 0 && typeof cl === 'object'
+                          ? ' (unowned)'
+                          : ''
+                    }</code>`;
+                  })
+                  .join('')}
+              </div>`
+            : '';
         return `<div class="layer-card">
           <div class="layer-card-header">
             <h3 class="layer-card-title"><code>${escapeHtml(c.path)}</code></h3>
-            <span class="status-badge solid">${escapeHtml(c.category || 'Contract')}</span>
+            <div style="display:flex;gap:6px;align-items:center;">
+              ${owners.length ? `<span class="tpill">${escapeHtml(owners.join(', '))}</span>` : ''}
+              <span class="status-badge solid">${escapeHtml(c.category || 'Contract')}</span>
+            </div>
           </div>
           <p style="margin:4px 0 8px;color:var(--ink-2)">${escapeHtml(c.summary || '')}</p>
           ${diffSum ? `<div style="font:400 12px var(--mono);background:var(--well);padding:6px 10px;border-radius:4px;margin-bottom:8px;">
             ${escapeHtml(diffSum)}
           </div>` : ''}
+          ${blastHtml}
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;">
             <strong style="color:var(--muted)">Linked Findings:</strong>
             ${linked.length
@@ -605,6 +776,7 @@
     currentId = d.id;
 
     const t = getTriage(d.id);
+    const resInfo = getFindingResolutionInfo(d);
     const sevMeta = report?.SEV?.[d.sev] || { l: d.sev };
     const earlierLinks = (d.earlier || [])
       .map(
@@ -616,6 +788,53 @@
     const mermaidHtml = d.mermaid
       ? `<div class="diaslot"><div class="mermaid">${escapeHtml(d.mermaid)}</div></div>`
       : '';
+
+    let lifecycleBannerHtml = '';
+    if (resInfo.hasExplicitStatus || resInfo.hasExistingThread) {
+      const stateTitleMap = {
+        fixed: '✅ Verified Fixed in Latest Commits',
+        external: '✅ Resolved on Base Branch (External)',
+        dropped: '🔇 Dropped / Dismissed',
+        partial: '⚠️ Partially Fixed — Failure Still Reachable',
+        rebutted: '🔄 Author Rebuttal Reviewed — Defect Still Holds',
+        open: '🔄 Still Open in Latest Commits'
+      };
+      const bannerTitle = stateTitleMap[resInfo.state] || `Status: ${resInfo.state}`;
+      const ghStatusBadge = resInfo.hasExistingThread
+        ? `<a href="${escapeHtml(resInfo.ghThread?.htmlUrl || t.ghUrl || '#')}" target="_blank" rel="noopener" class="tpill" style="text-decoration:none;">
+            🔗 GitHub Thread #${escapeHtml(String(resInfo.ghThread?.commentId || t.ghCommentId))} (${resInfo.ghResolved ? 'Resolved on GH' : 'Open on GH'})
+           </a>`
+        : '';
+      const publishBehaviorText = resInfo.hasExistingThread
+        ? resInfo.isResolved || t.action === 'dismiss'
+          ? 'Publishing will reply <code>✅ Verified Fixed / Resolved</code> to this existing GitHub thread and mark it <strong>Resolved</strong>.'
+          : resInfo.ghResolved
+            ? 'Publishing will <strong>reply to this existing GitHub thread</strong> (no duplicate comment) and <strong>reopen (unresolve)</strong> it on GitHub.'
+            : 'Publishing will <strong>append a follow-up reply to this existing GitHub thread</strong> instead of creating a new duplicate comment.'
+        : '';
+
+      lifecycleBannerHtml = `<div class="layer-card" style="margin-bottom:14px;border-color:${
+        resInfo.isResolved ? 'var(--ok)' : 'var(--s-medium)'
+      };background:${resInfo.isResolved ? 'var(--ok-tint)' : 'var(--s-medium-tint)'};">
+        <div class="layer-card-header">
+          <strong>${bannerTitle}</strong>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${d.status?.evidence ? `<code style="font-size:11.5px;">${escapeHtml(d.status.evidence)}</code>` : ''}
+            ${ghStatusBadge}
+          </div>
+        </div>
+        ${d.status?.note ? `<div class="prose" style="margin-top:4px;font-size:12.5px;">${d.status.note}</div>` : ''}
+        ${
+          d.status?.dev?.quote
+            ? `<blockquote style="margin:6px 0;padding:6px 10px;border-left:3px solid var(--rule-strong);background:var(--surface);font-size:12px;">
+                “${escapeHtml(d.status.dev.quote)}” — <strong>@${escapeHtml(d.status.dev.who || 'author')}</strong>
+                ${d.status.dev.verdict ? `<div class="prose" style="margin-top:4px;">${d.status.dev.verdict}</div>` : ''}
+              </blockquote>`
+            : ''
+        }
+        ${publishBehaviorText ? `<div style="margin-top:6px;font-size:11.5px;color:var(--ink-2);">💡 ${publishBehaviorText}</div>` : ''}
+      </div>`;
+    }
 
     return `<div class="panein" style="${sevVars(d.sev)}">
       <div class="triage-card">
@@ -630,7 +849,7 @@
             💬 Comment / Nit
           </button>
           <button type="button" class="tbtn${t.action === 'dismiss' ? ' on' : ''}" data-triage="dismiss" title="Shortcut: x">
-            🔇 Dismiss (Skip)
+            🔇 ${resInfo.hasExistingThread ? 'Resolve / Dismiss' : 'Dismiss (Skip)'}
           </button>
           <button type="button" class="btn" id="copyFixPromptBtn" title="Copy structured fix instruction for your Coding Agent">
             🤖 Copy Agent Fix Prompt
@@ -638,10 +857,13 @@
         </div>
       </div>
 
+      ${lifecycleBannerHtml}
+
       <div class="fhead">
         <div class="fmeta">
           <span class="badge">${escapeHtml(d.id)} · ${escapeHtml(sevMeta.l)}</span>
           ${d.verify ? `<span class="verify-pill">✓ ${escapeHtml(d.verify)}</span>` : ''}
+          ${d.leanSavedLines > 0 ? `<span class="tpill">✂️ -${d.leanSavedLines} lines cuttable</span>` : ''}
           <span>Lenses: <strong>${escapeHtml(d.cat || 'general')}</strong></span>
           ${earlierLinks}
         </div>
@@ -812,16 +1034,99 @@
 
   function buildGitHubPreviewPayload() {
     const issues = report?.DATA || [];
+    const existingThreads = report?.GITHUB_STATE?.findingThreads || {};
     const published = issues.filter((d) => {
       const a = getTriage(d.id).action;
-      return a === 'block' || a === 'comment';
+      const resInfo = getFindingResolutionInfo(d);
+      if (resInfo.hasExistingThread && (resInfo.isResolved || a === 'dismiss' || a === 'block' || a === 'comment')) {
+        return true;
+      }
+      return (a === 'block' || a === 'comment') && !resInfo.isStateResolved;
     });
     const selectedEvent =
       document.querySelector('input[name="ghReviewEvent"]:checked')?.value || 'REQUEST_CHANGES';
     const summaryNote = $('#ghSummaryNote')?.value || '';
+    const rawHead = String(report?.REVIEW?.head || '').trim();
+    const shortHead = rawHead ? rawHead.slice(0, 8) : 'HEAD';
 
-    const inlineComments = published.map((d) => {
+    const inlineComments = [];
+    const threadUpdates = [];
+    const outOfHunkBodies = [];
+    for (const d of published) {
       const t = getTriage(d.id);
+      const resInfo = getFindingResolutionInfo(d);
+      const existingThread =
+        existingThreads[d.id] ||
+        (t.ghCommentId ? { commentId: t.ghCommentId, threadId: t.ghThreadId, isResolved: t.ghIsResolved } : null);
+
+      // If this finding already has a thread on GitHub, reply & resolve/reopen that thread instead of creating a duplicate!
+      if (existingThread && existingThread.commentId) {
+        const state = resInfo.state || 'open';
+        const isResolvedOrDismissed = resInfo.isStateResolved || t.action === 'dismiss';
+        const effectiveAction = isResolvedOrDismissed ? 'dismiss' : t.action || 'comment';
+        const updMeta = {
+          v: 1,
+          id: d.id,
+          state,
+          action: effectiveAction,
+          head: rawHead,
+          pr: report?.REVIEW?.pr || null
+        };
+        const replyLines = [`<!-- crv-finding-update: ${JSON.stringify(updMeta)} -->`];
+        if (state === 'fixed' || state === 'external') {
+          replyLines.push(
+            `✅ **Verified ${state === 'external' ? 'Resolved Upstream' : 'Fixed'}** (\`${d.id}\` at \`${shortHead}\`)`
+          );
+        } else if (state === 'dropped' || t.action === 'dismiss') {
+          replyLines.push(`🔇 **Resolved / Dismissed** (\`${d.id}\` at \`${shortHead}\`)`);
+        } else {
+          const stateLabel =
+            state === 'partial'
+              ? '⚠️ **Partially Fixed — Still Open**'
+              : state === 'rebutted'
+                ? '🔄 **Rebuttal Reviewed — Still Open**'
+                : '🔄 **Still Open**';
+          const actionBadge = effectiveAction === 'block' ? '🚫 **Blocking**' : '💬 **Comment**';
+          replyLines.push(`${stateLabel} (\`${d.id}\` at \`${shortHead}\` · ${actionBadge})`);
+        }
+        if (t.note) {
+          replyLines.push('', `> **Reviewer Note:** ${t.note}`);
+        }
+        const statusNoteMd = stripHtmlToMd(d.status?.note || '');
+        if (statusNoteMd || d.status?.evidence) {
+          replyLines.push(
+            '',
+            `${statusNoteMd}${d.status?.evidence ? ` (verified at \`${d.status.evidence}\`)` : ''}`.trim()
+          );
+        }
+        if (d.status?.dev?.quote) {
+          replyLines.push(
+            '',
+            `> "${d.status.dev.quote}" — @${d.status.dev.who || 'author'}`,
+            d.status.dev.verdict ? `\n${stripHtmlToMd(d.status.dev.verdict)}` : ''
+          );
+        }
+        if (!isResolvedOrDismissed && d.suggestion) {
+          replyLines.push('', `\`\`\`suggestion\n${String(d.suggestion).replace(/\r?\n$/, '')}\n\`\`\``);
+        }
+
+        threadUpdates.push({
+          id: d.id,
+          commentId: existingThread.commentId,
+          threadId: existingThread.threadId || null,
+          state,
+          action: effectiveAction,
+          head: rawHead,
+          resolutionAction: isResolvedOrDismissed ? 'resolve' : 'unresolve',
+          body: replyLines.filter(Boolean).join('\n').trim()
+        });
+        continue;
+      }
+
+      if (resInfo.isStateResolved || t.action === 'dismiss') {
+        continue;
+      }
+
       const locMatch = /^(.+):(\d+)(?:-(\d+))?$/.exec(String(d.loc || '').trim());
       const filePath = locMatch ? locMatch[1] : String(d.loc || '').trim();
       const lineNum = locMatch ? Number(locMatch[2]) : 1;
@@ -834,7 +1139,7 @@
         action: t.action,
         loc: d.loc || '',
         title: d.title || '',
-        head: report?.REVIEW?.head || '',
+        head: rawHead,
         pr: report?.REVIEW?.pr || null
       };
       const bodyParts = [
@@ -869,16 +1174,40 @@
         );
       }
 
-      return {
-        path: filePath,
-        line: lineNum || 1,
-        side: 'RIGHT',
-        body: bodyParts.filter(Boolean).join('\n')
-      };
-    });
+      const fullBody = bodyParts.filter(Boolean).join('\n');
+      let targetLine = lineNum || 1;
+      let canPostInline = Boolean(filePath);
+      if (d.diffSlice && Array.isArray(d.diffSlice.lines)) {
+        const rightLines = d.diffSlice.lines
+          .map((l) => l.newNumber)
+          .filter((n) => Number.isFinite(n));
+        if (rightLines.length === 0) {
+          canPostInline = false;
+        } else if (!rightLines.includes(targetLine)) {
+          targetLine = rightLines[0];
+        }
+      } else if ('diffSlice' in d && !d.diffSlice) {
+        canPostInline = false;
+      }
 
-    const counts = { block: 0, comment: 0, dismiss: 0, pending: 0 };
+      if (canPostInline) {
+        inlineComments.push({
+          path: filePath,
+          line: targetLine,
+          side: 'RIGHT',
+          body: fullBody
+        });
+      } else {
+        outOfHunkBodies.push(fullBody);
+      }
+    }
+
+    const counts = { block: 0, comment: 0, dismiss: 0, pending: 0, fixed: 0 };
     for (const d of issues) {
+      const resInfo = getFindingResolutionInfo(d);
+      if (resInfo.state === 'fixed' || resInfo.state === 'external') {
+        counts.fixed++;
+      }
       const act = getTriage(d.id).action || 'pending';
       counts[act] = (counts[act] || 0) + 1;
     }
@@ -887,7 +1216,7 @@
       v: 1,
       repo: report?.REVIEW?.repo || '',
       pr: report?.REVIEW?.pr || 0,
-      head: report?.REVIEW?.head || '',
+      head: rawHead,
       counts,
       triage: Object.fromEntries(
         issues.map((d) => [d.id, { action: getTriage(d.id).action, done: Boolean(getTriage(d.id).done), note: getTriage(d.id).note }])
@@ -903,16 +1232,24 @@
       `| :--- | :---: | :--- |`,
       `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
       `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
-      `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
+      ...(counts.fixed > 0 ? [`| ✅ **Verified Fixed** | **${counts.fixed}** | Confirmed resolved in latest commits |`] : []),
+      `| 🔇 **Dismissed / Resolved** | **${counts.dismiss}** | Filtered out or resolved by reviewer |`,
       `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`
     ].filter(Boolean);
 
+    if (outOfHunkBodies.length > 0) {
+      overviewLines.push('', '---', '### Findings Outside Diff Hunks', '', outOfHunkBodies.join('\n\n---\n\n'));
+    }
+
     const reviewPayload = {
-      commit_id: report?.REVIEW?.head,
       event: selectedEvent,
       body: overviewLines.join('\n').trim(),
-      comments: inlineComments
+      comments: inlineComments,
+      threadUpdates
     };
+    if (/^[0-9a-f]{40}$/i.test(rawHead)) {
+      reviewPayload.commit_id = rawHead;
+    }
 
     return reviewPayload;
   }
@@ -925,7 +1262,14 @@
     }
     const statsEl = $('#ghModalStats');
     if (statsEl) {
-      statsEl.textContent = `${payload.comments.length} inline PR review thread comments + 1 sticky crv-meta overview comment`;
+      const updates = payload.threadUpdates || [];
+      const toResolve = updates.filter((u) => u.resolutionAction === 'resolve').length;
+      const toReopen = updates.filter((u) => u.resolutionAction === 'unresolve').length;
+      const updateDesc =
+        updates.length > 0
+          ? ` · ${updates.length} existing thread repl${updates.length === 1 ? 'y' : 'ies'} (${toResolve} to resolve, ${toReopen} to keep open/reopen)`
+          : '';
+      statsEl.textContent = `${payload.comments.length} new inline thread${payload.comments.length === 1 ? '' : 's'}${updateDesc} + 1 sticky crv-meta overview comment`;
     }
   }
 
@@ -998,6 +1342,178 @@
         triggerMermaidRender();
       });
     }
+  }
+
+  function renderGuideRadar() {
+    const radarEl = $('#guideLiveRadar');
+    if (!radarEl) return;
+
+    const issues = report?.DATA || [];
+    const signals = report?.LAYERS?.attentionSignals || {};
+    const contracts = report?.LAYERS?.contracts || [];
+    const testMatrix = report?.LAYERS?.testMatrix || [];
+
+    const plausibleIssues = issues.filter((d) => String(d.verify || '').toUpperCase() === 'PLAUSIBLE');
+    const highIssues = issues.filter((d) => d.sev === 'high');
+    const untriagedCount = issues.filter((d) => !getTriage(d.id).done).length;
+    const removedGuards = signals.removedGuards || [];
+    const stealthChanges = signals.stealthChanges || [];
+    const shortcuts = signals.shortcuts || [];
+    const rotRiskShortcuts = shortcuts.filter((s) => s.rotRisk || !s.hasTrigger);
+    const negViolations = signals.specAlignment?.negativeSpaceViolations || [];
+    const uncoveredClauses = (signals.specAlignment?.specClauses || []).filter((c) => !c.covered);
+    const unownedCallerContracts = contracts.filter(
+      (c) => (c.callerBlastRadius?.unownedCallersCount || 0) > 0
+    );
+    const weakTestSuites = testMatrix.filter((tm) =>
+      (tm.scenarios || tm.cases || []).some(
+        (sc) => sc.hollow || sc.tautology || sc.internalMock || sc.mockOnly
+      )
+    );
+
+    const radarItems = [];
+
+    if (plausibleIssues.length > 0) {
+      const firstId = plausibleIssues[0].id;
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🔍 <strong>${plausibleIssues.length} <code>PLAUSIBLE</code> finding${plausibleIssues.length > 1 ? 's' : ''}</strong> need human domain verification (${plausibleIssues.map((x) => `<code>${escapeHtml(x.id)}</code>`).join(', ')})</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-finding="${escapeHtml(firstId)}">Inspect</button>`
+      });
+    }
+
+    if (highIssues.length > 0) {
+      const firstHigh = highIssues[0].id;
+      radarItems.push({
+        tone: 'high',
+        html: `<span>🚫 <strong>${highIssues.length} High-Severity Blocker${highIssues.length > 1 ? 's' : ''}</strong> (${untriagedCount} total untriaged)</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-finding="${escapeHtml(firstHigh)}">Review</button>`
+      });
+    }
+
+    if (removedGuards.length > 0 || negViolations.length > 0) {
+      radarItems.push({
+        tone: 'high',
+        html: `<span>🛡️ <strong>${removedGuards.length} Removed Guard${removedGuards.length === 1 ? '' : 's'} · ${negViolations.length} Scope Violation${negViolations.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    if (stealthChanges.length > 0 || rotRiskShortcuts.length > 0) {
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🕵️ <strong>${stealthChanges.length} Stealth File${stealthChanges.length === 1 ? '' : 's'} · ${rotRiskShortcuts.length} Rot-Risk TODO${rotRiskShortcuts.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    if (contracts.length > 0 || unownedCallerContracts.length > 0) {
+      radarItems.push({
+        tone: unownedCallerContracts.length > 0 ? 'warn' : 'normal',
+        html: `<span>📜 <strong>${contracts.length} Public Contract${contracts.length === 1 ? '' : 's'}</strong>${unownedCallerContracts.length > 0 ? ` (${unownedCallerContracts.length} w/ unowned callers)` : ''}</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="contracts">Layer 3</button>`
+      });
+    }
+
+    if (weakTestSuites.length > 0 || uncoveredClauses.length > 0) {
+      radarItems.push({
+        tone: 'warn',
+        html: `<span>🧪 <strong>${weakTestSuites.length} Weak/Mock-Only Suite${weakTestSuites.length === 1 ? '' : 's'} · ${uncoveredClauses.length} Uncovered Spec${uncoveredClauses.length === 1 ? '' : 's'}</strong></span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="tests">Layer 4</button>`
+      });
+    }
+
+    if (radarItems.length === 0) {
+      radarItems.push({
+        tone: 'normal',
+        html: `<span>✅ <strong>No automated red flags</strong> — spot-check Layer 1 intent &amp; Layer 3 contracts before approving.</span>
+               <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Layer 1</button>`
+      });
+    }
+
+    radarEl.innerHTML = `
+      <div class="guide-radar-title">
+        <span>⚡ What to Check on This PR</span>
+        <span class="num">${radarItems.length} signal${radarItems.length === 1 ? '' : 's'}</span>
+      </div>
+      <ul class="guide-radar-list">
+        ${radarItems
+          .map(
+            (it) =>
+              `<li class="guide-radar-item ${it.tone === 'high' ? 'high' : it.tone === 'warn' ? 'warn' : ''}">${it.html}</li>`
+          )
+          .join('')}
+      </ul>
+    `;
+  }
+
+  function setupGuidePanel() {
+    const appEl = $('#app');
+    const panelEl = $('#guidePanel');
+    const toggleBtn = $('#guideToggleBtn');
+    const closeBtn = $('#guideCloseBtn');
+    if (!appEl || !panelEl || !toggleBtn) return;
+
+    function setGuideOpen(isOpen, persist = true) {
+      if (isOpen) {
+        panelEl.removeAttribute('hidden');
+        appEl.classList.remove('guide-collapsed');
+        toggleBtn.setAttribute('aria-expanded', 'true');
+      } else {
+        if ('onbeforematch' in HTMLElement.prototype) {
+          panelEl.setAttribute('hidden', 'until-found');
+        } else {
+          panelEl.setAttribute('hidden', '');
+        }
+        appEl.classList.add('guide-collapsed');
+        toggleBtn.setAttribute('aria-expanded', 'false');
+      }
+      if (persist) {
+        try {
+          localStorage.setItem('crv-guide-open', isOpen ? '1' : '0');
+        } catch (e) {}
+      }
+    }
+
+    // Restore saved state (defaults to open on first visit so reviewers see what to focus on)
+    let initialOpen = true;
+    try {
+      const saved = localStorage.getItem('crv-guide-open');
+      if (saved === '0') initialOpen = false;
+    } catch (e) {}
+    setGuideOpen(initialOpen, false);
+
+    // Synchronize state when native Find-in-Page matches text inside the collapsed panel
+    // per modern-web-guidance (`search-hidden-content`)
+    panelEl.addEventListener('beforematch', () => {
+      setGuideOpen(true, true);
+    });
+
+    toggleBtn.addEventListener('click', () => {
+      const currentlyOpen = toggleBtn.getAttribute('aria-expanded') === 'true';
+      setGuideOpen(!currentlyOpen, true);
+    });
+
+    closeBtn?.addEventListener('click', () => {
+      setGuideOpen(false, true);
+    });
+
+    panelEl.addEventListener('click', (e) => {
+      const layerBtn = e.target.closest('[data-guide-layer]');
+      if (layerBtn) {
+        activeLayer = layerBtn.dataset.guideLayer;
+        renderRack();
+        renderPane();
+        return;
+      }
+      const findingBtn = e.target.closest('[data-guide-finding]');
+      if (findingBtn) {
+        currentId = findingBtn.dataset.guideFinding;
+        activeLayer = 'findings';
+        renderRack();
+        renderPane();
+      }
+    });
   }
 
   function stepFinding(delta) {
@@ -1184,6 +1700,7 @@
     renderRack();
     renderPane();
     setupDialogAndTheme();
+    setupGuidePanel();
 
     const importBtn = $('#importReportBtn');
     const importInput = $('#importReportInput');
@@ -1251,7 +1768,8 @@
         resizerEl.classList.add('drag');
         resizerEl.setPointerCapture(e.pointerId);
         const onMove = (ev) => {
-          const w = Math.max(260, Math.min(window.innerWidth - 360, ev.clientX));
+          const guideW = $('#guidePanel')?.offsetWidth || 0;
+          const w = Math.max(260, Math.min(window.innerWidth - guideW - 360, ev.clientX));
           document.documentElement.style.setProperty('--rack-w', `${w}px`);
         };
         const onUp = (ev) => {
@@ -1279,6 +1797,10 @@
     });
 
     $('#openGhModalBtn')?.addEventListener('click', () => {
+      const hasBlocker = (report?.DATA || []).some((d) => getTriage(d.id).action === 'block');
+      const defaultEvent = hasBlocker ? 'REQUEST_CHANGES' : 'COMMENT';
+      const radio = document.querySelector(`input[name="ghReviewEvent"][value="${defaultEvent}"]`);
+      if (radio) radio.checked = true;
       updateModalPreview();
       $('#ghReviewDialog')?.showModal();
     });
@@ -1575,6 +2097,9 @@
       } else if (e.key === 'x' && activeLayer === 'findings') {
         e.preventDefault();
         setTriageAction(currentId, 'dismiss');
+      } else if (e.key === '?') {
+        e.preventDefault();
+        $('#guideToggleBtn')?.click();
       }
     });
   }

@@ -7,16 +7,22 @@ const fs = require('node:fs');
 
 const {
   serializeFindingComment,
+  serializeFindingThreadUpdateReply,
   parseFindingComment,
   serializeOverviewComment,
   parseOverviewComment,
   buildGitHubReviewPayload,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   classifyFilePath,
   inferFlowName,
   parseUnifiedDiff,
   buildLayersFromParsedDiff,
+  extractShortcutsFromHunks,
+  parseCodeowners,
+  matchCodeowners,
+  analyzeSpecAlignment,
   extractDiffSlice,
   synthesizeUnifiedDiffFromFiles,
   fetchPrDiffWithFallback,
@@ -189,6 +195,11 @@ test('Standalone HTML export embeds report, styles, and Mermaid runtime cleanly'
   assert.ok(html.includes('id="crv-findings"'));
   assert.ok(html.includes('closedby="any"'));
   assert.ok(html.includes('Layer 4: Behavioral Test Matrix'));
+  assert.ok(html.includes('id="guidePanel"'));
+  assert.ok(html.includes('id="guideToggleBtn"'));
+  assert.ok(html.includes('Where Humans Add Maximum Leverage'));
+  assert.ok(html.includes('until-found'));
+  assert.match(html, /<title>#1230 · [\w-]+ — /);
 });
 
 test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings.py round-trip', () => {
@@ -290,6 +301,14 @@ test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings
   assert.equal(prepOut.flowsCount, 1);
   assert.equal(prepOut.testCasesExtracted, 3);
   assert.equal(prepOut.hollowOrMockOnlyCases, 2);
+  assert.ok(Array.isArray(prepOut.triggeredLenses));
+  assert.ok(prepOut.triggeredLenses.includes('correctness'));
+  assert.ok(prepOut.triggeredLenses.includes('contract'));
+  assert.ok(prepOut.triggeredLenses.includes('tests'));
+  assert.ok(fs.existsSync(path.join(tmpDir, 'review-pack.md')));
+  const reviewPackText = fs.readFileSync(path.join(tmpDir, 'review-pack.md'), 'utf8');
+  assert.match(reviewPackText, /Pre-Computed Judge Lens Pick/);
+  assert.match(reviewPackText, /L12 \+  await repo\.updateStatus/);
 
   // Export standalone HTML and verify extract_findings.py recovers sampleFindings losslessly
   const htmlPath = path.join(tmpDir, 'pr1230-workbench.html');
@@ -479,7 +498,7 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
   const { PassThrough } = require('node:stream');
   const report = loadReportFile(path.join(__dirname, '../fixtures/pr1230-report.json'));
   const tmpSubmitPath = path.join(os.tmpdir(), `crv-test-submit-${Date.now()}.json`);
-  const { server, sessionToken } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath });
+  const { server, sessionToken } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath, dryRun: true });
   const auth = { 'x-crv-token': sessionToken };
 
   function invokeServer({ method = 'GET', url = '/', headers = {}, body = null }) {
@@ -563,6 +582,7 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
     assert.equal(indexRes.status, 200);
     const indexHtml = await indexRes.text();
     assert.ok(indexHtml.includes('id="resizer"'));
+    assert.ok(indexHtml.includes('id="guidePanel"'));
 
     const traversalRes = await invokeServer({ method: 'GET', url: '/..%2f..%2fpackage.json' });
     assert.equal(traversalRes.status, 404);
@@ -622,10 +642,10 @@ test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via 
 
   const fallbackApiResult = fetchPrDiffWithFallback({
     pr: 1480,
-    repo: 'transurban/cx-integration-hub',
+    repo: 'acme/cx-integration-hub',
     prMeta: {
       number: 1480,
-      url: 'https://github.com/transurban/cx-integration-hub/pull/1480',
+      url: 'https://github.com/acme/cx-integration-hub/pull/1480',
       baseRefOid: 'aaaa1111',
       headRefOid: 'bbbb2222'
     },
@@ -654,7 +674,7 @@ test('Large PR (>20,000 lines HTTP 406 PullRequest.diff too_large) fallback via 
   // 4. fetchPrDiffWithFallback uses local-git-diff when inside the git repo with commits present
   const fallbackGitResult = fetchPrDiffWithFallback({
     pr: 1480,
-    repo: 'transurban/cx-integration-hub',
+    repo: 'acme/cx-integration-hub',
     prMeta: {
       number: 1480,
       baseRefOid: 'aaaa1111',
@@ -794,3 +814,314 @@ test('AI-era Human Attention Signals: removedGuards, tautology, internalMock, st
   const ghComment = serializeFindingComment(compiled.DATA[0], { action: 'block' }, { head: '12345678', pr: 99 });
   assert.match(ghComment, /```suggestion\n {2}if \(!isAuthorized\(req\.user\)\)/);
 });
+
+test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast Radius, Lean Cuttable Lines, and ESL Slop Linter', () => {
+  const diff = [
+    'diff --git a/packages/api/src/user-contract.ts b/packages/api/src/user-contract.ts',
+    '@@ -1,4 +1,9 @@',
+    ' export interface UserContract {',
+    '   id: string;',
+    '+  // shortcut: <1000 active sessions, migrate to Redis cluster when concurrent users exceed 1000',
+    '+  sessionCache?: Record<string, string>;',
+    '+  // TODO: clean up legacy token field later',
+    '+  legacyToken?: string;',
+    ' }',
+    'diff --git a/packages/legacy-auth/src/session.ts b/packages/legacy-auth/src/session.ts',
+    '@@ -10,3 +10,4 @@ export function verifyLegacySession(t) {',
+    '+  return Boolean(t);',
+    ' }',
+    'diff --git a/packages/api/test/user-contract.test.ts b/packages/api/test/user-contract.test.ts',
+    '@@ -1,3 +1,8 @@',
+    '+describe("UserContract session cache", () => {',
+    '+  it("caches active session when user logs in", () => {',
+    '+    expect(createSession("u1").id).toBe("u1");',
+    '+  });',
+    '+});'
+  ].join('\n');
+
+  const parsed = parseUnifiedDiff(diff);
+  const shortcuts = extractShortcutsFromHunks(parsed);
+  assert.equal(shortcuts.length, 2);
+  const bounded = shortcuts.find((s) => s.kind === 'shortcut');
+  const unbounded = shortcuts.find((s) => s.kind === 'todo');
+  assert.ok(bounded);
+  assert.equal(bounded.hasTrigger, true);
+  assert.equal(bounded.rotRisk, false);
+  assert.ok(unbounded);
+  assert.equal(unbounded.hasTrigger, false);
+  assert.equal(unbounded.rotRisk, true);
+
+  // CODEOWNERS parsing & matching (including /* single-level wildcard, **/ zero-dir glob, and inline comments)
+  const codeownersRules = parseCodeowners([
+    '# Core owners',
+    '/packages/api/ @platform-team @api-leads # inline comment',
+    '/packages/legacy-auth/ @security-team',
+    '/packages/* @root-pkg-owner',
+    'packages/**/index.js @index-owner'
+  ].join('\n'));
+  assert.deepEqual(matchCodeowners('packages/api/src/user-contract.ts', codeownersRules), [
+    '@platform-team',
+    '@api-leads'
+  ]);
+  assert.deepEqual(matchCodeowners('packages/top.js', codeownersRules), ['@root-pkg-owner']);
+  assert.deepEqual(matchCodeowners('packages/index.js', codeownersRules), ['@index-owner']);
+
+  // Spec & Negative-Space Alignment + Caller Blast Radius
+  const prMeta = {
+    title: 'feat(api): add sessionCache to UserContract',
+    body: [
+      '## Summary',
+      'Adds bounded in-memory session cache with `Given/When/Then` and `WHEN ... SHALL` support.',
+      'Repo precedent: follows `packages/api/src/token-contract.ts`.',
+      '',
+      '## Acceptance Criteria',
+      '- WHEN user logs in, the system SHALL cache active session in memory',
+      '- Given an expired token, When session is queried, Then return 401 unauthorized',
+      '',
+      '## Out of scope',
+      '- Do not touch `test` runner or packages/legacy-auth.'
+    ].join('\n')
+  };
+
+  const layers = buildLayersFromParsedDiff(parsed, [], {
+    prMeta,
+    codeownersRules,
+    callerBlastRadiusByPath: {
+      'packages/api/src/user-contract.ts': {
+        callers: [
+          { path: 'apps/web/src/auth.ts', owners: ['@web-team'] },
+          { path: 'apps/mobile/src/login.ts', owners: [] }
+        ],
+        unownedCallersCount: 1
+      }
+    }
+  });
+
+  // Verify shortcuts & specAlignment in attentionSignals
+  assert.equal(layers.attentionSignals.shortcuts.length, 2);
+  const spec = layers.attentionSignals.specAlignment;
+  assert.ok(spec);
+  assert.equal(spec.outOfScope.length, 1);
+  assert.equal(spec.negativeSpaceViolations.length, 1);
+  assert.equal(spec.negativeSpaceViolations[0].path, 'packages/legacy-auth/src/session.ts');
+  assert.equal(spec.repoPrecedents.length, 1);
+  assert.equal(spec.specClauses.length, 2);
+  assert.equal(spec.specClauses[0].covered, true);
+  assert.equal(spec.specClauses[1].covered, false);
+
+  // Verify contract owners & callerBlastRadius in Layer 3
+  assert.equal(layers.contracts.length, 1);
+  assert.deepEqual(layers.contracts[0].owners, ['@platform-team', '@api-leads']);
+  assert.equal(layers.contracts[0].callerBlastRadius.callers.length, 2);
+  assert.equal(layers.contracts[0].callerBlastRadius.unownedCallersCount, 1);
+
+  // Verify LeanSavedLines total & ESL Slop Linter in findings-compiler
+  const findingsWithLeanAndSlop = {
+    meta: {
+      title: 'PR #101: Add session cache',
+      summary: '**What it does.** This is paramount and not a simple map, but a session cache.\n\n**Coverage.** 14 lenses checked.'
+    },
+    issues: [
+      {
+        id: 'M1',
+        sev: 'medium',
+        cat: 'structure',
+        verify: 'CONFIRMED',
+        leanSavedLines: 42,
+        loc: 'packages/api/src/user-contract.ts:3',
+        title: 'Pass-through wrapper adds 42 lines without changing shape',
+        impact: '**Breaks:** Callers must maintain two identical interfaces (verified: packages/api/src/user-contract.ts:3).\n\n**Because:** `UserContract` duplicates `SessionRecord`.\n\n**Reach:** 2 callers.',
+        fix: '**Do:** Delete the pass-through wrapper.\n\n**Check:** `npm test` passes.'
+      },
+      {
+        id: 'L1',
+        sev: 'low',
+        cat: 'readability',
+        loc: 'packages/api/src/user-contract.ts:5',
+        title: 'This load-bearing module is not a cache, but a session store',
+        impact: '**Breaks:** Confuses readers with a single pane of glass.\n\n**Because:** Naming mixes cache and store.\n\n**Reach:** Local file.',
+        fix: '**Do:** Rename field.\n\n**Check:** Build succeeds.'
+      }
+    ]
+  };
+
+  const warnings = checkFindingsShape(findingsWithLeanAndSlop);
+  assert.equal(warnings.some((w) => w.includes('paramount')), true);
+  assert.equal(warnings.some((w) => w.includes('meta.summary: contains "not X, but Y"')), true);
+  assert.equal(warnings.some((w) => w.includes('load-bearing')), true);
+  assert.equal(warnings.some((w) => w.includes('single pane of glass')), true);
+  assert.equal(warnings.some((w) => w.includes('L1: contains "not X, but Y"')), true);
+
+  const report = compileFindingsToWorkbenchReport(findingsWithLeanAndSlop, {
+    diffText: diff,
+    prMeta,
+    layers
+  });
+  assert.equal(report.SUMMARY.leanSavedLinesTotal, 42);
+  assert.equal(report.LAYERS.leanSavedLinesTotal, 42);
+  assert.equal(report.DATA[0].leanSavedLines, 42);
+  assert.deepEqual(report.LAYERS.contracts[0].owners, ['@platform-team', '@api-leads']);
+  assert.equal(report.LAYERS.contracts[0].callerBlastRadius.callers.length, 2);
+});
+
+test('Re-review (r2) replies to existing GitHub threads, resolves fixed threads, and reopens partially-fixed threads without creating duplicates', () => {
+  // 1. Hydrate two existing GitHub PR review comments (H1 and H2) + GraphQL thread states
+  const h1CommentBody = serializeFindingComment(
+    { id: 'H1', sev: 'high', verify: 'CONFIRMED', loc: 'src/auth.ts:12', title: 'Missing DISABLED guard' },
+    { action: 'block', note: 'Block until fixed' },
+    { head: '1111111111111111111111111111111111111111', pr: 42 }
+  );
+  const h2CommentBody = serializeFindingComment(
+    { id: 'H2', sev: 'high', verify: 'CONFIRMED', loc: 'src/auth.ts:30', title: 'Token expiry not checked' },
+    { action: 'block', note: 'Must validate exp claim' },
+    { head: '1111111111111111111111111111111111111111', pr: 42 }
+  );
+
+  const hydrated = hydrateFromGitHubComments(
+    [],
+    [
+      {
+        id: 9001,
+        path: 'src/auth.ts',
+        line: 12,
+        user: { login: 'reviewer' },
+        body: h1CommentBody,
+        html_url: 'https://github.com/acme/repo/pull/42#discussion_r9001'
+      },
+      {
+        id: 9002,
+        path: 'src/auth.ts',
+        line: 30,
+        user: { login: 'reviewer' },
+        body: h2CommentBody,
+        html_url: 'https://github.com/acme/repo/pull/42#discussion_r9002'
+      }
+    ],
+    // crv markers are only honoured from trusted authors (deny-by-default)
+    { trustedAuthors: ['reviewer'] }
+  );
+
+  // Merge GraphQL reviewThreads (H1 still open on GH, H2 prematurely marked resolved by author on GH)
+  mergeGraphqlReviewThreads(hydrated, {
+    data: {
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [
+              {
+                id: 'PRRT_kwDO_H1',
+                isResolved: false,
+                isOutdated: false,
+                comments: { nodes: [{ databaseId: 9001, body: h1CommentBody }] }
+              },
+              {
+                id: 'PRRT_kwDO_H2',
+                isResolved: true,
+                isOutdated: false,
+                comments: { nodes: [{ databaseId: 9002, body: h2CommentBody }] }
+              }
+            ]
+          }
+        }
+      }
+    }
+  });
+
+  assert.equal(hydrated.findingThreads.H1.threadId, 'PRRT_kwDO_H1');
+  assert.equal(hydrated.findingThreads.H1.isResolved, false);
+  assert.equal(hydrated.findingThreads.H2.threadId, 'PRRT_kwDO_H2');
+  assert.equal(hydrated.findingThreads.H2.isResolved, true);
+
+  // 2. Compile a Re-Review (r2) report where:
+  //    - H1 is verified FIXED
+  //    - H2 is PARTIAL (author resolved the thread on GH, but expiry is still bypassed on refresh tokens!)
+  //    - R1 is a brand-new finding introduced in r2
+  const r2Report = compileFindingsToWorkbenchReport({
+    meta: {
+      title: 'PR #42: Auth session hardening',
+      review: {
+        repo: 'acme/repo',
+        pr: 42,
+        base: '0000000000000000000000000000000000000000',
+        head: '2222222222222222222222222222222222222222'
+      },
+      revision: {
+        number: 2,
+        reviewedCommit: '1111111111111111111111111111111111111111',
+        headCommit: '2222222222222222222222222222222222222222',
+        commits: ['22222222 fix(auth): guard DISABLED status'],
+        summary: '1 fixed (H1), 1 partial (H2), 1 new (R1).'
+      }
+    },
+    issues: [
+      {
+        id: 'H1',
+        sev: 'high',
+        verify: 'CONFIRMED',
+        loc: 'src/auth.ts:12',
+        title: 'Missing DISABLED guard',
+        impact: '**Breaks:** Banned users can log in.\n\n**Because:** No check.\n\n**Reach:** Auth.',
+        fix: '**Do:** Add check.\n\n**Check:** Test.',
+        status: {
+          state: 'fixed',
+          note: 'Guard added before session issue.',
+          evidence: 'src/auth.ts:14'
+        }
+      },
+      {
+        id: 'H2',
+        sev: 'high',
+        verify: 'CONFIRMED',
+        loc: 'src/auth.ts:30',
+        title: 'Token expiry not checked',
+        impact: '**Breaks:** Expired refresh tokens accepted.\n\n**Because:** Only access token checked.\n\n**Reach:** Auth.',
+        fix: '**Do:** Check refresh exp.\n\n**Check:** Test.',
+        status: {
+          state: 'partial',
+          note: 'Access token expiry is now checked, but refresh token path at line 41 still skips `exp`.',
+          evidence: 'src/auth.ts:41'
+        }
+      },
+      {
+        id: 'R1',
+        sev: 'medium',
+        verify: 'CONFIRMED',
+        isNew: true,
+        loc: 'src/auth.ts:45',
+        title: 'New error log leaks raw token string',
+        impact: '**Breaks:** Token written to stdout.\n\n**Because:** `logger.error(token)`.\n\n**Reach:** Logs.',
+        fix: '**Do:** Redact token.\n\n**Check:** Unit test.'
+      }
+    ]
+  });
+  r2Report.GITHUB_STATE = hydrated;
+
+  const triageMap = {
+    H1: { action: 'dismiss', note: '', done: true, ghCommentId: 9001, ghThreadId: 'PRRT_kwDO_H1' },
+    H2: { action: 'block', note: 'Please also check refresh token exp at line 41.', done: true, ghCommentId: 9002, ghThreadId: 'PRRT_kwDO_H2' },
+    R1: { action: 'comment', note: 'Redact before merging', done: true }
+  };
+
+  const payload = buildGitHubReviewPayload(r2Report, triageMap);
+
+  // Only R1 is a brand-new inline comment; H1 and H2 are threadUpdates on existing commentIds 9001 and 9002!
+  assert.equal(payload.comments.length, 1);
+  assert.match(payload.comments[0].body, /"id":"R1"/);
+  assert.equal(payload.threadUpdates.length, 2);
+
+  const updH1 = payload.threadUpdates.find((u) => u.id === 'H1');
+  const updH2 = payload.threadUpdates.find((u) => u.id === 'H2');
+  assert.ok(updH1);
+  assert.equal(updH1.commentId, 9001);
+  assert.equal(updH1.threadId, 'PRRT_kwDO_H1');
+  assert.equal(updH1.resolutionAction, 'resolve');
+  assert.match(updH1.body, /Verified Fixed/);
+
+  assert.ok(updH2);
+  assert.equal(updH2.commentId, 9002);
+  assert.equal(updH2.threadId, 'PRRT_kwDO_H2');
+  assert.equal(updH2.resolutionAction, 'unresolve');
+  assert.match(updH2.body, /Partially Fixed — Still Open/);
+  assert.match(updH2.body, /refresh token path at line 41/);
+});
+

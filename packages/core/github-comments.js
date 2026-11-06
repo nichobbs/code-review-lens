@@ -13,6 +13,36 @@
 
 const CRV_META_REGEX = /<!--\s*crv-meta:\s*(\{[\s\S]*?\})\s*-->/;
 const CRV_FINDING_REGEX = /<!--\s*crv-finding:\s*(\{[\s\S]*?\})\s*-->/;
+const CRV_FINDING_UPDATE_REGEX = /<!--\s*crv-finding-update:\s*(\{[\s\S]*?\})\s*-->/;
+
+const RESOLVED_STATES = new Set(['fixed', 'external', 'dropped']);
+
+const REVIEW_THREADS_GRAPHQL_QUERY = `
+query($owner: String!, $name: String!, $pr: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          comments(first: 30) {
+            nodes {
+              databaseId
+              body
+              createdAt
+              url
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`.trim();
 
 const SEVERITY_BADGES = {
   high: '🔴 **HIGH**',
@@ -386,47 +416,189 @@ function foldCommentsIntoBody(payload) {
 }
 
 /**
- * Builds the GitHub Pull Request Review API payload (`POST /repos/{owner}/{repo}/pulls/{number}/reviews`).
+ * Serializes a follow-up reply + thread resolution directive (`resolve` or `unresolve`)
+ * for a finding that ALREADY has an inline comment thread (`commentId`) on GitHub.
+ * Prevents duplicate inline threads on re-reviews (`r2+`) and reopens threads whose fix was incomplete.
+ */
+function serializeFindingThreadUpdateReply(finding, triage = {}, reviewMeta = {}, existingThread = {}) {
+  const state = finding.status?.state || 'open';
+  const isStateResolved = RESOLVED_STATES.has(state);
+  const action = isStateResolved ? 'dismiss' : triage.action || 'comment';
+  const isDismissedOrFixed = isStateResolved || action === 'dismiss';
+  const humanNote = (triage.note || '').trim();
+  const head = reviewMeta.head || '';
+  const shortHead = head ? head.slice(0, 8) : 'HEAD';
+
+  const updateMeta = {
+    v: 1,
+    id: finding.id,
+    state,
+    action,
+    head,
+    pr: reviewMeta.pr || null,
+    updatedAt: new Date().toISOString()
+  };
+
+  const lines = [`<!-- crv-finding-update: ${JSON.stringify(updateMeta)} -->`];
+
+  if (state === 'fixed' || state === 'external') {
+    lines.push(
+      `✅ **Verified ${state === 'external' ? 'Resolved Upstream' : 'Fixed'}** (\`${finding.id}\` at \`${shortHead}\`)`
+    );
+  } else if (state === 'dropped' || action === 'dismiss') {
+    lines.push(`🔇 **Resolved / Dismissed** (\`${finding.id}\` at \`${shortHead}\`)`);
+  } else {
+    const stateLabel =
+      state === 'partial'
+        ? '⚠️ **Partially Fixed — Still Open**'
+        : state === 'rebutted'
+          ? '🔄 **Rebuttal Reviewed — Still Open**'
+          : '🔄 **Still Open**';
+    const actionBadge = action === 'block' ? '🚫 **Blocking**' : '💬 **Comment**';
+    lines.push(`${stateLabel} (\`${finding.id}\` at \`${shortHead}\` · ${actionBadge})`);
+  }
+
+  if (humanNote) {
+    lines.push('', `> **Reviewer Note:** ${humanNote.replace(/\n/g, '\n> ')}`);
+  }
+
+  const statusNoteMd = stripHtmlToMarkdown(finding.status?.note || '');
+  const evidence = (finding.status?.evidence || '').trim();
+  if (statusNoteMd || evidence) {
+    lines.push(
+      '',
+      `${statusNoteMd || ''}${evidence ? ` (verified at \`${evidence}\`)` : ''}`.trim()
+    );
+  }
+
+  if (finding.status?.dev && finding.status.dev.quote) {
+    const dev = finding.status.dev;
+    const verdictMd = stripHtmlToMarkdown(dev.verdict || '');
+    lines.push(
+      '',
+      `> "${dev.quote}" — @${dev.who || 'author'}`,
+      verdictMd ? `\n${verdictMd}` : ''
+    );
+  }
+
+  if (!isDismissedOrFixed && finding.suggestion && String(finding.suggestion).trim()) {
+    lines.push('', '```suggestion', String(finding.suggestion).replace(/\r?\n$/, ''), '```');
+  }
+
+  const resolutionAction = isDismissedOrFixed ? 'resolve' : 'unresolve';
+  return {
+    id: finding.id,
+    commentId: existingThread.commentId || triage.ghCommentId,
+    threadId: existingThread.threadId || triage.ghThreadId || null,
+    state,
+    action,
+    head,
+    resolutionAction,
+    body: lines.filter((l) => l !== undefined).join('\n').trim()
+  };
+}
+
+/**
+ * Builds the GitHub Pull Request Review API payload (`POST /repos/{owner}/{repo}/pulls/{number}/reviews`)
+ * plus `threadUpdates` for existing `<!-- crv-finding -->` threads so re-reviews reply & resolve/reopen
+ * existing threads instead of creating duplicate inline comments.
  */
 function buildGitHubReviewPayload(report, triageMap = {}, options = {}) {
   const issues = report.DATA || [];
+  const existingThreads = report.GITHUB_STATE?.findingThreads || {};
+
   const published = issues.filter((d) => {
     const action = triageMap[d.id]?.action;
-    return action === 'block' || action === 'comment';
+    const isResolvedState = RESOLVED_STATES.has(d.status?.state);
+    const hasExistingThread = Boolean(existingThreads[d.id]?.commentId || triageMap[d.id]?.ghCommentId);
+    if (hasExistingThread && (isResolvedState || action === 'dismiss' || action === 'block' || action === 'comment')) {
+      return true;
+    }
+    return (action === 'block' || action === 'comment') && !isResolvedState;
   });
 
-  const hasBlocker = published.some((d) => triageMap[d.id]?.action === 'block');
+  const hasBlocker = published.some(
+    (d) => triageMap[d.id]?.action === 'block' && !RESOLVED_STATES.has(d.status?.state)
+  );
   const event = options.event || (hasBlocker ? 'REQUEST_CHANGES' : 'COMMENT');
-  const commitId = report.REVIEW?.head || report.XMETA?.head || undefined;
+  const rawCommitId = String(report.REVIEW?.head || report.XMETA?.head || '').trim();
+  const commitId = /^[0-9a-f]{40}$/i.test(rawCommitId) ? rawCommitId : undefined;
 
   const inlineComments = [];
+  const threadUpdates = [];
+  const outOfDiffNotes = [];
   const unplaced = [];
   for (const finding of published) {
+    const t = triageMap[finding.id] || {};
+    const existingThread = existingThreads[finding.id] || (t.ghCommentId ? { commentId: t.ghCommentId, threadId: t.ghThreadId } : null);
+
+    if (existingThread && existingThread.commentId) {
+      const update = serializeFindingThreadUpdateReply(
+        finding,
+        t,
+        report.REVIEW || {},
+        existingThread
+      );
+      threadUpdates.push(update);
+      continue;
+    }
+
+    if (RESOLVED_STATES.has(finding.status?.state) || t.action === 'dismiss') {
+      continue;
+    }
+
     const { path, line } = parseLoc(finding.loc);
+    const body = serializeFindingComment(finding, t, report.REVIEW || {});
     if (path && line) {
-      inlineComments.push({
-        path,
-        line,
-        side: 'RIGHT',
-        body: serializeFindingComment(finding, triageMap[finding.id], report.REVIEW || {})
-      });
+      let targetLine = line;
+      let canPostInline = true;
+      if (finding.diffSlice && Array.isArray(finding.diffSlice.lines)) {
+        const rightLines = finding.diffSlice.lines
+          .map((l) => l.newNumber)
+          .filter((n) => Number.isFinite(n));
+        if (rightLines.length === 0) {
+          canPostInline = false;
+        } else if (!rightLines.includes(line)) {
+          targetLine = rightLines[0];
+        }
+      }
+      if (canPostInline) {
+        inlineComments.push({
+          path,
+          line: targetLine,
+          side: 'RIGHT',
+          body
+        });
+      } else {
+        outOfDiffNotes.push(body);
+      }
     } else {
       unplaced.push(finding);
     }
   }
 
   let body = serializeOverviewComment(report, triageMap, options.summaryNote || '');
+  if (outOfDiffNotes.length > 0) {
+    body += `\n\n---\n### Additional Findings (Outside Diff Hunks)\n\n${outOfDiffNotes.join('\n\n---\n\n')}`;
+  }
   if (unplaced.length) {
     // No `path:line` (or not parseable): GitHub cannot anchor an inline comment, so list them in the review body.
-    body = capComment(`${body}\n\n${renderUnplacedSection(unplaced, triageMap)}`);
+    body += `\n\n${renderUnplacedSection(unplaced, triageMap)}`;
+  }
+  if (outOfDiffNotes.length > 0 || unplaced.length) {
+    body = capComment(body);
   }
 
-  return {
-    commit_id: commitId,
+  const payload = {
     event,
     body,
-    comments: inlineComments
+    comments: inlineComments,
+    threadUpdates
   };
+  if (commitId) {
+    payload.commit_id = commitId;
+  }
+  return payload;
 }
 
 function hasCrvMarker(body) {
@@ -527,12 +699,25 @@ function hydrateFromGitHubComments(issueComments = [], reviewComments = [], opti
         (t) => t.commentId === rc.in_reply_to_id
       );
       if (parentEntry) {
+        let updateMeta = null;
+        const updMatch = CRV_FINDING_UPDATE_REGEX.exec(rc.body || '');
+        if (updMatch) {
+          try {
+            updateMeta = JSON.parse(updMatch[1]);
+          } catch (e) {}
+        }
+        if (updateMeta) {
+          parentEntry.lastUpdate = updateMeta;
+          if (updateMeta.action) parentEntry.action = updateMeta.action;
+          if (updateMeta.state) parentEntry.state = updateMeta.state;
+        }
         parentEntry.replies.push({
           id: rc.id,
           author: rc.user?.login || 'unknown',
           body: rc.body,
           createdAt: rc.created_at,
-          htmlUrl: rc.html_url
+          htmlUrl: rc.html_url,
+          updateMeta
         });
       } else if (generalByCommentId.has(rc.in_reply_to_id)) {
         generalByCommentId.get(rc.in_reply_to_id).replies.push({
@@ -585,17 +770,63 @@ function parsePaginatedGhJson(raw) {
   }
 }
 
+/**
+ * Enriches `hydrateFromGitHubComments` output with GraphQL `PullRequestReviewThread`
+ * state (`threadId`, `isResolved`, `isOutdated`).
+ */
+function mergeGraphqlReviewThreads(hydrated, graphqlResponse) {
+  if (!hydrated || !hydrated.findingThreads || !graphqlResponse) return hydrated;
+  const parsed =
+    typeof graphqlResponse === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(graphqlResponse);
+          } catch (e) {
+            return null;
+          }
+        })()
+      : graphqlResponse;
+  const threads =
+    parsed?.data?.repository?.pullRequest?.reviewThreads?.nodes ||
+    parsed?.repository?.pullRequest?.reviewThreads?.nodes ||
+    [];
+  if (!Array.isArray(threads)) return hydrated;
+
+  for (const th of threads) {
+    if (!th || !Array.isArray(th.comments?.nodes) || th.comments.nodes.length === 0) continue;
+    const firstComment = th.comments.nodes[0];
+    const dbId = firstComment?.databaseId;
+    const parsedFinding = parseFindingComment(firstComment?.body || '');
+    const findingId = parsedFinding?.meta?.id;
+
+    let entry = findingId ? hydrated.findingThreads[findingId] : null;
+    if (!entry && dbId != null) {
+      entry = Object.values(hydrated.findingThreads).find((t) => t.commentId === dbId);
+    }
+    if (entry) {
+      entry.threadId = th.id;
+      entry.isResolved = Boolean(th.isResolved);
+      entry.isOutdated = Boolean(th.isOutdated);
+    }
+  }
+  return hydrated;
+}
+
 module.exports = {
   SEVERITY_BADGES,
   TRIAGE_LABELS,
+  RESOLVED_STATES,
+  REVIEW_THREADS_GRAPHQL_QUERY,
   stripHtmlToMarkdown,
   parseLoc,
   serializeFindingComment,
+  serializeFindingThreadUpdateReply,
   parseFindingComment,
   serializeOverviewComment,
   parseOverviewComment,
   buildGitHubReviewPayload,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   foldCommentsIntoBody,
   capComment,

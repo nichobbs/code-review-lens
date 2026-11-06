@@ -30,6 +30,9 @@
       <button type="button" class="btn gh-submit" id="openGhModalBtn">
         Publish to GitHub
       </button>
+      <button type="button" class="btn" id="guideToggleBtn" aria-expanded="true" aria-controls="guidePanel" title="Toggle Reviewer Guide &amp; Human Focus panel (Shortcut: ?)">
+        📖 Guide &amp; Focus
+      </button>
       <button type="button" class="btn" id="themeToggleBtn" aria-label="Toggle color scheme" title="Toggle light/dark theme">
         ◐ Theme
       </button>
@@ -49,7 +52,7 @@
       <div class="panescroll" id="pane" tabindex="-1"></div>
       <footer class="dock">
         <div>
-          <span>Shortcuts: <kbd class="kbd">j</kbd>/<kbd class="kbd">k</kbd> navigate · <kbd class="kbd">b</kbd> Block · <kbd class="kbd">m</kbd> Comment · <kbd class="kbd">x</kbd> Dismiss</span>
+          <span>Shortcuts: <kbd class="kbd">j</kbd>/<kbd class="kbd">k</kbd> navigate · <kbd class="kbd">b</kbd> Block · <kbd class="kbd">m</kbd> Comment · <kbd class="kbd">x</kbd> Dismiss · <kbd class="kbd">?</kbd> Guide</span>
         </div>
         <div style="display:flex;gap:8px;">
           <button type="button" class="btn" id="prevBtn">← Previous</button>
@@ -57,6 +60,121 @@
         </div>
       </footer>
     </main>
+
+    <aside class="guidecol" id="guidePanel" aria-label="Reviewer Guide and Human Attention Focus">
+      <div class="guide-inner">
+        <div class="guide-head">
+          <div class="guide-head-title">
+            <span>📖 Reviewer Guide &amp; Human Focus</span>
+          </div>
+          <button type="button" class="btn guide-close-btn" id="guideCloseBtn" aria-label="Collapse Reviewer Guide panel" title="Collapse panel (Shortcut: ?)">
+            ✕
+          </button>
+        </div>
+
+        <div class="guide-scroll">
+          <!-- Live PR Human Attention Radar (populated dynamically from active report) -->
+          <section class="guide-radar" id="guideLiveRadar" aria-label="Live PR Human Attention Radar"></section>
+
+          <details class="guide-section" open>
+            <summary>🎯 Where Humans Add Maximum Leverage</summary>
+            <div class="guide-body">
+              <p>AI lenses verify mechanical rules, syntax, and local control flow. Spend your human review budget on the <strong>4 high-leverage judgment areas</strong> AI cannot decide alone:</p>
+              <ul class="guide-list">
+                <li>
+                  <strong>1. Business Intent &amp; Operating Load:</strong> Does the change solve the right problem for the expected load (single-user CLI, batch job, or high-concurrency service)?
+                </li>
+                <li>
+                  <strong>2. <code>PLAUSIBLE</code> vs <code>CONFIRMED</code> Findings:</strong> <code>CONFIRMED</code> findings are proven in the diff. <code>PLAUSIBLE</code> findings have a real code path but depend on prod config, upstream callers, or real traffic shapes—<strong>use your domain knowledge to Block or Dismiss</strong>.
+                </li>
+                <li>
+                  <strong>3. Silent Removals &amp; Scope Creep:</strong> Check <strong>Removed Guards</strong> (deleted auth, schema validation, or retry checks), <strong>Negative-Space Violations</strong> (files marked <em>Out of scope</em>), and <strong>Stealth Changes</strong> (core files modified without mention in the PR description).
+                </li>
+                <li>
+                  <strong>4. Bounded Shortcuts vs Rot Risk:</strong> Respect <code>// shortcut: &lt;ceiling&gt;, &lt;upgrade&gt;</code> when load stays below <code>&lt;ceiling&gt;</code>. Challenge unbounded <code>TODO</code>/<code>FIXME</code> comments flagged as <strong>Rot Risk</strong>.
+                </li>
+              </ul>
+            </div>
+          </details>
+
+          <details class="guide-section" open>
+            <summary>🧭 How to Review the 4 Layers</summary>
+            <div class="guide-body">
+              <div class="guide-step">
+                <div class="guide-step-head">
+                  <strong>Layer 1 · Intent &amp; Architecture</strong>
+                  <button type="button" class="btn guide-jump-btn" data-guide-layer="overview">Open</button>
+                </div>
+                <p>Read <strong>What it does</strong>, the C4 diagram, <strong>Human Focus</strong> bullets, and the automated <strong>Attention &amp; Shortcut Ledger</strong> before looking at individual files.</p>
+              </div>
+
+              <div class="guide-step">
+                <div class="guide-step-head">
+                  <strong>Layer 2 · Verified Risk Findings</strong>
+                  <button type="button" class="btn guide-jump-btn" data-guide-layer="findings">Open</button>
+                </div>
+                <p>Step through findings with <kbd class="kbd">j</kbd>/<kbd class="kbd">k</kbd>. Inspect the inline diff slice and Verifier proof. Triage each as <strong>🚫 Block</strong> (<kbd class="kbd">b</kbd>), <strong>💬 Comment</strong> (<kbd class="kbd">m</kbd>), or <strong>🔇 Dismiss</strong> (<kbd class="kbd">x</kbd>).</p>
+              </div>
+
+              <div class="guide-step">
+                <div class="guide-step-head">
+                  <strong>Layer 3 · Contracts &amp; Story Flows</strong>
+                  <button type="button" class="btn guide-jump-btn" data-guide-layer="contracts">Open</button>
+                </div>
+                <p>Audit public API/event/schema changes first. Check <code>CODEOWNERS</code> badges and <strong>External Caller Blast Radius</strong>—especially <code>(unowned)</code> callers outside the PR.</p>
+              </div>
+
+              <div class="guide-step">
+                <div class="guide-step-head">
+                  <strong>Layer 4 · Behavioral Test Matrix</strong>
+                  <button type="button" class="btn guide-jump-btn" data-guide-layer="tests">Open</button>
+                </div>
+                <p>Skip raw mock boilerplate. Scan the behavior table for <code>hollow</code> (0 assertions), <code>tautology</code> (asserting constants), <code>internal-mock</code> (mocking internal helpers), and uncovered EARS/BDD spec clauses.</p>
+              </div>
+            </div>
+          </details>
+
+          <details class="guide-section">
+            <summary>⚡ Triage, Agent Prompts &amp; Publishing</summary>
+            <div class="guide-body">
+              <ul class="guide-list">
+                <li>
+                  <strong>Batch Presets:</strong> In Layer 1, use <em>Block Highs · Comment Medium/Design</em> to pre-triage in one click, then refine individual items.
+                </li>
+                <li>
+                  <strong>Human Reviewer Notes:</strong> Add context in the note box on any finding—it is included in both the GitHub PR thread and the Coding Agent prompt.
+                </li>
+                <li>
+                  <strong>Publish to GitHub:</strong> Click <strong>Publish to GitHub</strong> to post inline <code>&lt;!-- crv-finding --&gt;</code> threads + a sticky summary comment (live publish is on by default; pass <code>--dry-run</code> on the CLI for local-only mode).
+                </li>
+                <li>
+                  <strong>Hand Off to Coding Agent:</strong> Click <strong>🤖 Copy Agent Fix Prompt</strong> on a finding (or <strong>Copy Agent Prompt</strong> in the top bar) to paste curated fix instructions into your AI coding agent.
+                </li>
+              </ul>
+            </div>
+          </details>
+
+          <details class="guide-section">
+            <summary>⌨️ Shortcuts &amp; Fast CLI Reference</summary>
+            <div class="guide-body">
+              <div class="guide-kbd-grid">
+                <span><kbd class="kbd">j</kbd> / <kbd class="kbd">↓</kbd></span><span>Next finding</span>
+                <span><kbd class="kbd">k</kbd> / <kbd class="kbd">↑</kbd></span><span>Previous finding</span>
+                <span><kbd class="kbd">b</kbd></span><span>Triage as 🚫 Block</span>
+                <span><kbd class="kbd">m</kbd></span><span>Triage as 💬 Comment</span>
+                <span><kbd class="kbd">x</kbd></span><span>Triage as 🔇 Dismiss</span>
+                <span><kbd class="kbd">?</kbd></span><span>Toggle Guide &amp; Focus panel</span>
+              </div>
+              <div style="margin-top:8px;font:500 11px/1.5 var(--mono);background:var(--well);padding:6px 8px;border-radius:4px;border:1px solid var(--rule);">
+                <div>crv review &lt;pr&gt;          # Review &amp; live publish</div>
+                <div>crv review &lt;pr&gt; --fast   # Fast low-effort pass</div>
+                <div>crv review &lt;pr&gt; --dry-run # Local preview only</div>
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+    </aside>
   </div>
 
   <!-- Native modal dialog with light-dismiss (closedby="any") -->

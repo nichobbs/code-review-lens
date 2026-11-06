@@ -6,16 +6,27 @@ Read `references/patterns.md` before this lens runs. Find callers and copies wit
 
 ## Looks for
 
-Run the four checks in this order.
+Run the five checks in this order.
 
-1. **Reuse before new.** Inspect `attentionSignals.reuseCandidates` and `attentionSignals.addedSymbols` in `<scratch>/layers.json` first. For each client, helper, error type, interceptor or config loader the diff adds, grep the repository for one that already does the job (or check whether the diff defines the same helper in two files). If one exists, the finding is to use it, with its path. When a repository standard already covers reuse, leave it to the standards lens.
-2. **Pattern fit.** Match the diff against the shapes in `references/patterns.md`. Recommend a pattern only when the shape is in the diff, and one of these holds: the repository already uses that pattern for a sibling case, which you name as the precedent; the shape occurs three or more times; or two copies already change together by hand, which you show from `git log`. Apply the deletion test: a module whose removal would only move its calls into its callers adds nothing. A new seam needs two adapters, and a test fake counts as one.
+1. **Delete & YAGNI (6-part Lean taxonomy).** Apply the deletion test to new abstractions in the diff:
+   - **Delete:** dead branches, unused exports, or speculative options/parameters with no caller in `<head>`.
+   - **Reuse:** inspect `attentionSignals.reuseCandidates` and `attentionSignals.addedSymbols` in `<scratch>/layers.json`. For each client, helper, error type, interceptor, or config loader the diff adds, grep the repository for one that already does the job (or check whether the diff defines the same helper in two files). If one exists, the finding is to use it, with its `path:line`.
+   - **Stdlib / native over new dependency:** flag a newly added third-party package or custom utility when the language runtime or standard library (`crypto.randomUUID`, `structuredClone`, `URLSearchParams`, `fs.promises`, `Array.prototype`) already provides it in 1–3 lines.
+   - **Single-implementation wrapper (`yagni`):** a new interface, abstract class, factory, or wrapper module with only one implementation (and no test fake that requires the seam) whose removal would only inline its calls into its caller.
+   - **Merge pass-through layers:** a function or file that only forwards arguments unchanged to another function.
+   - **Split by job, never by line count:** flag an arbitrary split where one cohesive job was chopped across files by line count, or a single function that mixes I/O orchestration with pure domain calculation.
+   When a finding removes unnecessary code or reuses an existing helper, set `leanSavedLines` (positive integer) on the finding to the approximate number of lines the author can delete.
+2. **Pattern fit.** Match the diff against the shapes in `references/patterns.md`. Recommend a pattern only when the shape is in the diff, and one of these holds: the repository already uses that pattern for a sibling case, which you name as the precedent (`attentionSignals.specAlignment.repoPrecedents` or grep); the shape occurs three or more times; or two copies already change together by hand, which you show from `git log`.
 3. **One source of truth.** For each literal the diff adds or changes (an environment variable name, a topic or subscription name, a bucket or collection name, a URL, a timeout, a flag key, an enum value, a schema field), grep the repository for the same literal. Report when another copy exists and both copies must agree for the system to work: a second copy of a value the repository defines once, or a hard-coded value the repository loads from config. When the diff changes one copy and leaves another, hand the finding to the correctness lens. When a repository standard says where configuration lives, leave the finding to the standards lens.
 4. **Smells.** Report the smells that `references/patterns.md` lists as visible in a diff hunk, when the trigger matches and no exception applies. Report the others only after reading the files around the change, and say in `reasoning` that you did. Prefix every smell with "possible".
+5. **Shortcut & deferral ledger (`attentionSignals.shortcuts`).** Inspect `attentionSignals.shortcuts` in `<scratch>/layers.json`:
+   - When a `shortcut:`, `ponytail:`, `TODO:`, or `FIXME:` comment added in the diff has `rotRisk: true` (no concrete ceiling and upgrade trigger), report a `low` finding asking the author either to add the ceiling and upgrade trigger (`// shortcut: <ceiling>, <upgrade>`) or to address the deferral now.
+   - When a comment has `hasTrigger: true` (`// shortcut: <ceiling>, <upgrade>`) and the expected load from Step 2 stays below `<ceiling>`, respect the shortcut and do not raise a structure finding against it.
 
 ## Never reports
 
 - A pattern because it is good practice in general. No shape in the diff, or no precedent and no repetition, means no finding.
+- A bounded `// shortcut: <ceiling>, <upgrade>` whose `<ceiling>` holds under the expected load.
 - A literal that appears twice for different reasons, such as the same text as a log message and as a topic name.
 - Anything a repository standard endorses. The standard wins.
 - Structure the diff does not add or make worse.

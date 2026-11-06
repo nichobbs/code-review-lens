@@ -18,6 +18,7 @@ const CONTRACT_PATTERNS = [
   /openapi-spec/i,
   /\.openapi\./i,
   /schema/i,
+  /contract/i,
   /models\.ts$/i,
   /member-status\.ts$/i,
   /feature-flag/i,
@@ -206,9 +207,13 @@ function parseUnifiedDiff(diffText) {
     if (classification.layer === 'tests') {
       fileEntry.testMatrix = extractTestCasesFromHunks(filePath, hunks);
       fileEntry.internalMocks = extractInternalMocksFromHunks(hunks);
+      fileEntry.shortcuts = [];
     } else if (classification.layer === 'flows' || classification.layer === 'contracts') {
       fileEntry.removedGuards = extractRemovedGuardsFromHunks(filePath, hunks);
       fileEntry.addedSymbols = extractAddedSymbolsFromHunks(filePath, hunks);
+      fileEntry.shortcuts = extractShortcutsFromHunks(filePath, hunks);
+    } else {
+      fileEntry.shortcuts = extractShortcutsFromHunks(filePath, hunks);
     }
 
     files.push(fileEntry);
@@ -324,6 +329,277 @@ function extractAddedSymbolsFromHunks(filePath, hunks) {
   }
 
   return added.filter((s) => !deletedNames.has(s.name));
+}
+
+/**
+ * Extracts deliberate shortcut (`shortcut:` / `ponytail:`) and deferral (`TODO:` / `FIXME:`)
+ * comments added in diff hunks. Distinguishes bounded shortcuts with an explicit ceiling + upgrade
+ * path (`hasTrigger: true`) from unbounded deferrals (`rotRisk: true`).
+ */
+function extractShortcutsFromHunks(filePath, hunks) {
+  if (Array.isArray(filePath)) {
+    const all = [];
+    for (const f of filePath) {
+      if (f.layer === 'tests') continue;
+      all.push(...extractShortcutsFromHunks(f.path, f.hunks));
+    }
+    return all;
+  }
+  const normPath = String(filePath || '').replace(/\\/g, '/');
+  if (/\.(?:md|mdx|txt|rst)$/i.test(normPath) || TEST_PATTERNS.some((re) => re.test(normPath))) {
+    return [];
+  }
+
+  const shortcuts = [];
+  // Match full-line comments or trailing comments not enclosed in quotes or backticks
+  const fullLineCommentRe = /^\s*(?:\/\/|#|\/\*+|\*)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)(?:\*\/)?$/i;
+  const trailingCommentRe = /^[^'"`]*?(?:\/\/|#)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)$/i;
+
+  for (const hunk of hunks || []) {
+    for (const l of hunk.lines || []) {
+      if (l.type !== 'add') continue;
+      const text = String(l.content || '').trim();
+      const m = fullLineCommentRe.exec(text) || trailingCommentRe.exec(text);
+      if (!m) continue;
+
+      const marker = m[1].toLowerCase();
+      const body = m[2].trim();
+      let ceiling = '';
+      let upgrade = '';
+      let hasTrigger = false;
+
+      if (marker === 'shortcut' || marker === 'ponytail') {
+        const splitMatch = /^([^,;—–-]+?)(?:\s*(?:,|;|->|→|—|–|\bwhen\b|\buntil\b|\bbefore\b)\s*)(.+)$/i.exec(body);
+        if (splitMatch && splitMatch[1].trim().length >= 3 && splitMatch[2].trim().length >= 3) {
+          ceiling = splitMatch[1].trim();
+          upgrade = splitMatch[2].trim();
+          hasTrigger = true;
+        } else {
+          ceiling = body;
+          hasTrigger = false;
+        }
+      } else {
+        const triggerMatch = /\b(?:when|until|after|before|once|at\s+\d+|#[0-9]+|[A-Z]{2,}-\d+)\b/i.exec(body);
+        hasTrigger = Boolean(triggerMatch);
+        ceiling = body;
+      }
+
+      shortcuts.push({
+        path: filePath,
+        line: l.newNumber,
+        marker,
+        kind: marker,
+        text: body.slice(0, 200),
+        ceiling,
+        upgrade,
+        hasTrigger,
+        rotRisk: !hasTrigger
+      });
+    }
+  }
+  return shortcuts;
+}
+
+/**
+ * Parses a GitHub/GitLab CODEOWNERS file into ordered `{ pattern, regex, owners }` rules.
+ */
+function parseCodeowners(codeownersText) {
+  if (!codeownersText || typeof codeownersText !== 'string') return [];
+  const rules = [];
+  for (const rawLine of codeownersText.split(/\r?\n/)) {
+    const stripped = rawLine.replace(/\s+#.*$/, '').trim();
+    if (!stripped || stripped.startsWith('#')) continue;
+    const parts = stripped.split(/\s+/);
+    if (parts.length < 2) continue;
+    const pattern = parts[0];
+    const owners = parts.slice(1).filter((p) => p.startsWith('@') || p.includes('@'));
+    if (!owners.length) continue;
+
+    const clean = pattern.replace(/^\//, '').replace(/\/$/, '');
+    const anchored = pattern.startsWith('/') || clean.includes('/');
+    const dirOnly = pattern.endsWith('/');
+    const endsWithSingleWildcard = /(?:^|\/)\*[^/]*$/.test(clean) && !/\*\*$/.test(clean);
+    const escaped = clean
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\?/g, '[^/]')
+      .replace(/\/\*\*\//g, '__SLASH_DOUBLE_STAR_SLASH__')
+      .replace(/\*\*/g, '__DOUBLE_STAR__')
+      .replace(/\*/g, '[^/]*')
+      .replace(/__SLASH_DOUBLE_STAR_SLASH__/g, '(?:/.*)?/')
+      .replace(/__DOUBLE_STAR__/g, '.*');
+
+    const suffix = dirOnly ? '(?:/.*)?$' : endsWithSingleWildcard ? '$' : '(?:/.*|$)';
+    const regexStr =
+      pattern === '*'
+        ? '^.*$'
+        : `${anchored ? '^' : '(?:^|/)'}${escaped}${suffix}`;
+    try {
+      rules.push({ pattern, regex: new RegExp(regexStr), owners });
+    } catch (e) {}
+  }
+  return rules;
+}
+
+/**
+ * Matches a repository-relative file path against parsed CODEOWNERS rules (last match wins).
+ */
+function matchCodeowners(filePath, rules = []) {
+  const norm = String(filePath || '').replace(/\\/g, '/').replace(/^\//, '');
+  let matched = [];
+  for (const rule of rules || []) {
+    if (rule.regex && rule.regex.test(norm)) {
+      matched = rule.owners;
+    }
+  }
+  return matched;
+}
+
+/**
+ * Parses PR / ticket description text for:
+ * - `outOfScope`: Negative Space / Out-of-Scope / Do-Not-Touch constraints
+ * - `repoPrecedents`: Repo Precedent / Mirror references
+ * - `specClauses`: BDD (`Given/When/Then`) and EARS (`WHEN ... SHALL`, `IF ... THEN ... SHALL`, `WHILE ... SHALL`) clauses
+ * Cross-checks changed files against `outOfScope` (`negativeSpaceViolations`) and `specClauses` against `testMatrix`.
+ */
+function analyzeSpecAlignment(parsedFiles = [], prMeta = null) {
+  const body = String((prMeta && prMeta.body) || '');
+  const outOfScope = [];
+  const repoPrecedents = [];
+  const rawClauses = [];
+
+  if (body.trim()) {
+    const lines = body.split(/\r?\n/);
+    let section = '';
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      const headingMatch = /^#{1,4}\s+(.+)$/.exec(line) || /^\*\*([^*]+)\*\*[:.]?$/.exec(line);
+      if (headingMatch) {
+        const h = headingMatch[1].toLowerCase();
+        if (/out of scope|non-goals?|negative space|do not touch|untouched/i.test(h)) {
+          section = 'out-of-scope';
+        } else if (/repo precedent|precedent|mirror/i.test(h)) {
+          section = 'precedent';
+        } else if (/acceptance|scenarios?|requirements?|behaviour|behavior|ears|bdd/i.test(h)) {
+          section = 'spec';
+        } else {
+          section = '';
+        }
+        continue;
+      }
+
+      const inlineOos = /^(?:[-*]\s+)?(?:\*{1,2})?(?:out of scope|do not touch|negative space|leave untouched)(?:\*{1,2})?[:\s-]+(.+)$/i.exec(line);
+      if (inlineOos) {
+        outOfScope.push(inlineOos[1].trim());
+        continue;
+      }
+
+      const inlinePrec = /^(?:[-*]\s+)?(?:\*{1,2})?(?:repo precedent|precedent|mirror)(?:\*{1,2})?[:\s-]+(.+)$/i.exec(line);
+      if (inlinePrec) {
+        repoPrecedents.push(inlinePrec[1].trim());
+        continue;
+      }
+
+      const bullet = /^[-*]\s+(.+)$/.exec(line) || /^\d+\.\s+(.+)$/.exec(line);
+      const itemText = bullet ? bullet[1].trim() : line;
+
+      if (section === 'out-of-scope' && bullet) {
+        outOfScope.push(itemText);
+        continue;
+      } else if (section === 'precedent' && bullet) {
+        repoPrecedents.push(itemText);
+        continue;
+      }
+
+      const unbackticked = itemText.replace(/`[^`]*`/g, '');
+      const allowSpecMatch =
+        section === 'spec' || /^(?:given|when|while|if)\s+/i.test(unbackticked.trim());
+      if (allowSpecMatch) {
+        if (/\bGiven\s+[\s\S]+\bWhen\s+[\s\S]+\bThen\s+/i.test(unbackticked)) {
+          rawClauses.push({ kind: 'BDD', clause: itemText.slice(0, 220) });
+        } else if (
+          /\b(?:WHEN|WHILE)\s+[^.]+?\bSHALL\s+|\bIF\s+[^.]+?\bTHEN\s+[^.]+?\bSHALL\s+/i.test(unbackticked)
+        ) {
+          rawClauses.push({ kind: 'EARS', clause: itemText.slice(0, 220) });
+        }
+      }
+    }
+  }
+
+  const negativeSpaceViolations = [];
+  if (outOfScope.length > 0) {
+    for (const f of parsedFiles || []) {
+      if ((f.additions || 0) + (f.deletions || 0) === 0) continue;
+      const normPath = String(f.path || '').toLowerCase().replace(/\\/g, '/');
+      for (const item of outOfScope) {
+        const cleanToken = (t) => t.toLowerCase().trim().replace(/^[.,:;!?'"]+|[.,:;!?'"]+$/g, '').replace(/^\/+|\/+$/g, '');
+        const isPathLike = (t) =>
+          t.length >= 4 &&
+          (t.includes('/') || /\.[a-z0-9]{1,5}$/i.test(t));
+        const backticks = [...item.matchAll(/`([^`]+)`/g)].map((m) => cleanToken(m[1])).filter(isPathLike);
+        const pathTokens = item
+          .split(/[\s,;()]+/)
+          .map(cleanToken)
+          .filter(isPathLike);
+        const candidates = [...new Set([...backticks, ...pathTokens])];
+        const matchedToken = candidates.find((c) => {
+          const esc = c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`(?:^|/)${esc}(?:/|$)`).test(normPath);
+        });
+        if (matchedToken) {
+          negativeSpaceViolations.push({
+            path: f.path,
+            matchedToken,
+            outOfScopeItem: item,
+            reason: `File "${f.path}" was modified (+${f.additions}/-${f.deletions}) despite Negative Space / Out-of-Scope constraint: "${item}"`
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  const allTests = [];
+  for (const f of parsedFiles || []) {
+    for (const tc of f.testMatrix || []) {
+      if (!tc.hollow) {
+        allTests.push({
+          file: f.path,
+          behavior: tc.behavior,
+          text: `${tc.suite || ''} ${tc.behavior || ''}`.toLowerCase()
+        });
+      }
+    }
+  }
+
+  const stopWords = new Set(['given', 'when', 'then', 'shall', 'should', 'while', 'system', 'service', 'request', 'response', 'return', 'returns', 'with', 'from', 'that', 'this', 'into', 'only']);
+  const specClauses = rawClauses.map((sc) => {
+    const keywords = sc.clause
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/)
+      .filter((w) => w.length >= 4 && !stopWords.has(w));
+    const matchedTests = allTests
+      .filter((t) => {
+        if (keywords.length === 0) return false;
+        const hits = keywords.filter((kw) => t.text.includes(kw));
+        return hits.length >= Math.min(2, keywords.length);
+      })
+      .map((t) => `${t.file}: ${t.behavior}`);
+    return {
+      kind: sc.kind,
+      clause: sc.clause,
+      covered: matchedTests.length > 0,
+      matchedTests: matchedTests.slice(0, 3)
+    };
+  });
+
+  return {
+    outOfScope,
+    repoPrecedents,
+    negativeSpaceViolations,
+    specClauses
+  };
 }
 
 /**
@@ -468,11 +744,15 @@ function formatHunksAsRawDiff(fileObj) {
 function analyzeAttentionSignals(parsedFiles = [], options = {}) {
   const removedGuards = [];
   const addedSymbols = [];
+  const shortcuts = [];
   const symbolToFiles = new Map();
 
   for (const f of parsedFiles || []) {
     if (Array.isArray(f.removedGuards)) {
       removedGuards.push(...f.removedGuards);
+    }
+    if (Array.isArray(f.shortcuts)) {
+      shortcuts.push(...f.shortcuts);
     }
     if (Array.isArray(f.addedSymbols)) {
       for (const sym of f.addedSymbols) {
@@ -535,7 +815,16 @@ function analyzeAttentionSignals(parsedFiles = [], options = {}) {
     }
   }
 
+  const specAlignment = analyzeSpecAlignment(parsedFiles, prMeta);
+  const rotRiskShortcuts = shortcuts.filter((s) => s.rotRisk);
+  const uncoveredClauses = (specAlignment.specClauses || []).filter((c) => !c.covered);
+
   const humanFocusPrompts = [];
+  if (specAlignment.negativeSpaceViolations.length > 0) {
+    humanFocusPrompts.push(
+      `Check ${specAlignment.negativeSpaceViolations.length} Negative-Space violation(s) (${specAlignment.negativeSpaceViolations.map((v) => v.path).slice(0, 3).join(', ')}) touching files marked Out-of-Scope.`
+    );
+  }
   if (removedGuards.length > 0) {
     humanFocusPrompts.push(
       `Inspect ${removedGuards.length} removed guard(s) (${removedGuards.map((g) => `${g.path}:${g.newLine}`).slice(0, 3).join(', ')}) to confirm defensive checks were not silently dropped.`
@@ -551,12 +840,24 @@ function analyzeAttentionSignals(parsedFiles = [], options = {}) {
       `Check ${reuseCandidates.length} newly added helper(s) (${reuseCandidates.map((r) => `\`${r.name}\``).slice(0, 3).join(', ')}) that overlap existing symbols.`
     );
   }
+  if (rotRiskShortcuts.length > 0) {
+    humanFocusPrompts.push(
+      `Review ${rotRiskShortcuts.length} unbounded deferral/shortcut comment(s) (${rotRiskShortcuts.map((s) => `${s.path}:${s.line}`).slice(0, 3).join(', ')}) missing a ceiling and upgrade trigger.`
+    );
+  }
+  if (uncoveredClauses.length > 0) {
+    humanFocusPrompts.push(
+      `Verify ${uncoveredClauses.length} EARS/BDD acceptance clause(s) from the PR description that have no matching test in Layer 4.`
+    );
+  }
 
   return {
     removedGuards,
     addedSymbols,
     reuseCandidates,
     stealthChanges,
+    shortcuts,
+    specAlignment,
     humanFocusPrompts
   };
 }
@@ -584,6 +885,11 @@ function buildLayersFromParsedDiff(parsedFiles, issues = [], options = {}) {
     return [...new Set(out)];
   };
 
+  const codeownersRules =
+    options.codeownersRules ||
+    (options.codeownersText ? parseCodeowners(options.codeownersText) : []);
+  const callerBlastMap = options.callerBlastRadius || options.callerBlastRadiusByPath || {};
+
   const contracts = [];
   const flowsMap = new Map();
   const testMatrix = [];
@@ -593,6 +899,7 @@ function buildLayersFromParsedDiff(parsedFiles, issues = [], options = {}) {
     const linkedFindings = findMatchingIds(f.path);
     if (f.layer === 'contracts') {
       const summary = `${f.category} (+${f.additions} / -${f.deletions})`;
+      const owners = codeownersRules.length ? matchCodeowners(f.path, codeownersRules) : [];
       contracts.push({
         path: f.path,
         category: f.category,
@@ -601,6 +908,8 @@ function buildLayersFromParsedDiff(parsedFiles, issues = [], options = {}) {
         summary,
         diffSummary: summarizeContractDiff(f),
         removedGuards: f.removedGuards || [],
+        owners,
+        callerBlastRadius: callerBlastMap[f.path] || null,
         findings: linkedFindings,
         linkedFindings
       });
@@ -1020,6 +1329,10 @@ module.exports = {
   parseUnifiedDiff,
   extractRemovedGuardsFromHunks,
   extractAddedSymbolsFromHunks,
+  extractShortcutsFromHunks,
+  parseCodeowners,
+  matchCodeowners,
+  analyzeSpecAlignment,
   extractInternalMocksFromHunks,
   extractTestCasesFromHunks,
   analyzeAttentionSignals,

@@ -15,6 +15,8 @@ const {
   createWorkbenchServer,
   isAllowedHostHeader,
   validateReviewPayload,
+  alignInlineCommentsToHunks,
+  validateThreadUpdates,
   parsePrTargetInput,
   buildCsp
 } = require('../packages/cli/server');
@@ -364,4 +366,35 @@ test('no leftover "13-lens" wording and no .tu-skills lookups in shipped code', 
   }
   const lensCount = fs.readdirSync(path.join(root, '.agents/skills/crv-code-review/lenses')).length;
   assert.equal(lensCount, 14);
+});
+
+test('merged: hunk alignment runs before validation and does not mutate its input', () => {
+  const report = {
+    DATA: [{ id: 'A1', loc: 'src/a.ts:50', diffSlice: { path: 'src/a.ts', lines: [{ newNumber: 10 }, { newNumber: 11 }] } }]
+  };
+  const input = { event: 'COMMENT', body: 'b', commit_id: 'not-a-sha', comments: [{ path: 'src/a.ts', line: 50, body: 'x' }] };
+  const aligned = alignInlineCommentsToHunks(input, report);
+  assert.equal(input.comments[0].line, 50);
+  assert.equal(aligned.comments[0].line, 10);
+  assert.equal(aligned.commit_id, undefined);
+  const safe = validateReviewPayload(aligned, { allowApprove: false });
+  assert.equal(safe.comments[0].line, 10);
+  assert.throws(() => validateReviewPayload({ ...aligned, event: 'APPROVE' }, { allowApprove: false }), /not allowed/);
+});
+
+test('merged: thread updates only apply to known trusted threads with server-side ids', () => {
+  const report = { GITHUB_STATE: { findingThreads: { H1: { commentId: 9001, threadId: 'PRRT_kwDO_H1' } } } };
+  const out = validateThreadUpdates(
+    [
+      { id: 'H1', commentId: 9001, threadId: 'EVIL', body: 'reply', resolutionAction: 'resolve' },
+      { id: 'H1', commentId: 1234, body: 'wrong comment id' },
+      { id: 'H9', commentId: 9001, body: 'unknown thread' },
+      { id: '__proto__', commentId: 1 }
+    ],
+    report
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0].threadId, 'PRRT_kwDO_H1');
+  assert.equal(out[0].commentId, 9001);
+  assert.deepEqual(validateThreadUpdates('nope', report), []);
 });

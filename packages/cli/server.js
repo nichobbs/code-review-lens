@@ -7,7 +7,9 @@ const path = require('path');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const {
+  REVIEW_THREADS_GRAPHQL_QUERY,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   parseUnifiedDiff,
   extractDiffSlice,
@@ -24,7 +26,8 @@ const {
   isValidRepoSlug,
   parsePrNumber,
   resolveTrustedAuthors,
-  foldCommentsIntoBody
+  foldCommentsIntoBody,
+  capComment
 } = require('../core');
 const { sanitizeReport } = require('../ui/sanitize.js');
 
@@ -79,8 +82,21 @@ function reportFromParsedJson(parsed, resolved, options) {
     if (warnings.length) {
       console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
     }
+    const dir = path.dirname(resolved);
+    const readSibling = (name, given) => {
+      if (given) return given;
+      const sibling = path.join(dir, name);
+      if (!fs.existsSync(sibling) || fs.statSync(sibling).size > MAX_REPORT_BYTES) return null;
+      try {
+        return JSON.parse(fs.readFileSync(sibling, 'utf8'));
+      } catch (e) {
+        return null;
+      }
+    };
+    const prMeta = readSibling('pr-meta.json', options.prMeta);
+    const layers = readSibling('layers.json', options.layers);
     // The compiler escapes agent text itself, so its output is already inside the allow-list.
-    return compileFindingsToWorkbenchReport(parsed, { diffText, outPath: options.outPath });
+    return compileFindingsToWorkbenchReport(parsed, { diffText, prMeta, layers, outPath: options.outPath });
   }
   return sanitizeReport(parsed);
 }
@@ -118,13 +134,33 @@ function spawnGhAsync(args, options = {}) {
   });
 }
 
+function extractGhErrorMessage(res) {
+  const stderr = (res.stderr || '').trim();
+  const stdout = (res.stdout || '').trim();
+  if (stdout) {
+    try {
+      const parsed = JSON.parse(stdout);
+      const details = Array.isArray(parsed.errors)
+        ? parsed.errors.map((e) => (typeof e === 'string' ? e : e.message || JSON.stringify(e))).join('; ')
+        : '';
+      if (details) {
+        return `${stderr || parsed.message || 'gh api error'}: ${details}`;
+      }
+      if (parsed.message && !stderr.includes(parsed.message)) {
+        return `${stderr} (${parsed.message})`.trim();
+      }
+    } catch (e) {}
+  }
+  return stderr || stdout || 'gh api failed';
+}
+
 async function runGhApiAsync(args, inputStr) {
   const res = await spawnGhAsync(['api', ...args], {
     input: inputStr,
     maxBuffer: 20 * 1024 * 1024
   });
   if (res.status !== 0) {
-    throw new Error((res.stderr || res.stdout || 'gh api failed').trim());
+    throw new Error(extractGhErrorMessage(res));
   }
   return res.stdout;
 }
@@ -192,9 +228,10 @@ async function listRecentPrsAsync(explicitRepo, limit = 10) {
 }
 
 function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hydrated }) {
+  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
   if (!diffText) {
     const diffCandidates = [
-      path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
+      path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
     ];
     const stagedDiffPath = diffCandidates.find((p) => fs.existsSync(p));
     if (stagedDiffPath) {
@@ -202,16 +239,28 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
     }
   }
 
-  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json
-  const scratchCandidates = [
-    path.resolve(process.cwd(), `.crv-skills/crv-code-review/${prNumInt}/findings.json`)
-  ];
-  const scratchFindingsPath = scratchCandidates.find((p) => fs.existsSync(p));
-  if (scratchFindingsPath) {
+  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json matching this repo
+  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}`);
+  const scratchFindingsPath = path.join(scratchDir, 'findings.json');
+  const scratchLayersPath = path.join(scratchDir, 'layers.json');
+  let stagedLayers = null;
+  if (fs.existsSync(scratchLayersPath)) {
+    try {
+      stagedLayers = JSON.parse(fs.readFileSync(scratchLayersPath, 'utf8'));
+    } catch (e) {}
+  }
+  if (fs.existsSync(scratchFindingsPath)) {
     const findingsJson = JSON.parse(fs.readFileSync(scratchFindingsPath, 'utf8'));
-    const compiled = compileFindingsToWorkbenchReport(findingsJson, { diffText });
-    compiled.GITHUB_STATE = hydrated;
-    return compiled;
+    const findingsRepo = findingsJson?.meta?.review?.repo || findingsJson?.REVIEW?.repo || '';
+    if (!findingsRepo || !repo || String(findingsRepo).toLowerCase() === String(repo).toLowerCase()) {
+      const compiled = compileFindingsToWorkbenchReport(findingsJson, {
+        diffText,
+        prMeta,
+        layers: stagedLayers
+      });
+      compiled.GITHUB_STATE = hydrated;
+      return compiled;
+    }
   }
 
   // If loading the bundled demo fixture PR and its repo matches, enrich and return it
@@ -232,12 +281,20 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
   // Reconstruct any existing CRV findings previously published to GitHub PR comments
   for (const ft of Object.values(hydrated?.findingThreads || {})) {
     const loc = ft.meta?.loc || (ft.path ? `${ft.path}:${ft.line || 1}` : '');
+    const inferredState = ft.state || (ft.isResolved ? 'fixed' : 'open');
     autoIssues.push({
       id: ft.id,
       sev: ft.meta?.sev || 'medium',
       cat: ft.meta?.cat || 'github-crv',
       verify: ft.meta?.verify || 'CONFIRMED',
-      suggestedTriage: ft.action || 'comment',
+      suggestedTriage: inferredState === 'fixed' || inferredState === 'dropped' ? 'dismiss' : ft.action || 'comment',
+      status:
+        inferredState !== 'open' || ft.isResolved
+          ? {
+              state: inferredState,
+              note: ft.isResolved ? 'Marked resolved on GitHub PR review thread.' : `Thread state: ${inferredState}`
+            }
+          : undefined,
       loc,
       title: ft.title || `Finding ${ft.id}`,
       impact: `**Breaks:** Published CRV finding thread on GitHub by \`@${ft.author}\`.\n\n**Because:** ${ft.note || 'See GitHub review thread.'}\n\n**Reach:** Inline thread at \`${loc || 'PR'}\`.`,
@@ -263,7 +320,7 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
   }
 
   // Flag any hollow or mock-only tests automatically from Layer 4
-  const preLayers = buildLayersFromParsedDiff(parsedFiles, []);
+  const preLayers = buildLayersFromParsedDiff(parsedFiles, [], { prMeta });
   let testIdx = 1;
   for (const tm of preLayers.testMatrix) {
     for (const c of tm.cases) {
@@ -329,7 +386,11 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
     issues: autoIssues
   };
 
-  const compiled = compileFindingsToWorkbenchReport(syntheticFindings, { diffText });
+  const compiled = compileFindingsToWorkbenchReport(syntheticFindings, {
+    diffText,
+    prMeta,
+    layers: stagedLayers
+  });
   compiled.GITHUB_STATE = hydrated;
   return compiled;
 }
@@ -496,6 +557,23 @@ async function syncReportWithGitHubAsync(report, ctx = {}) {
       trustedAuthors: await getTrustedAuthors(ctx.trustedAuthors),
       currentHead: report?.REVIEW?.head
     });
+    try {
+      const [owner, name] = String(repo).split('/');
+      if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
+        const gqlOut = await runGhApiAsync([
+          'graphql',
+          '-f',
+          `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
+          '-F',
+          `owner=${owner}`,
+          '-F',
+          `name=${name}`,
+          '-F',
+          `pr=${pr}`
+        ]);
+        mergeGraphqlReviewThreads(hydrated, gqlOut);
+      }
+    } catch (e) {}
 
     const diffText = await resolvePrDiffAsync({
       repo,
@@ -518,6 +596,31 @@ async function syncReportWithGitHubAsync(report, ctx = {}) {
   } catch (err) {
     return { synced: false, reason: err.message };
   }
+}
+
+function formatReportPageTitle(report) {
+  if (!report) return 'Agentic PR Review Workbench';
+  const urlMatch = /github\.com\/([^/]+\/([^/]+))\/pull\/(\d+)/i.exec(report.PR?.url || '');
+  const rawRepo = report.REVIEW?.repo || (urlMatch ? urlMatch[1] : '');
+  const repoShort = rawRepo ? rawRepo.split('/').pop() : urlMatch ? urlMatch[2] : '';
+  const rawTitle = String(report.XMETA?.title || '').trim();
+  const titlePrMatch = /^PR\s*#(\d+)/i.exec(rawTitle);
+  const labelPrMatch = /#(\d+)/.exec(report.PR?.label || '');
+  const prNum =
+    report.REVIEW?.pr ||
+    (urlMatch ? urlMatch[3] : '') ||
+    (titlePrMatch ? titlePrMatch[1] : '') ||
+    (labelPrMatch ? labelPrMatch[1] : '');
+  const cleanTitle = rawTitle.replace(/^PR\s*#\d+\s*[:—–-]\s*/i, '').trim();
+
+  const prefixParts = [];
+  if (prNum) prefixParts.push(`#${prNum}`);
+  if (repoShort) prefixParts.push(repoShort);
+  const prefix = prefixParts.join(' · ');
+
+  if (prefix && cleanTitle) return `${prefix} — ${cleanTitle}`;
+  if (prefix) return `${prefix} — CRV Workbench`;
+  return rawTitle || 'Agentic PR Review Workbench';
 }
 
 const CSP_META_RE = /(<meta http-equiv="Content-Security-Policy" content=")[^"]*(">)/;
@@ -569,6 +672,10 @@ function buildStandaloneHtml(report) {
     issues: report.DATA || []
   };
   const safeRawFindings = escapeJsonForScript(rawFindingsPayload);
+  const safePageTitle = formatReportPageTitle(report)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
   const inlineScripts = [
     `window.__CRV_INITIAL_REPORT__ = ${safeJson};`,
@@ -581,6 +688,7 @@ function buildStandaloneHtml(report) {
     .join(' ');
 
   const html = template
+    .replace('<title>Agentic PR Review Workbench</title>', () => `<title>${safePageTitle}</title>`)
     .replace('<link rel="stylesheet" href="./workbench.css">', () => `<style>\n${css}\n</style>`)
     .replace(
       '<script src="./vendor/mermaid.min.js"></script>',
@@ -728,9 +836,85 @@ function validateReviewPayload(payload, { allowApprove = false } = {}) {
   return out;
 }
 
+/**
+ * Moves inline comment lines that are outside the PR diff hunks onto a valid line (or folds them into the
+ * review body) using the report's `diffSlice` data, so GitHub does not reject the whole review with HTTP 422.
+ * Runs BEFORE `validateReviewPayload` so validation sees the final payload. Does not mutate its input.
+ */
+function alignInlineCommentsToHunks(payload, report) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const out = { ...payload };
+  if (out.commit_id !== undefined && !/^[0-9a-f]{40}$/i.test(String(out.commit_id).trim())) {
+    delete out.commit_id;
+  }
+  if (!Array.isArray(out.comments) || !Array.isArray(report?.DATA)) return out;
+  const validInline = [];
+  const foldedOut = [];
+  for (const c of out.comments) {
+    if (!c || typeof c !== 'object') {
+      validInline.push(c); // left for validateReviewPayload to reject
+      continue;
+    }
+    const matchIssue = report.DATA.find(
+      (d) =>
+        d.loc === `${c.path}:${c.line}` ||
+        (typeof c.body === 'string' && c.body.includes(`"id":"${d.id}"`)) ||
+        (d.diffSlice && d.diffSlice.path === c.path)
+    );
+    if (matchIssue && matchIssue.diffSlice && Array.isArray(matchIssue.diffSlice.lines)) {
+      const rightLines = matchIssue.diffSlice.lines.map((l) => l.newNumber).filter((n) => Number.isFinite(n));
+      if (rightLines.length === 0) foldedOut.push(c);
+      else if (rightLines.includes(c.line)) validInline.push(c);
+      else validInline.push({ ...c, line: rightLines[0] });
+    } else if (matchIssue && 'diffSlice' in matchIssue && !matchIssue.diffSlice) {
+      foldedOut.push(c);
+    } else {
+      validInline.push(c);
+    }
+  }
+  out.comments = validInline;
+  if (foldedOut.length > 0) {
+    const extra = foldedOut.map((c) => `#### \u{1F4C4} \`${c.path}:${c.line}\`\n\n${c.body}`).join('\n\n---\n\n');
+    out.body = capComment(`${out.body || ''}\n\n---\n### Findings Outside Diff Hunks\n\n${extra}`.trim());
+  }
+  return out;
+}
+
+const MAX_THREAD_UPDATES = 100;
+
+/**
+ * Thread follow-ups (reply + resolve/unresolve) are only honoured for threads that exist in the loaded report's
+ * trusted `GITHUB_STATE.findingThreads`. The comment id, thread id and target come from server state, never from
+ * the client, so a request cannot reply to or resolve arbitrary comments.
+ */
+function validateThreadUpdates(raw, report) {
+  if (!Array.isArray(raw)) return [];
+  const threads = report?.GITHUB_STATE?.findingThreads || {};
+  const out = [];
+  for (const u of raw.slice(0, MAX_THREAD_UPDATES)) {
+    if (!u || typeof u !== 'object') continue;
+    const known = Object.prototype.hasOwnProperty.call(threads, String(u.id)) ? threads[String(u.id)] : null;
+    if (!known || !Number.isSafeInteger(Number(known.commentId)) || Number(u.commentId) !== Number(known.commentId)) continue;
+    const resolutionAction = u.resolutionAction === 'resolve' || u.resolutionAction === 'unresolve' ? u.resolutionAction : null;
+    const threadId = typeof known.threadId === 'string' && /^[A-Za-z0-9_=-]{1,200}$/.test(known.threadId) ? known.threadId : null;
+    out.push({
+      id: String(u.id),
+      commentId: Number(known.commentId),
+      threadId,
+      body: typeof u.body === 'string' ? u.body.slice(0, MAX_REVIEW_BODY) : '',
+      resolutionAction,
+      state: typeof u.state === 'string' ? u.state.slice(0, 40) : undefined,
+      action: typeof u.action === 'string' ? u.action.slice(0, 40) : undefined,
+      head: typeof u.head === 'string' ? u.head.slice(0, 64) : undefined
+    });
+  }
+  return out;
+}
+
 function createWorkbenchServer(options = {}) {
   let report = options.report || loadReportFile(options.reportPath);
-  const allowLivePublish = Boolean(options.publish);
+  // Publishing is OFF unless explicitly requested (--publish); --dry-run / --no-publish force it off.
+  const allowLivePublish = options.dryRun ? false : Boolean(options.publish);
   const allowApprove = Boolean(options.allowApprove);
   let lastSubmittedPath = options.lastSubmittedPath || null;
   /** Private (0700) per-process directory: never a predictable, world-writable /tmp path. */
@@ -977,31 +1161,101 @@ function createWorkbenchServer(options = {}) {
           err.statusCode = 409;
           throw err;
         }
-        const safePayload = validateReviewPayload(payload, { allowApprove });
+        // 1. Align inline comment lines to the diff hunks (avoids HTTP 422), 2. then validate the FINAL payload.
+        const { threadUpdates: rawThreadUpdates, ...reviewInput } =
+          payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : { __invalid: payload };
+        const safePayload = validateReviewPayload(
+          '__invalid' in reviewInput ? payload : alignInlineCommentsToHunks(reviewInput, report),
+          { allowApprove }
+        );
+        const threadUpdates = validateThreadUpdates(rawThreadUpdates, report);
         const savePath = getLastSubmittedPath();
         fs.writeFileSync(
           savePath,
-          JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload: safePayload }, null, 2),
+          JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload: safePayload, threadUpdates }, null, 2),
           { mode: 0o600 }
         );
 
         if (allowLivePublish) {
-          const post = (body) =>
-            runGhApiAsync(['--method', 'POST', `repos/${activeRepo}/pulls/${activePr}/reviews`, '--input', '-'], JSON.stringify(body));
-          let out;
+          const reviewsPath = `repos/${activeRepo}/pulls/${activePr}/reviews`;
+          const post = (body) => runGhApiAsync(['--method', 'POST', reviewsPath, '--input', '-'], JSON.stringify(body));
+          const isUnprocessable = (e) => /HTTP 422|Unprocessable|could not be resolved|must be part of the diff/i.test(String((e && e.message) || ''));
           let mode = 'gh-api-live';
-          try {
-            out = await post(safePayload);
-          } catch (postErr) {
-            // One inline comment outside the diff makes GitHub reject the entire review (422): retry body-only.
-            if (safePayload.comments.length && /422|Unprocessable|could not be resolved|must be part of the diff/i.test(postErr.message)) {
-              out = await post(foldCommentsIntoBody(safePayload));
-              mode = 'gh-api-live-fallback-body';
-            } else {
-              throw postErr;
+          let out = '{}';
+          const shouldPostReview = safePayload.comments.length > 0 || Boolean(safePayload.body) || threadUpdates.length === 0;
+          if (shouldPostReview) {
+            try {
+              out = await post(safePayload);
+            } catch (firstErr) {
+              if (!isUnprocessable(firstErr)) throw firstErr;
+              // Retry 1: REQUEST_CHANGES on your own PR is rejected: downgrade to COMMENT (never escalates) and drop the commit pin.
+              const downgraded = { ...safePayload, event: 'COMMENT' };
+              delete downgraded.commit_id;
+              try {
+                out = await post(downgraded);
+                mode = 'gh-api-live (downgraded event to COMMENT for self-review)';
+              } catch (secondErr) {
+                if (!isUnprocessable(secondErr) || downgraded.comments.length === 0) throw secondErr;
+                // Retry 2: one inline comment outside the diff rejects the whole review: fold comments into the body.
+                out = await post(foldCommentsIntoBody(downgraded));
+                mode = 'gh-api-live-fallback-body (folded inline threads into review summary)';
+              }
             }
           }
-          sendJson(res, 200, { ok: true, mode, response: JSON.parse(out) });
+
+          // Follow-up replies and GraphQL resolve/unresolve, only for threads that exist in the loaded (trusted) report.
+          let repliedCount = 0;
+          let resolvedCount = 0;
+          let reopenedCount = 0;
+          for (const upd of threadUpdates) {
+            const existingThread = report?.GITHUB_STATE?.findingThreads?.[upd.id] || {};
+            const lastUpd = existingThread.lastUpdate || null;
+            const isDuplicateReply =
+              lastUpd && lastUpd.state === upd.state && lastUpd.action === upd.action && lastUpd.head && upd.head && lastUpd.head === upd.head;
+
+            if (!isDuplicateReply && upd.body) {
+              try {
+                await runGhApiAsync(
+                  ['--method', 'POST', `repos/${activeRepo}/pulls/${activePr}/comments/${upd.commentId}/replies`, '--input', '-'],
+                  JSON.stringify({ body: upd.body })
+                );
+                repliedCount++;
+              } catch (e) {}
+            }
+
+            if (upd.threadId && upd.resolutionAction) {
+              const mutationName = upd.resolutionAction === 'resolve' ? 'resolveReviewThread' : 'unresolveReviewThread';
+              const shouldMutate = upd.resolutionAction === 'resolve' ? existingThread.isResolved !== true : existingThread.isResolved !== false;
+              if (shouldMutate) {
+                try {
+                  await runGhApiAsync([
+                    'graphql',
+                    '-f',
+                    `query=mutation($threadId: ID!) { ${mutationName}(input: { threadId: $threadId }) { thread { id isResolved } } }`,
+                    '-F',
+                    `threadId=${upd.threadId}`
+                  ]);
+                  if (upd.resolutionAction === 'resolve') resolvedCount++;
+                  else reopenedCount++;
+                } catch (e) {}
+              }
+            }
+          }
+
+          if (repliedCount > 0 || resolvedCount > 0 || reopenedCount > 0) {
+            const bits = [];
+            if (repliedCount > 0) bits.push(`${repliedCount} thread repl${repliedCount === 1 ? 'y' : 'ies'}`);
+            if (resolvedCount > 0) bits.push(`${resolvedCount} resolved`);
+            if (reopenedCount > 0) bits.push(`${reopenedCount} reopened`);
+            mode += ` + ${bits.join(', ')}`;
+          }
+
+          try {
+            await syncReportWithGitHubAsync(report);
+            broadcastEvent('report-updated', { repo: report?.REVIEW?.repo, pr: report?.REVIEW?.pr });
+          } catch (e) {}
+
+          sendJson(res, 200, { ok: true, mode, savedTo: savePath, repliedCount, resolvedCount, reopenedCount, response: JSON.parse(out || '{}') });
         } else {
           sendJson(res, 200, {
             ok: true,
@@ -1065,6 +1319,8 @@ module.exports = {
   formatMissingRepoError,
   isAllowedHostHeader,
   validateReviewPayload,
+  alignInlineCommentsToHunks,
+  validateThreadUpdates,
   buildCsp,
   buildStandaloneHtml,
   createWorkbenchServer,
