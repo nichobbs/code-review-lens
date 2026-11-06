@@ -796,7 +796,7 @@ function readJsonBody(req, maxBytes = 2 * 1024 * 1024) {
 
 function createWorkbenchServer(options = {}) {
   let report = options.report || loadReportFile(options.reportPath);
-  const allowLivePublish = Boolean(options.publish);
+  const allowLivePublish = options.dryRun ? false : options.publish !== false;
   const lastSubmittedPath =
     options.lastSubmittedPath || path.join(os.tmpdir(), 'crv-last-submitted-review.json');
   const sseClients = new Set();
@@ -1051,13 +1051,20 @@ function createWorkbenchServer(options = {}) {
             }
           }
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, mode, response: JSON.parse(out) }));
+          res.end(
+            JSON.stringify({
+              ok: true,
+              mode,
+              savedTo: lastSubmittedPath,
+              response: JSON.parse(out)
+            })
+          );
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(
             JSON.stringify({
               ok: true,
-              mode: `dry-run (saved to ${lastSubmittedPath}; pass --publish for live GitHub POST)`,
+              mode: `dry-run (saved to ${lastSubmittedPath})`,
               savedTo: lastSubmittedPath
             })
           );

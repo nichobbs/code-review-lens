@@ -287,6 +287,14 @@ test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings
   assert.equal(prepOut.flowsCount, 1);
   assert.equal(prepOut.testCasesExtracted, 3);
   assert.equal(prepOut.hollowOrMockOnlyCases, 2);
+  assert.ok(Array.isArray(prepOut.triggeredLenses));
+  assert.ok(prepOut.triggeredLenses.includes('correctness'));
+  assert.ok(prepOut.triggeredLenses.includes('contract'));
+  assert.ok(prepOut.triggeredLenses.includes('tests'));
+  assert.ok(fs.existsSync(path.join(tmpDir, 'review-pack.md')));
+  const reviewPackText = fs.readFileSync(path.join(tmpDir, 'review-pack.md'), 'utf8');
+  assert.match(reviewPackText, /Pre-Computed Judge Lens Pick/);
+  assert.match(reviewPackText, /L12 \+  await repo\.updateStatus/);
 
   // Export standalone HTML and verify extract_findings.py recovers sampleFindings losslessly
   const htmlPath = path.join(tmpDir, 'pr1230-workbench.html');
@@ -413,7 +421,7 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
   const { PassThrough } = require('node:stream');
   const report = loadReportFile(path.join(__dirname, '../fixtures/pr1230-report.json'));
   const tmpSubmitPath = path.join(os.tmpdir(), `crv-test-submit-${Date.now()}.json`);
-  const { server } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath });
+  const { server } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath, dryRun: true });
 
   function invokeServer({ method = 'GET', url = '/', headers = {}, body = null }) {
     return new Promise((resolve, reject) => {

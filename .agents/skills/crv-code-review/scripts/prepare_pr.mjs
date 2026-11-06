@@ -63,6 +63,174 @@ function parseCli(argv) {
   return { diffPath, prInput, scratchDir, repo };
 }
 
+function scanRepoStandards(cwd) {
+  const candidates = [
+    'AGENTS.md',
+    'CLAUDE.md',
+    'CONTRIBUTING.md',
+    '.cursorrules',
+    '.github/copilot-instructions.md'
+  ];
+  const found = [];
+  for (const rel of candidates) {
+    const abs = path.join(cwd, rel);
+    if (fs.existsSync(abs)) {
+      found.push({ path: rel, scope: 'repo-wide' });
+    }
+  }
+  return found;
+}
+
+function pickTriggeredLenses(parsedFiles, prMeta, standardsList = []) {
+  const nonGenerated = (parsedFiles || []).filter(
+    (f) => !/(^|\/)(?:dist|generated|node_modules)\/|package-lock\.json$|pnpm-lock\.yaml$|yarn\.lock$/i.test(f.path)
+  );
+  const paths = nonGenerated.map((f) => f.path);
+  const addedContent = nonGenerated
+    .flatMap((f) => (f.hunks || []).flatMap((h) => (h.lines || []).filter((l) => l.type === 'add').map((l) => l.content)))
+    .join('\n');
+  const prBodyAndTitle = `${prMeta?.title || ''}\n${prMeta?.body || ''}`;
+
+  const pick = [
+    { lens: 'correctness', run: true, reason: 'always' },
+    { lens: 'adversarial', run: true, reason: 'always' }
+  ];
+
+  const hasCode = nonGenerated.some((f) => f.layer === 'flows' || f.layer === 'contracts');
+  pick.push({
+    lens: 'structure',
+    run: hasCode,
+    reason: hasCode ? 'code changed' : 'no production code changed'
+  });
+
+  const touchesStandardsFile = paths.some((p) => /(^|\/)(?:AGENTS|CLAUDE|CONTRIBUTING)\.md$|\.cursorrules$|\.github\/instructions\//i.test(p));
+  const runStandards = standardsList.length > 0 || touchesStandardsFile;
+  pick.push({
+    lens: 'standards',
+    run: runStandards,
+    reason: runStandards
+      ? touchesStandardsFile
+        ? 'standards/instruction file changed'
+        : `${standardsList.length} repo standard(s) apply`
+      : 'no repo standards files detected'
+  });
+
+  const topDirs = new Set(
+    nonGenerated
+      .filter((f) => f.layer === 'flows' || f.layer === 'contracts')
+      .map((f) => f.path.split('/').slice(0, 2).join('/'))
+  );
+  const runArch = topDirs.size >= 2 || nonGenerated.some((f) => f.layer === 'contracts');
+  pick.push({
+    lens: 'architecture',
+    run: runArch,
+    reason: runArch ? `touches ${topDirs.size} module(s) / contracts` : 'single module change'
+  });
+
+  const triggerRules = [
+    {
+      lens: 'security',
+      pathRe: /(?:auth|token|jwt|crypto|secret|iam|policy|middleware|interceptor|cors|csrf|cookie|session|Dockerfile|pnpm-workspace\.yaml|\.npmrc|\.env)/i,
+      contentRe: /\b(?:process\.env|verify\(|exec\(|execSync\(|spawn\(|spawnSync\(|eval\(|dangerouslySetInnerHTML|pull_request_target|rejectUnauthorized)\b/
+    },
+    {
+      lens: 'ai-harness',
+      pathRe: /(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|\.cursorrules|\.agents\/|\.claude\/|prompts\/|mcp|agent-runner)/i,
+      contentRe: /\b(?:generateText|streamText|chat\.completions|response_format|systemPrompt|system_prompt|invoke_subagent|define_subagent|call_mcp_tool|BypassSandbox)\b/
+    },
+    {
+      lens: 'data',
+      pathRe: /(?:migrations\/|dao\/|alembic|flyway|knex|repository|persistence|pubsub|subscriber)/i,
+      contentRe: /\b(?:transaction|upsert|ALTER\s+TABLE|DROP\s+COLUMN|idempotency|Firestore|DynamoDB|BigQuery)\b/i
+    },
+    {
+      lens: 'contract',
+      pathRe: /(?:openapi|\.proto$|\.graphql$|schema|contract|packages\/[^/]+\/index\.js$)/i,
+      contentRe: /\b(?:module\.exports|export\s+(?:interface|type|function|const)|deprecated|BREAKING)\b/
+    },
+    {
+      lens: 'infra',
+      pathRe: /(?:\.tf$|\.tfvars$|\.hcl$|Pulumi|cdk\.json|infra\/|Dockerfile|\.github\/workflows\/|\.github\/actions\/|renovate\.json|dependabot\.yml)/i,
+      contentRe: /\b(?:ignore_changes|prevent_destroy|deletion_protection|RemovalPolicy|id-token|pull_request_target)\b/
+    },
+    {
+      lens: 'tests',
+      pathRe: /(?:\.test\.|\.spec\.|__tests__\/|^test\/)/i,
+      contentRe: null
+    },
+    {
+      lens: 'operability',
+      pathRe: /(?:logger|metrics|alert|monitor|feature-flag|runbook)/i,
+      contentRe: /\b(?:logger\.|Counter\(|Histogram\(|Gauge\(|tracer\.)\b/
+    },
+    {
+      lens: 'performance',
+      pathRe: /(?:handler|worker|queue|batch|stream|cache)/i,
+      contentRe: /\b(?:Promise\.all\(|SELECT\s+\*|\.map\(\s*async)\b/i,
+      prRe: /\b(?:faster|optimi[sz]e|latency|throughput|speedup|perf)\b/i
+    },
+    {
+      lens: 'docs',
+      pathRe: /(?:^README\.md$|^docs\/|openapi)/i,
+      contentRe: null
+    }
+  ];
+
+  for (const rule of triggerRules) {
+    const matchedPath = rule.pathRe ? paths.find((p) => rule.pathRe.test(p)) : null;
+    const matchedContent = !matchedPath && rule.contentRe ? rule.contentRe.exec(addedContent) : null;
+    const matchedPr = !matchedPath && !matchedContent && rule.prRe ? rule.prRe.exec(prBodyAndTitle) : null;
+    if (matchedPath) {
+      pick.push({ lens: rule.lens, run: true, reason: `path \`${matchedPath}\`` });
+    } else if (matchedContent) {
+      pick.push({ lens: rule.lens, run: true, reason: `diff signal \`${matchedContent[0]}\`` });
+    } else if (matchedPr) {
+      pick.push({ lens: rule.lens, run: true, reason: `PR description \`${matchedPr[0]}\`` });
+    } else {
+      pick.push({ lens: rule.lens, run: false, reason: 'no trigger' });
+    }
+  }
+
+  return pick;
+}
+
+function formatLineNumberedDiff(parsedFiles, maxTotalChars = 28000) {
+  const chunks = [];
+  let usedChars = 0;
+  // Prioritize contracts and flows first so production code always gets full line-numbered hunks
+  const ordered = [
+    ...(parsedFiles || []).filter((f) => f.layer === 'contracts'),
+    ...(parsedFiles || []).filter((f) => f.layer === 'flows'),
+    ...(parsedFiles || []).filter((f) => f.layer === 'config'),
+    ...(parsedFiles || []).filter((f) => f.layer === 'tests')
+  ];
+
+  for (const f of ordered) {
+    if (f.layer === 'tests' && usedChars > maxTotalChars * 0.7) {
+      chunks.push(
+        `### [TEST FILE COLLAPSED INTO LAYER 4 MATRIX] ${f.path} (+${f.additions}/-${f.deletions}) — read diff.patch only if needed`
+      );
+      continue;
+    }
+    const fileLines = [`### ${f.path} [${f.layer}: ${f.category}] (+${f.additions}/-${f.deletions})`];
+    for (const h of f.hunks || []) {
+      fileLines.push(h.header);
+      for (const l of h.lines || []) {
+        if (l.type === 'add') {
+          fileLines.push(`L${l.newNumber} +${l.content}`);
+        } else if (l.type === 'del') {
+          fileLines.push(`DEL(${l.oldNumber}) -${l.content}`);
+        } else {
+          fileLines.push(`L${l.newNumber}  ${l.content}`);
+        }
+      }
+    }
+    const block = fileLines.join('\n');
+    chunks.push(block);
+    usedChars += block.length;
+  }
+  return chunks.join('\n\n');
+}
 function main() {
   const { diffPath, prInput, scratchDir, repo } = parseCli(process.argv);
   if ((!diffPath && !prInput) || !scratchDir) {
@@ -275,18 +443,36 @@ function main() {
     }
   }
 
+  const standardsScan = scanRepoStandards(process.cwd());
+  const lensPick = pickTriggeredLenses(parsedFiles, prMeta, standardsScan);
+  const triggeredLenses = lensPick.filter((l) => l.run).map((l) => l.lens);
+
+  let recentGitLog = '';
+  try {
+    const logRes = spawnSync('git', ['log', '--stat', '-5', '--no-color'], {
+      encoding: 'utf8',
+      timeout: 3000
+    });
+    if (logRes && logRes.status === 0 && logRes.stdout) {
+      recentGitLog = logRes.stdout.trim();
+    }
+  } catch (e) {}
+
   const layers = buildLayersFromParsedDiff(parsedFiles, [], {
     prMeta,
     reuseCandidates,
     codeownersRules,
     callerBlastRadius
   });
+  layers.standardsScan = standardsScan;
+  layers.lensPick = lensPick;
+  layers.triggeredLenses = triggeredLenses;
 
   fs.writeFileSync(path.join(absScratch, 'layers.json'), JSON.stringify(layers, null, 2));
   fs.writeFileSync(path.join(absScratch, 'github-threads.json'), JSON.stringify(hydratedThreads, null, 2));
 
-  // Pre-bundle judge.md, findings.md, verifier.md, and all lenses/*.md into <scratch>/lenses-bundle.md
-  // so headless/interactive agents can read all rules and lenses in a single tool call instead of 17 sequential reads.
+  // Pre-build both <scratch>/lenses-bundle.md and a single-read <scratch>/review-pack.md
+  // containing PR metadata, 4-Layer summary, pre-computed lens pick, triggered lenses, and line-numbered diff.
   try {
     const skillRoot = path.resolve(scriptDir, '..');
     const refFiles = ['references/judge.md', 'references/findings.md', 'references/verifier.md'];
@@ -308,6 +494,69 @@ function main() {
     if (bundleParts.length > 0) {
       fs.writeFileSync(path.join(absScratch, 'lenses-bundle.md'), bundleParts.join('\n\n'));
     }
+
+    // Build single-read <scratch>/review-pack.md with ONLY triggered lenses + line-numbered diff
+    const triggeredLensDocs = [];
+    for (const lensName of triggeredLenses) {
+      const p = path.join(skillRoot, 'lenses', `${lensName}.md`);
+      if (fs.existsSync(p)) {
+        triggeredLensDocs.push(`### Lens: ${lensName}\n` + fs.readFileSync(p, 'utf8'));
+      }
+    }
+    const findingsDocPath = path.join(skillRoot, 'references', 'findings.md');
+    const findingsDoc = fs.existsSync(findingsDocPath) ? fs.readFileSync(findingsDocPath, 'utf8') : '';
+    const pickTableMd = [
+      '| Lens | Run | Reason |',
+      '| --- | --- | --- |',
+      ...lensPick.map((r) => `| \`${r.lens}\` | ${r.run ? 'yes' : 'no'} | ${r.reason} |`)
+    ].join('\n');
+
+    const reviewPack = [
+      `# Pre-Staged Review Pack`,
+      ``,
+      `## 1. PR Metadata & Commits`,
+      `- **PR:** #${prMeta?.number || prInput || 'branch'} — ${prMeta?.title || '(branch diff)'}`,
+      `- **URL:** ${prMeta?.url || ''}`,
+      `- **Base → Head:** \`${prMeta?.baseRefName || 'base'}\` (\`${prMeta?.baseRefOid || ''}\`) → \`${prMeta?.headRefName || 'head'}\` (\`${prMeta?.headRefOid || ''}\`)`,
+      `- **Description:**\n${prMeta?.body || '(none)'}`,
+      ``,
+      `## 2. Pre-Computed Standards Scan & Recent Git History`,
+      `- **Standards Files Applying to Changed Files:** ${
+        standardsScan.length ? standardsScan.map((s) => `\`${s.path}\` (${s.scope})`).join(', ') : 'None (0 repo standards files)'
+      }`,
+      recentGitLog ? `### Recent 5 Commits (\`git log --stat -5\`)\n\`\`\`text\n${recentGitLog}\n\`\`\`` : '',
+      ``,
+      `## 3. Pre-Computed 4-Layer Breakdown & Attention Signals`,
+      `- **Contracts (${layers.contracts.length}):** ${layers.contracts.map((c) => `\`${c.path}\` (${c.summary})`).join(', ') || 'none'}`,
+      `- **Flows (${layers.flows.length}):** ${layers.flows.map((f) => `${f.name}: ${f.files.map((p) => `\`${p}\``).join(', ')}`).join(' | ') || 'none'}`,
+      `- **Test Matrix (${layers.testMatrix.length} files):** ${
+        layers.testMatrix
+          .map(
+            (tm) =>
+              `\`${tm.file}\` (${tm.totalCases} cases, ${tm.assertionsCount} assertions, status: ${tm.status})`
+          )
+          .join(', ') || 'none'
+      }`,
+      `- **Attention Signals:** \`${JSON.stringify(layers.attentionSignals || {})}\``,
+      ``,
+      `## 4. Pre-Computed Judge Lens Pick (${triggeredLenses.length}/${lensPick.length} Triggered)`,
+      pickTableMd,
+      ``,
+      `## 5. Triggered Lens Rules (${triggeredLenses.join(', ')})`,
+      triggeredLensDocs.join('\n\n'),
+      ``,
+      `## 6. Findings Output Schema & Writing Rules`,
+      findingsDoc,
+      ``,
+      `## 7. Line-Numbered Unified Diff (Every \`L<num>\` prefix is the exact \`<head>\` line number for \`loc: "<path>:<num>"\`)`,
+      '```diff',
+      formatLineNumberedDiff(parsedFiles),
+      '```'
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    fs.writeFileSync(path.join(absScratch, 'review-pack.md'), reviewPack);
   } catch (e) {}
 
   const totalCases = layers.testMatrix.reduce((acc, f) => acc + f.cases.length, 0);
@@ -339,6 +588,7 @@ function main() {
         shortcutsCount: shortcuts.length,
         rotRiskShortcutsCount: shortcuts.filter((s) => s.rotRisk).length,
         negativeSpaceViolationsCount: (specAlignment.negativeSpaceViolations || []).length,
+        triggeredLenses,
         hydratedCrvFindings: Object.keys(hydratedThreads.findingThreads || {}).length,
         generalGitHubComments: (hydratedThreads.generalComments || []).length
       },
