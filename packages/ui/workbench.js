@@ -150,9 +150,35 @@
     }
   }
 
+  function formatDocumentTitle(rep) {
+    if (!rep) return 'CRV PR Review Workbench';
+    const urlMatch = /github\.com\/([^/]+\/([^/]+))\/pull\/(\d+)/i.exec(rep.PR?.url || '');
+    const rawRepo = rep.REVIEW?.repo || (urlMatch ? urlMatch[1] : '');
+    const repoShort = rawRepo ? rawRepo.split('/').pop() : urlMatch ? urlMatch[2] : '';
+    const rawTitle = String(rep.XMETA?.title || '').trim();
+    const titlePrMatch = /^PR\s*#(\d+)/i.exec(rawTitle);
+    const labelPrMatch = /#(\d+)/.exec(rep.PR?.label || '');
+    const prNum =
+      rep.REVIEW?.pr ||
+      (urlMatch ? urlMatch[3] : '') ||
+      (titlePrMatch ? titlePrMatch[1] : '') ||
+      (labelPrMatch ? labelPrMatch[1] : '');
+    const cleanTitle = rawTitle.replace(/^PR\s*#\d+\s*[:—–-]\s*/i, '').trim();
+
+    const prefixParts = [];
+    if (prNum) prefixParts.push(`#${prNum}`);
+    if (repoShort) prefixParts.push(repoShort);
+    const prefix = prefixParts.join(' · ');
+
+    if (prefix && cleanTitle) return `${prefix} — ${cleanTitle}`;
+    if (prefix) return `${prefix} — CRV Workbench`;
+    return rawTitle || 'CRV PR Review Workbench';
+  }
+
   function renderHeader() {
     if (!report) return;
     $('#prTitle').textContent = report.XMETA?.title || 'PR Review Workbench';
+    document.title = formatDocumentTitle(report);
     const prLinkHolder = $('#prLinkHolder');
     if (report.PR?.url) {
       prLinkHolder.innerHTML = `<a class="prlink" href="${escapeHtml(report.PR.url)}" target="_blank" rel="noopener">🔗 ${escapeHtml(report.PR.label || 'View PR')}</a>`;

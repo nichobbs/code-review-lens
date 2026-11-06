@@ -695,6 +695,31 @@ async function syncReportWithGitHubAsync(report) {
   }
 }
 
+function formatReportPageTitle(report) {
+  if (!report) return 'Agentic PR Review Workbench';
+  const urlMatch = /github\.com\/([^/]+\/([^/]+))\/pull\/(\d+)/i.exec(report.PR?.url || '');
+  const rawRepo = report.REVIEW?.repo || (urlMatch ? urlMatch[1] : '');
+  const repoShort = rawRepo ? rawRepo.split('/').pop() : urlMatch ? urlMatch[2] : '';
+  const rawTitle = String(report.XMETA?.title || '').trim();
+  const titlePrMatch = /^PR\s*#(\d+)/i.exec(rawTitle);
+  const labelPrMatch = /#(\d+)/.exec(report.PR?.label || '');
+  const prNum =
+    report.REVIEW?.pr ||
+    (urlMatch ? urlMatch[3] : '') ||
+    (titlePrMatch ? titlePrMatch[1] : '') ||
+    (labelPrMatch ? labelPrMatch[1] : '');
+  const cleanTitle = rawTitle.replace(/^PR\s*#\d+\s*[:—–-]\s*/i, '').trim();
+
+  const prefixParts = [];
+  if (prNum) prefixParts.push(`#${prNum}`);
+  if (repoShort) prefixParts.push(repoShort);
+  const prefix = prefixParts.join(' · ');
+
+  if (prefix && cleanTitle) return `${prefix} — ${cleanTitle}`;
+  if (prefix) return `${prefix} — CRV Workbench`;
+  return rawTitle || 'Agentic PR Review Workbench';
+}
+
 /**
  * Builds a single-file standalone HTML version of the upgraded 4-Layer Workbench.
  */
@@ -718,8 +743,13 @@ function buildStandaloneHtml(report) {
     issues: report.DATA || []
   };
   const safeRawFindings = JSON.stringify(rawFindingsPayload).replace(/<\/script/gi, '<\\/script');
+  const safePageTitle = formatReportPageTitle(report)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
   return template
+    .replace('<title>Agentic PR Review Workbench</title>', `<title>${safePageTitle}</title>`)
     .replace('<link rel="stylesheet" href="./workbench.css">', `<style>\n${css}\n</style>`)
     .replace(
       '<script src="./vendor/mermaid.min.js"></script>',

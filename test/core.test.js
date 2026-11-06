@@ -190,6 +190,7 @@ test('Standalone HTML export embeds report, styles, and Mermaid runtime cleanly'
   assert.ok(html.includes('id="guideToggleBtn"'));
   assert.ok(html.includes('Where Humans Add Maximum Leverage'));
   assert.ok(html.includes('until-found'));
+  assert.match(html, /<title>#1230 · [\w-]+ — /);
 });
 
 test('crv-code-review findings.json compiler & prepare_pr.mjs / extract_findings.py round-trip', () => {

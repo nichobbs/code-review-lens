@@ -413,7 +413,20 @@ def build(findings, mermaid_js, out_path=""):
 
     result, tone = review_result(findings)
 
+    raw_title = (meta.get("title") or "Code review").strip()
+    clean_title = re.sub(r"^PR\s*#\d+\s*[:—–-]\s*", "", raw_title, flags=re.I).strip()
+    repo_short = (review.get("repo") or "").split("/")[-1].strip()
+    pr_num = review.get("pr")
+    prefix_parts = []
+    if pr_num:
+        prefix_parts.append(f"#{pr_num}")
+    if repo_short:
+        prefix_parts.append(repo_short)
+    prefix = " · ".join(prefix_parts)
+    page_title = f"{prefix} — {clean_title}" if (prefix and clean_title) else (prefix or raw_title)
+
     markers = {
+        "__PAGE_TITLE__": esc(page_title),
         "__TITLE__": esc(meta.get("title","Code review")),
         "__SUBTITLE__": esc(meta.get("subtitle","")),
         "__VERDICT__": esc(result),
@@ -452,7 +465,7 @@ def build(findings, mermaid_js, out_path=""):
 TEMPLATE = r'''<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <meta name=color-scheme content="light dark">
-<title>__TITLE__</title>
+<title>__PAGE_TITLE__</title>
 <style>
 /*__FONTS__*/
 /* Flight progress strips: each finding is a strip with fixed fields and a coloured holder band. */
