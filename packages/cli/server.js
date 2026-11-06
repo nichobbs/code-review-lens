@@ -7,7 +7,9 @@ const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const vm = require('vm');
 const {
+  REVIEW_THREADS_GRAPHQL_QUERY,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   parseUnifiedDiff,
   extractDiffSlice,
@@ -325,12 +327,20 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
   // Reconstruct any existing CRV findings previously published to GitHub PR comments
   for (const ft of Object.values(hydrated?.findingThreads || {})) {
     const loc = ft.meta?.loc || (ft.path ? `${ft.path}:${ft.line || 1}` : '');
+    const inferredState = ft.state || (ft.isResolved ? 'fixed' : 'open');
     autoIssues.push({
       id: ft.id,
       sev: ft.meta?.sev || 'medium',
       cat: ft.meta?.cat || 'github-crv',
       verify: ft.meta?.verify || 'CONFIRMED',
-      suggestedTriage: ft.action || 'comment',
+      suggestedTriage: inferredState === 'fixed' || inferredState === 'dropped' ? 'dismiss' : ft.action || 'comment',
+      status:
+        inferredState !== 'open' || ft.isResolved
+          ? {
+              state: inferredState,
+              note: ft.isResolved ? 'Marked resolved on GitHub PR review thread.' : `Thread state: ${inferredState}`
+            }
+          : undefined,
       loc,
       title: ft.title || `Finding ${ft.id}`,
       impact: `**Breaks:** Published CRV finding thread on GitHub by \`@${ft.author}\`.\n\n**Because:** ${ft.note || 'See GitHub review thread.'}\n\n**Reach:** Inline thread at \`${loc || 'PR'}\`.`,
@@ -510,6 +520,21 @@ function loadLivePrFromGitHub(prInput, explicitRepo) {
       runGhApi([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate', '--slurp']) || '[]'
     );
     hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+    const [owner, name] = String(repo).split('/');
+    if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
+      const gqlOut = runGhApi([
+        'graphql',
+        '-f',
+        `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
+        '-F',
+        `owner=${owner}`,
+        '-F',
+        `name=${name}`,
+        '-F',
+        `pr=${prNumInt}`
+      ]);
+      mergeGraphqlReviewThreads(hydrated, gqlOut);
+    }
   } catch (e) {}
 
   return buildLivePrReportFromFetchedData({
@@ -624,6 +649,23 @@ function syncReportWithGitHub(report) {
     const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
     const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
     const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+    try {
+      const [owner, name] = String(repo).split('/');
+      if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
+        const gqlOut = runGhApi([
+          'graphql',
+          '-f',
+          `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
+          '-F',
+          `owner=${owner}`,
+          '-F',
+          `name=${name}`,
+          '-F',
+          `pr=${pr}`
+        ]);
+        mergeGraphqlReviewThreads(hydrated, gqlOut);
+      }
+    } catch (e) {}
 
     let diffText = '';
     try {
@@ -671,6 +713,23 @@ async function syncReportWithGitHubAsync(report) {
     const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
     const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
     const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+    try {
+      const [owner, name] = String(repo).split('/');
+      if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
+        const gqlOut = await runGhApiAsync([
+          'graphql',
+          '-f',
+          `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
+          '-F',
+          `owner=${owner}`,
+          '-F',
+          `name=${name}`,
+          '-F',
+          `pr=${pr}`
+        ]);
+        mergeGraphqlReviewThreads(hydrated, gqlOut);
+      }
+    } catch (e) {}
 
     const diffText = await resolvePrDiffAsync({
       repo,
@@ -1034,59 +1093,143 @@ function createWorkbenchServer(options = {}) {
         );
 
         if (allowLivePublish && repo && pr) {
+          const threadUpdates = Array.isArray(payload?.threadUpdates) ? payload.threadUpdates : [];
+          const reviewPayload = { ...payload };
+          delete reviewPayload.threadUpdates;
+
           let mode = 'gh-api-live';
-          let out;
-          try {
-            out = await runGhApiAsync(
-              ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-              JSON.stringify(payload)
-            );
-          } catch (firstErr) {
-            const msg = String(firstErr.message || '');
-            if (!/HTTP 422|Unprocessable Entity/i.test(msg)) {
-              throw firstErr;
-            }
-            // Retry 1: If event was REQUEST_CHANGES or APPROVE (e.g. reviewing own PR), downgrade to COMMENT
-            const fallbackPayload = { ...payload, event: 'COMMENT' };
-            delete fallbackPayload.commit_id;
+          let out = '{}';
+          const shouldPostReview =
+            (Array.isArray(reviewPayload.comments) && reviewPayload.comments.length > 0) ||
+            Boolean(reviewPayload.body) ||
+            threadUpdates.length === 0;
+
+          if (shouldPostReview) {
             try {
               out = await runGhApiAsync(
                 ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-                JSON.stringify(fallbackPayload)
+                JSON.stringify(reviewPayload)
               );
-              mode = 'gh-api-live (downgraded event to COMMENT for self-review)';
-            } catch (secondErr) {
-              const msg2 = String(secondErr.message || '');
-              if (
-                !/HTTP 422|Unprocessable Entity/i.test(msg2) ||
-                !Array.isArray(fallbackPayload.comments) ||
-                fallbackPayload.comments.length === 0
-              ) {
-                throw secondErr;
+            } catch (firstErr) {
+              const msg = String(firstErr.message || '');
+              if (!/HTTP 422|Unprocessable Entity/i.test(msg)) {
+                throw firstErr;
               }
-              // Retry 2: One or more inline comment lines are outside the PR diff on GitHub; fold comments into body
-              const foldedNotes = fallbackPayload.comments
-                .map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`)
-                .join('\n\n---\n\n');
-              const bodyOnlyPayload = {
-                event: 'COMMENT',
-                body: `${fallbackPayload.body || ''}\n\n---\n### Inline Findings\n\n${foldedNotes}`.trim(),
-                comments: []
-              };
-              out = await runGhApiAsync(
-                ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-                JSON.stringify(bodyOnlyPayload)
-              );
-              mode = 'gh-api-live (folded out-of-hunk inline threads into review summary)';
+              // Retry 1: If event was REQUEST_CHANGES or APPROVE (e.g. reviewing own PR), downgrade to COMMENT
+              const fallbackPayload = { ...reviewPayload, event: 'COMMENT' };
+              delete fallbackPayload.commit_id;
+              try {
+                out = await runGhApiAsync(
+                  ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+                  JSON.stringify(fallbackPayload)
+                );
+                mode = 'gh-api-live (downgraded event to COMMENT for self-review)';
+              } catch (secondErr) {
+                const msg2 = String(secondErr.message || '');
+                if (
+                  !/HTTP 422|Unprocessable Entity/i.test(msg2) ||
+                  !Array.isArray(fallbackPayload.comments) ||
+                  fallbackPayload.comments.length === 0
+                ) {
+                  throw secondErr;
+                }
+                // Retry 2: One or more inline comment lines are outside the PR diff on GitHub; fold comments into body
+                const foldedNotes = fallbackPayload.comments
+                  .map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`)
+                  .join('\n\n---\n\n');
+                const bodyOnlyPayload = {
+                  event: 'COMMENT',
+                  body: `${fallbackPayload.body || ''}\n\n---\n### Inline Findings\n\n${foldedNotes}`.trim(),
+                  comments: []
+                };
+                out = await runGhApiAsync(
+                  ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+                  JSON.stringify(bodyOnlyPayload)
+                );
+                mode = 'gh-api-live (folded out-of-hunk inline threads into review summary)';
+              }
             }
           }
+
+          // Process follow-up replies & GraphQL thread resolve/unresolve (reopen) for existing threads
+          let repliedCount = 0;
+          let resolvedCount = 0;
+          let reopenedCount = 0;
+          for (const upd of threadUpdates) {
+            if (!upd || !upd.commentId) continue;
+            const existingThread = report?.GITHUB_STATE?.findingThreads?.[upd.id] || {};
+            const threadId = upd.threadId || existingThread.threadId || null;
+            const lastUpd = existingThread.lastUpdate || null;
+            const isDuplicateReply =
+              lastUpd &&
+              lastUpd.state === upd.state &&
+              lastUpd.action === upd.action &&
+              lastUpd.head &&
+              upd.head &&
+              lastUpd.head === upd.head;
+
+            if (!isDuplicateReply && upd.body) {
+              try {
+                await runGhApiAsync(
+                  [
+                    '--method',
+                    'POST',
+                    `repos/${repo}/pulls/${pr}/comments/${upd.commentId}/replies`,
+                    '--input',
+                    '-'
+                  ],
+                  JSON.stringify({ body: upd.body })
+                );
+                repliedCount++;
+              } catch (e) {}
+            }
+
+            if (threadId && (upd.resolutionAction === 'resolve' || upd.resolutionAction === 'unresolve')) {
+              const mutationName =
+                upd.resolutionAction === 'resolve' ? 'resolveReviewThread' : 'unresolveReviewThread';
+              const shouldMutate =
+                upd.resolutionAction === 'resolve'
+                  ? existingThread.isResolved !== true
+                  : existingThread.isResolved !== false;
+              if (shouldMutate) {
+                try {
+                  await runGhApiAsync([
+                    'graphql',
+                    '-f',
+                    `query=mutation($threadId: ID!) { ${mutationName}(input: { threadId: $threadId }) { thread { id isResolved } } }`,
+                    '-F',
+                    `threadId=${threadId}`
+                  ]);
+                  if (upd.resolutionAction === 'resolve') resolvedCount++;
+                  else reopenedCount++;
+                } catch (e) {}
+              }
+            }
+          }
+
+          if (repliedCount > 0 || resolvedCount > 0 || reopenedCount > 0) {
+            const summaryBits = [];
+            if (repliedCount > 0) summaryBits.push(`${repliedCount} thread repl${repliedCount === 1 ? 'y' : 'ies'}`);
+            if (resolvedCount > 0) summaryBits.push(`${resolvedCount} resolved`);
+            if (reopenedCount > 0) summaryBits.push(`${reopenedCount} reopened`);
+            mode += ` + ${summaryBits.join(', ')}`;
+          }
+
+          try {
+            await syncReportWithGitHubAsync(report);
+            broadcastEvent('report-updated', { repo: report?.REVIEW?.repo, pr: report?.REVIEW?.pr });
+          } catch (e) {}
+
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(
             JSON.stringify({
               ok: true,
               mode,
               savedTo: lastSubmittedPath,
-              response: JSON.parse(out)
+              repliedCount,
+              resolvedCount,
+              reopenedCount,
+              response: JSON.parse(out || '{}')
             })
           );
         } else {

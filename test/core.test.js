@@ -7,11 +7,13 @@ const fs = require('node:fs');
 
 const {
   serializeFindingComment,
+  serializeFindingThreadUpdateReply,
   parseFindingComment,
   serializeOverviewComment,
   parseOverviewComment,
   buildGitHubReviewPayload,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   classifyFilePath,
   inferFlowName,
@@ -883,5 +885,164 @@ test('Shortcuts Ledger, Spec/Negative-Space Alignment, CODEOWNERS & Caller Blast
   assert.equal(report.DATA[0].leanSavedLines, 42);
   assert.deepEqual(report.LAYERS.contracts[0].owners, ['@platform-team', '@api-leads']);
   assert.equal(report.LAYERS.contracts[0].callerBlastRadius.callers.length, 2);
+});
+
+test('Re-review (r2) replies to existing GitHub threads, resolves fixed threads, and reopens partially-fixed threads without creating duplicates', () => {
+  // 1. Hydrate two existing GitHub PR review comments (H1 and H2) + GraphQL thread states
+  const h1CommentBody = serializeFindingComment(
+    { id: 'H1', sev: 'high', verify: 'CONFIRMED', loc: 'src/auth.ts:12', title: 'Missing DISABLED guard' },
+    { action: 'block', note: 'Block until fixed' },
+    { head: '1111111111111111111111111111111111111111', pr: 42 }
+  );
+  const h2CommentBody = serializeFindingComment(
+    { id: 'H2', sev: 'high', verify: 'CONFIRMED', loc: 'src/auth.ts:30', title: 'Token expiry not checked' },
+    { action: 'block', note: 'Must validate exp claim' },
+    { head: '1111111111111111111111111111111111111111', pr: 42 }
+  );
+
+  const hydrated = hydrateFromGitHubComments(
+    [],
+    [
+      {
+        id: 9001,
+        path: 'src/auth.ts',
+        line: 12,
+        user: { login: 'reviewer' },
+        body: h1CommentBody,
+        html_url: 'https://github.com/acme/repo/pull/42#discussion_r9001'
+      },
+      {
+        id: 9002,
+        path: 'src/auth.ts',
+        line: 30,
+        user: { login: 'reviewer' },
+        body: h2CommentBody,
+        html_url: 'https://github.com/acme/repo/pull/42#discussion_r9002'
+      }
+    ]
+  );
+
+  // Merge GraphQL reviewThreads (H1 still open on GH, H2 prematurely marked resolved by author on GH)
+  mergeGraphqlReviewThreads(hydrated, {
+    data: {
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [
+              {
+                id: 'PRRT_kwDO_H1',
+                isResolved: false,
+                isOutdated: false,
+                comments: { nodes: [{ databaseId: 9001, body: h1CommentBody }] }
+              },
+              {
+                id: 'PRRT_kwDO_H2',
+                isResolved: true,
+                isOutdated: false,
+                comments: { nodes: [{ databaseId: 9002, body: h2CommentBody }] }
+              }
+            ]
+          }
+        }
+      }
+    }
+  });
+
+  assert.equal(hydrated.findingThreads.H1.threadId, 'PRRT_kwDO_H1');
+  assert.equal(hydrated.findingThreads.H1.isResolved, false);
+  assert.equal(hydrated.findingThreads.H2.threadId, 'PRRT_kwDO_H2');
+  assert.equal(hydrated.findingThreads.H2.isResolved, true);
+
+  // 2. Compile a Re-Review (r2) report where:
+  //    - H1 is verified FIXED
+  //    - H2 is PARTIAL (author resolved the thread on GH, but expiry is still bypassed on refresh tokens!)
+  //    - R1 is a brand-new finding introduced in r2
+  const r2Report = compileFindingsToWorkbenchReport({
+    meta: {
+      title: 'PR #42: Auth session hardening',
+      review: {
+        repo: 'acme/repo',
+        pr: 42,
+        base: '0000000000000000000000000000000000000000',
+        head: '2222222222222222222222222222222222222222'
+      },
+      revision: {
+        number: 2,
+        reviewedCommit: '1111111111111111111111111111111111111111',
+        headCommit: '2222222222222222222222222222222222222222',
+        commits: ['22222222 fix(auth): guard DISABLED status'],
+        summary: '1 fixed (H1), 1 partial (H2), 1 new (R1).'
+      }
+    },
+    issues: [
+      {
+        id: 'H1',
+        sev: 'high',
+        verify: 'CONFIRMED',
+        loc: 'src/auth.ts:12',
+        title: 'Missing DISABLED guard',
+        impact: '**Breaks:** Banned users can log in.\n\n**Because:** No check.\n\n**Reach:** Auth.',
+        fix: '**Do:** Add check.\n\n**Check:** Test.',
+        status: {
+          state: 'fixed',
+          note: 'Guard added before session issue.',
+          evidence: 'src/auth.ts:14'
+        }
+      },
+      {
+        id: 'H2',
+        sev: 'high',
+        verify: 'CONFIRMED',
+        loc: 'src/auth.ts:30',
+        title: 'Token expiry not checked',
+        impact: '**Breaks:** Expired refresh tokens accepted.\n\n**Because:** Only access token checked.\n\n**Reach:** Auth.',
+        fix: '**Do:** Check refresh exp.\n\n**Check:** Test.',
+        status: {
+          state: 'partial',
+          note: 'Access token expiry is now checked, but refresh token path at line 41 still skips `exp`.',
+          evidence: 'src/auth.ts:41'
+        }
+      },
+      {
+        id: 'R1',
+        sev: 'medium',
+        verify: 'CONFIRMED',
+        isNew: true,
+        loc: 'src/auth.ts:45',
+        title: 'New error log leaks raw token string',
+        impact: '**Breaks:** Token written to stdout.\n\n**Because:** `logger.error(token)`.\n\n**Reach:** Logs.',
+        fix: '**Do:** Redact token.\n\n**Check:** Unit test.'
+      }
+    ]
+  });
+  r2Report.GITHUB_STATE = hydrated;
+
+  const triageMap = {
+    H1: { action: 'dismiss', note: '', done: true, ghCommentId: 9001, ghThreadId: 'PRRT_kwDO_H1' },
+    H2: { action: 'block', note: 'Please also check refresh token exp at line 41.', done: true, ghCommentId: 9002, ghThreadId: 'PRRT_kwDO_H2' },
+    R1: { action: 'comment', note: 'Redact before merging', done: true }
+  };
+
+  const payload = buildGitHubReviewPayload(r2Report, triageMap);
+
+  // Only R1 is a brand-new inline comment; H1 and H2 are threadUpdates on existing commentIds 9001 and 9002!
+  assert.equal(payload.comments.length, 1);
+  assert.match(payload.comments[0].body, /"id":"R1"/);
+  assert.equal(payload.threadUpdates.length, 2);
+
+  const updH1 = payload.threadUpdates.find((u) => u.id === 'H1');
+  const updH2 = payload.threadUpdates.find((u) => u.id === 'H2');
+  assert.ok(updH1);
+  assert.equal(updH1.commentId, 9001);
+  assert.equal(updH1.threadId, 'PRRT_kwDO_H1');
+  assert.equal(updH1.resolutionAction, 'resolve');
+  assert.match(updH1.body, /Verified Fixed/);
+
+  assert.ok(updH2);
+  assert.equal(updH2.commentId, 9002);
+  assert.equal(updH2.threadId, 'PRRT_kwDO_H2');
+  assert.equal(updH2.resolutionAction, 'unresolve');
+  assert.match(updH2.body, /Partially Fixed — Still Open/);
+  assert.match(updH2.body, /refresh token path at line 41/);
 });
 

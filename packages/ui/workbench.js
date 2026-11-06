@@ -4,16 +4,38 @@
   const OV = '__overview__';
   const CONTRACTS_VIEW = '__contracts__';
   const TESTS_VIEW = '__tests__';
+  const RESOLVED_STATES = new Set(['fixed', 'external', 'dropped']);
 
   let report = window.__CRV_INITIAL_REPORT__ || null;
   let activeLayer = 'findings'; // 'overview' | 'findings' | 'contracts' | 'tests'
-  let activeTab = 'todo';       // 'todo' | 'triaged' | 'all'
+  let activeTab = 'todo';       // 'todo' | 'triaged' | 'resolved' | 'all'
   let activeFilter = 'all';
   let currentId = 'H1';
-  let triage = {};              // { [id]: { action: 'block'|'comment'|'dismiss'|'pending', note: '', done: false, ghCommentId?: number, ghUrl?: string } }
+  let triage = {};              // { [id]: { action: 'block'|'comment'|'dismiss'|'pending', note: '', done: false, ghCommentId?: number, ghThreadId?: string, ghIsResolved?: boolean, ghUrl?: string } }
   let ghConnected = false;
 
   const $ = (sel) => document.querySelector(sel);
+
+  function getFindingResolutionInfo(d) {
+    const ghThread = report?.GITHUB_STATE?.findingThreads?.[d.id] || null;
+    const rawState = d?.status?.state || ghThread?.state || '';
+    const isStateResolved = RESOLVED_STATES.has(rawState);
+    const hasOpenReReviewState = rawState === 'partial' || rawState === 'open' || rawState === 'rebutted';
+    const ghResolved = Boolean(ghThread?.isResolved);
+    const isResolved = isStateResolved || (ghResolved && !hasOpenReReviewState);
+    const needsReopen = ghResolved && hasOpenReReviewState;
+    const hasExistingThread = Boolean(ghThread?.commentId || triage[d.id]?.ghCommentId);
+    return {
+      state: rawState || (ghResolved ? 'fixed' : 'open'),
+      hasExplicitStatus: Boolean(d?.status?.state || ghThread?.state),
+      isStateResolved,
+      ghResolved,
+      isResolved,
+      needsReopen,
+      hasExistingThread,
+      ghThread
+    };
+  }
 
   function storageKey() {
     return (report && report.KEY ? report.KEY : 'crv-workbench') + ':triage-v1';
@@ -38,26 +60,38 @@
       for (const d of report.DATA) {
         const ghThread = ghThreads[d.id];
         const ghSaved = ghOverviewTriage[d.id];
+        const resInfo = getFindingResolutionInfo(d);
         if (!triage[d.id]) {
-          const action =
-            ghThread?.action ||
-            ghSaved?.action ||
-            d.suggestedTriage ||
-            (d.sev === 'high' ? 'block' : 'comment');
+          const action = resInfo.isResolved
+            ? 'dismiss'
+            : ghThread?.action ||
+              ghSaved?.action ||
+              d.suggestedTriage ||
+              (d.sev === 'high' ? 'block' : 'comment');
           const note = ghThread?.note || ghSaved?.note || '';
-          const done = Boolean(ghThread || ghSaved?.done);
+          const done = Boolean(resInfo.isResolved || ghThread || ghSaved?.done);
           triage[d.id] = {
             action,
             note,
             done,
             ghCommentId: ghThread?.commentId,
+            ghThreadId: ghThread?.threadId,
+            ghIsResolved: Boolean(ghThread?.isResolved),
             ghUrl: ghThread?.htmlUrl
           };
-        } else if (ghThread) {
-          triage[d.id].ghCommentId = ghThread.commentId;
-          triage[d.id].ghUrl = ghThread.htmlUrl;
-          if (!triage[d.id].note && ghThread.note) {
-            triage[d.id].note = ghThread.note;
+        } else {
+          if (resInfo.isStateResolved && triage[d.id].action !== 'dismiss') {
+            triage[d.id].action = 'dismiss';
+            triage[d.id].done = true;
+          }
+          if (ghThread) {
+            triage[d.id].ghCommentId = ghThread.commentId;
+            triage[d.id].ghThreadId = ghThread.threadId;
+            triage[d.id].ghIsResolved = Boolean(ghThread.isResolved);
+            triage[d.id].ghUrl = ghThread.htmlUrl;
+            if (!triage[d.id].note && ghThread.note) {
+              triage[d.id].note = ghThread.note;
+            }
           }
         }
       }
@@ -217,15 +251,17 @@
     renderLayerNav();
     renderGuideRadar();
     const issues = report?.DATA || [];
-    const todoCount = issues.filter((d) => !getTriage(d.id).done).length;
-    const triagedCount = issues.length - todoCount;
+    const resolvedCount = issues.filter((d) => getFindingResolutionInfo(d).isResolved).length;
+    const todoCount = issues.filter((d) => !getFindingResolutionInfo(d).isResolved && !getTriage(d.id).done).length;
+    const triagedCount = issues.filter((d) => !getFindingResolutionInfo(d).isResolved && getTriage(d.id).done).length;
 
     const tabsEl = $('#tabs');
     if (tabsEl) {
       const tabs = [
         ['todo', 'Untriaged', todoCount],
         ['triaged', 'Triaged', triagedCount],
-        ['all', 'All Findings', issues.length]
+        ...(resolvedCount > 0 ? [['resolved', 'Resolved', resolvedCount]] : []),
+        ['all', 'All', issues.length]
       ];
       tabsEl.innerHTML = tabs
         .map(
@@ -254,8 +290,10 @@
 
     const filtered = issues.filter((d) => {
       if (activeFilter !== 'all' && d.sev !== activeFilter) return false;
-      if (activeTab === 'todo') return !getTriage(d.id).done;
-      if (activeTab === 'triaged') return Boolean(getTriage(d.id).done);
+      const resInfo = getFindingResolutionInfo(d);
+      if (activeTab === 'resolved') return resInfo.isResolved;
+      if (activeTab === 'todo') return !resInfo.isResolved && !getTriage(d.id).done;
+      if (activeTab === 'triaged') return !resInfo.isResolved && Boolean(getTriage(d.id).done);
       return true;
     });
 
@@ -265,22 +303,46 @@
 
     let html = '';
     if (activeTab === 'todo' && filtered.length === 0 && issues.length > 0) {
-      html += `<div class="racksep"><span>All findings triaged — showing full list</span></div>`;
+      html += `<div class="racksep"><span>All open findings triaged — showing full list</span></div>`;
     }
 
     for (const d of listToShow) {
       const t = getTriage(d.id);
+      const resInfo = getFindingResolutionInfo(d);
       const isSel = activeLayer === 'findings' && currentId === d.id;
-      const isDismissed = t.action === 'dismiss';
+      const isDismissed = t.action === 'dismiss' || resInfo.isResolved;
       const chipLabel =
-        t.action === 'block' ? 'BLOCK' : t.action === 'comment' ? 'CMT' : t.action === 'dismiss' ? 'SKIP' : '';
+        resInfo.state === 'fixed' || resInfo.state === 'external'
+          ? '✓ FIXED'
+          : resInfo.needsReopen
+            ? '🔄 REOPEN'
+            : resInfo.state === 'partial'
+              ? 'PARTIAL'
+              : resInfo.state === 'rebutted'
+                ? 'REBUTTED'
+                : t.action === 'block'
+                  ? 'BLOCK'
+                  : t.action === 'comment'
+                    ? 'CMT'
+                    : t.action === 'dismiss'
+                      ? 'SKIP'
+                      : '';
+      const chipClass =
+        resInfo.state === 'fixed' || resInfo.state === 'external'
+          ? 'fixed'
+          : resInfo.needsReopen || resInfo.state === 'rebutted'
+            ? 'block'
+            : resInfo.state === 'partial'
+              ? 'comment'
+              : t.action;
 
       html += `<div class="strip${isSel ? ' sel' : ''}${isDismissed ? ' dismissed' : ''}" data-id="${escapeHtml(d.id)}" style="${sevVars(d.sev)}">
         <span class="id num">${escapeHtml(d.id)}</span>
-        <span class="stitle">${formatInlineCode(d.title)}</span>
+        <span class="stitle">${d.isNew ? '<span class="triage-chip comment" style="margin-right:4px;">NEW</span>' : ''}${formatInlineCode(d.title)}</span>
         <span class="smeta">
+          ${resInfo.hasExistingThread ? `<span title="${resInfo.ghResolved ? 'Resolved thread on GitHub' : 'Open thread on GitHub'}">${resInfo.ghResolved ? '✅' : '💬'}</span>` : ''}
           ${t.note ? '<span title="Has human reviewer note">📝</span>' : ''}
-          ${chipLabel ? `<span class="triage-chip ${t.action}">${chipLabel}</span>` : ''}
+          ${chipLabel ? `<span class="triage-chip ${chipClass}">${chipLabel}</span>` : ''}
         </span>
       </div>`;
     }
@@ -423,6 +485,24 @@
         </div>`
       : '';
 
+    const revInfo = report?.REV || null;
+    const revHtml = revInfo
+      ? `<div class="layer-card" style="margin-bottom:14px;border-color:var(--accent);background:var(--active);">
+          <div class="layer-card-header">
+            <h3 class="layer-card-title">🔄 Since Last Review (Revision r${escapeHtml(String(revInfo.number || 2))})</h3>
+            <span class="tpill num"><code>${escapeHtml((revInfo.reviewedCommit || '').slice(0, 8) || 'prev')}</code> → <code>${escapeHtml((revInfo.headCommit || rev.head || '').slice(0, 8) || 'HEAD')}</code></span>
+          </div>
+          ${revInfo.summaryHtml ? `<div class="prose" style="margin-top:6px;">${revInfo.summaryHtml}</div>` : ''}
+          ${
+            Array.isArray(revInfo.commits) && revInfo.commits.length > 0
+              ? `<ul style="margin:6px 0 0;padding-left:18px;font:400 12px/1.5 var(--mono);color:var(--ink-2);">
+                  ${revInfo.commits.map((c) => `<li><code>${escapeHtml(c)}</code></li>`).join('')}
+                </ul>`
+              : ''
+          }
+        </div>`
+      : '';
+
     return `<div class="panein">
       <div class="triage-card">
         <div class="triage-card-label">
@@ -433,6 +513,8 @@
           <button type="button" class="btn" id="presetRecommendedBtn">Block Highs · Comment Medium/Design</button>
         </div>
       </div>
+
+      ${revHtml}
 
       <div class="fhead">
         <div class="fmeta">
@@ -659,6 +741,7 @@
     currentId = d.id;
 
     const t = getTriage(d.id);
+    const resInfo = getFindingResolutionInfo(d);
     const sevMeta = report?.SEV?.[d.sev] || { l: d.sev };
     const earlierLinks = (d.earlier || [])
       .map(
@@ -670,6 +753,53 @@
     const mermaidHtml = d.mermaid
       ? `<div class="diaslot"><div class="mermaid">${escapeHtml(d.mermaid)}</div></div>`
       : '';
+
+    let lifecycleBannerHtml = '';
+    if (resInfo.hasExplicitStatus || resInfo.hasExistingThread) {
+      const stateTitleMap = {
+        fixed: '✅ Verified Fixed in Latest Commits',
+        external: '✅ Resolved on Base Branch (External)',
+        dropped: '🔇 Dropped / Dismissed',
+        partial: '⚠️ Partially Fixed — Failure Still Reachable',
+        rebutted: '🔄 Author Rebuttal Reviewed — Defect Still Holds',
+        open: '🔄 Still Open in Latest Commits'
+      };
+      const bannerTitle = stateTitleMap[resInfo.state] || `Status: ${resInfo.state}`;
+      const ghStatusBadge = resInfo.hasExistingThread
+        ? `<a href="${escapeHtml(resInfo.ghThread?.htmlUrl || t.ghUrl || '#')}" target="_blank" rel="noopener" class="tpill" style="text-decoration:none;">
+            🔗 GitHub Thread #${escapeHtml(String(resInfo.ghThread?.commentId || t.ghCommentId))} (${resInfo.ghResolved ? 'Resolved on GH' : 'Open on GH'})
+           </a>`
+        : '';
+      const publishBehaviorText = resInfo.hasExistingThread
+        ? resInfo.isResolved || t.action === 'dismiss'
+          ? 'Publishing will reply <code>✅ Verified Fixed / Resolved</code> to this existing GitHub thread and mark it <strong>Resolved</strong>.'
+          : resInfo.ghResolved
+            ? 'Publishing will <strong>reply to this existing GitHub thread</strong> (no duplicate comment) and <strong>reopen (unresolve)</strong> it on GitHub.'
+            : 'Publishing will <strong>append a follow-up reply to this existing GitHub thread</strong> instead of creating a new duplicate comment.'
+        : '';
+
+      lifecycleBannerHtml = `<div class="layer-card" style="margin-bottom:14px;border-color:${
+        resInfo.isResolved ? 'var(--ok)' : 'var(--s-medium)'
+      };background:${resInfo.isResolved ? 'var(--ok-tint)' : 'var(--s-medium-tint)'};">
+        <div class="layer-card-header">
+          <strong>${bannerTitle}</strong>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${d.status?.evidence ? `<code style="font-size:11.5px;">${escapeHtml(d.status.evidence)}</code>` : ''}
+            ${ghStatusBadge}
+          </div>
+        </div>
+        ${d.status?.note ? `<div class="prose" style="margin-top:4px;font-size:12.5px;">${d.status.note}</div>` : ''}
+        ${
+          d.status?.dev?.quote
+            ? `<blockquote style="margin:6px 0;padding:6px 10px;border-left:3px solid var(--rule-strong);background:var(--surface);font-size:12px;">
+                “${escapeHtml(d.status.dev.quote)}” — <strong>@${escapeHtml(d.status.dev.who || 'author')}</strong>
+                ${d.status.dev.verdict ? `<div class="prose" style="margin-top:4px;">${d.status.dev.verdict}</div>` : ''}
+              </blockquote>`
+            : ''
+        }
+        ${publishBehaviorText ? `<div style="margin-top:6px;font-size:11.5px;color:var(--ink-2);">💡 ${publishBehaviorText}</div>` : ''}
+      </div>`;
+    }
 
     return `<div class="panein" style="${sevVars(d.sev)}">
       <div class="triage-card">
@@ -684,13 +814,15 @@
             💬 Comment / Nit
           </button>
           <button type="button" class="tbtn${t.action === 'dismiss' ? ' on' : ''}" data-triage="dismiss" title="Shortcut: x">
-            🔇 Dismiss (Skip)
+            🔇 ${resInfo.hasExistingThread ? 'Resolve / Dismiss' : 'Dismiss (Skip)'}
           </button>
           <button type="button" class="btn" id="copyFixPromptBtn" title="Copy structured fix instruction for your Coding Agent">
             🤖 Copy Agent Fix Prompt
           </button>
         </div>
       </div>
+
+      ${lifecycleBannerHtml}
 
       <div class="fhead">
         <div class="fmeta">
@@ -867,18 +999,99 @@
 
   function buildGitHubPreviewPayload() {
     const issues = report?.DATA || [];
+    const existingThreads = report?.GITHUB_STATE?.findingThreads || {};
     const published = issues.filter((d) => {
       const a = getTriage(d.id).action;
-      return a === 'block' || a === 'comment';
+      const resInfo = getFindingResolutionInfo(d);
+      if (resInfo.hasExistingThread && (resInfo.isResolved || a === 'dismiss' || a === 'block' || a === 'comment')) {
+        return true;
+      }
+      return (a === 'block' || a === 'comment') && !resInfo.isStateResolved;
     });
     const selectedEvent =
       document.querySelector('input[name="ghReviewEvent"]:checked')?.value || 'REQUEST_CHANGES';
     const summaryNote = $('#ghSummaryNote')?.value || '';
+    const rawHead = String(report?.REVIEW?.head || '').trim();
+    const shortHead = rawHead ? rawHead.slice(0, 8) : 'HEAD';
 
     const inlineComments = [];
+    const threadUpdates = [];
     const outOfHunkBodies = [];
     for (const d of published) {
       const t = getTriage(d.id);
+      const resInfo = getFindingResolutionInfo(d);
+      const existingThread =
+        existingThreads[d.id] ||
+        (t.ghCommentId ? { commentId: t.ghCommentId, threadId: t.ghThreadId, isResolved: t.ghIsResolved } : null);
+
+      // If this finding already has a thread on GitHub, reply & resolve/reopen that thread instead of creating a duplicate!
+      if (existingThread && existingThread.commentId) {
+        const state = resInfo.state || 'open';
+        const isResolvedOrDismissed = resInfo.isStateResolved || t.action === 'dismiss';
+        const effectiveAction = isResolvedOrDismissed ? 'dismiss' : t.action || 'comment';
+        const updMeta = {
+          v: 1,
+          id: d.id,
+          state,
+          action: effectiveAction,
+          head: rawHead,
+          pr: report?.REVIEW?.pr || null
+        };
+        const replyLines = [`<!-- crv-finding-update: ${JSON.stringify(updMeta)} -->`];
+        if (state === 'fixed' || state === 'external') {
+          replyLines.push(
+            `✅ **Verified ${state === 'external' ? 'Resolved Upstream' : 'Fixed'}** (\`${d.id}\` at \`${shortHead}\`)`
+          );
+        } else if (state === 'dropped' || t.action === 'dismiss') {
+          replyLines.push(`🔇 **Resolved / Dismissed** (\`${d.id}\` at \`${shortHead}\`)`);
+        } else {
+          const stateLabel =
+            state === 'partial'
+              ? '⚠️ **Partially Fixed — Still Open**'
+              : state === 'rebutted'
+                ? '🔄 **Rebuttal Reviewed — Still Open**'
+                : '🔄 **Still Open**';
+          const actionBadge = effectiveAction === 'block' ? '🚫 **Blocking**' : '💬 **Comment**';
+          replyLines.push(`${stateLabel} (\`${d.id}\` at \`${shortHead}\` · ${actionBadge})`);
+        }
+        if (t.note) {
+          replyLines.push('', `> **Reviewer Note:** ${t.note}`);
+        }
+        const statusNoteMd = stripHtmlToMd(d.status?.note || '');
+        if (statusNoteMd || d.status?.evidence) {
+          replyLines.push(
+            '',
+            `${statusNoteMd}${d.status?.evidence ? ` (verified at \`${d.status.evidence}\`)` : ''}`.trim()
+          );
+        }
+        if (d.status?.dev?.quote) {
+          replyLines.push(
+            '',
+            `> "${d.status.dev.quote}" — @${d.status.dev.who || 'author'}`,
+            d.status.dev.verdict ? `\n${stripHtmlToMd(d.status.dev.verdict)}` : ''
+          );
+        }
+        if (!isResolvedOrDismissed && d.suggestion) {
+          replyLines.push('', `\`\`\`suggestion\n${String(d.suggestion).replace(/\r?\n$/, '')}\n\`\`\``);
+        }
+
+        threadUpdates.push({
+          id: d.id,
+          commentId: existingThread.commentId,
+          threadId: existingThread.threadId || null,
+          state,
+          action: effectiveAction,
+          head: rawHead,
+          resolutionAction: isResolvedOrDismissed ? 'resolve' : 'unresolve',
+          body: replyLines.filter(Boolean).join('\n').trim()
+        });
+        continue;
+      }
+
+      if (resInfo.isStateResolved || t.action === 'dismiss') {
+        continue;
+      }
+
       const locMatch = /^(.+):(\d+)(?:-(\d+))?$/.exec(String(d.loc || '').trim());
       const filePath = locMatch ? locMatch[1] : String(d.loc || '').trim();
       const lineNum = locMatch ? Number(locMatch[2]) : 1;
@@ -891,7 +1104,7 @@
         action: t.action,
         loc: d.loc || '',
         title: d.title || '',
-        head: report?.REVIEW?.head || '',
+        head: rawHead,
         pr: report?.REVIEW?.pr || null
       };
       const bodyParts = [
@@ -954,8 +1167,12 @@
       }
     }
 
-    const counts = { block: 0, comment: 0, dismiss: 0, pending: 0 };
+    const counts = { block: 0, comment: 0, dismiss: 0, pending: 0, fixed: 0 };
     for (const d of issues) {
+      const resInfo = getFindingResolutionInfo(d);
+      if (resInfo.state === 'fixed' || resInfo.state === 'external') {
+        counts.fixed++;
+      }
       const act = getTriage(d.id).action || 'pending';
       counts[act] = (counts[act] || 0) + 1;
     }
@@ -964,7 +1181,7 @@
       v: 1,
       repo: report?.REVIEW?.repo || '',
       pr: report?.REVIEW?.pr || 0,
-      head: report?.REVIEW?.head || '',
+      head: rawHead,
       counts,
       triage: Object.fromEntries(
         issues.map((d) => [d.id, { action: getTriage(d.id).action, done: Boolean(getTriage(d.id).done), note: getTriage(d.id).note }])
@@ -980,7 +1197,8 @@
       `| :--- | :---: | :--- |`,
       `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
       `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
-      `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
+      ...(counts.fixed > 0 ? [`| ✅ **Verified Fixed** | **${counts.fixed}** | Confirmed resolved in latest commits |`] : []),
+      `| 🔇 **Dismissed / Resolved** | **${counts.dismiss}** | Filtered out or resolved by reviewer |`,
       `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`
     ].filter(Boolean);
 
@@ -988,11 +1206,11 @@
       overviewLines.push('', '---', '### Findings Outside Diff Hunks', '', outOfHunkBodies.join('\n\n---\n\n'));
     }
 
-    const rawHead = String(report?.REVIEW?.head || '').trim();
     const reviewPayload = {
       event: selectedEvent,
       body: overviewLines.join('\n').trim(),
-      comments: inlineComments
+      comments: inlineComments,
+      threadUpdates
     };
     if (/^[0-9a-f]{40}$/i.test(rawHead)) {
       reviewPayload.commit_id = rawHead;
@@ -1009,7 +1227,14 @@
     }
     const statsEl = $('#ghModalStats');
     if (statsEl) {
-      statsEl.textContent = `${payload.comments.length} inline PR review thread comments + 1 sticky crv-meta overview comment`;
+      const updates = payload.threadUpdates || [];
+      const toResolve = updates.filter((u) => u.resolutionAction === 'resolve').length;
+      const toReopen = updates.filter((u) => u.resolutionAction === 'unresolve').length;
+      const updateDesc =
+        updates.length > 0
+          ? ` · ${updates.length} existing thread repl${updates.length === 1 ? 'y' : 'ies'} (${toResolve} to resolve, ${toReopen} to keep open/reopen)`
+          : '';
+      statsEl.textContent = `${payload.comments.length} new inline thread${payload.comments.length === 1 ? '' : 's'}${updateDesc} + 1 sticky crv-meta overview comment`;
     }
   }
 

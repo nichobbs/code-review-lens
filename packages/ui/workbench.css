@@ -493,6 +493,11 @@ html, body {
   color: var(--muted);
 }
 
+.triage-chip.fixed {
+  background: var(--ok-tint);
+  color: var(--ok);
+}
+
 /* Right Column: Detail Pane */
 .pane {
   display: flex;

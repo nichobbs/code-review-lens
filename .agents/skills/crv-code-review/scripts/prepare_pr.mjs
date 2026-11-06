@@ -23,11 +23,13 @@ const vendoredCorePath = path.resolve(scriptDir, './lib/core/index.js');
 const monorepoCorePath = path.resolve(scriptDir, '../../../../packages/core/index.js');
 const corePath = fs.existsSync(vendoredCorePath) ? vendoredCorePath : monorepoCorePath;
 const {
+  REVIEW_THREADS_GRAPHQL_QUERY,
   parseUnifiedDiff,
   buildLayersFromParsedDiff,
   parseCodeowners,
   matchCodeowners,
   hydrateFromGitHubComments,
+  mergeGraphqlReviewThreads,
   parsePaginatedGhJson,
   fetchPrDiffWithFallback,
   resolveRepoConfig
@@ -320,6 +322,24 @@ function main() {
           runGh(['api', `repos/${resolvedRepo}/pulls/${prNum}/comments`, '--paginate', '--slurp']) || '[]'
         );
         hydratedThreads = hydrateFromGitHubComments(issueComments, reviewComments);
+        const [owner, name] = String(resolvedRepo).split('/');
+        if (owner && name && Object.keys(hydratedThreads.findingThreads || {}).length > 0) {
+          try {
+            const gqlOut = runGh([
+              'api',
+              'graphql',
+              '-f',
+              `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
+              '-F',
+              `owner=${owner}`,
+              '-F',
+              `name=${name}`,
+              '-F',
+              `pr=${prNum}`
+            ]);
+            mergeGraphqlReviewThreads(hydratedThreads, gqlOut);
+          } catch (e) {}
+        }
       } catch (err) {
         hydratedThreads.syncWarning = err.message;
       }
@@ -552,11 +572,100 @@ function main() {
       '```diff',
       formatLineNumberedDiff(parsedFiles),
       '```'
-    ]
-      .filter(Boolean)
-      .join('\n');
+    ];
 
-    fs.writeFileSync(path.join(absScratch, 'review-pack.md'), reviewPack);
+    // Check if an earlier findings.json or published GitHub crv-finding threads exist -> stage Re-Review context
+    const existingFindingsPath = path.join(absScratch, 'findings.json');
+    const prevFindingsPath = path.join(absScratch, 'previous-findings.json');
+    let previousFindings = null;
+    if (fs.existsSync(existingFindingsPath)) {
+      try {
+        previousFindings = JSON.parse(fs.readFileSync(existingFindingsPath, 'utf8'));
+        fs.writeFileSync(prevFindingsPath, JSON.stringify(previousFindings, null, 2));
+      } catch (e) {}
+    } else if (fs.existsSync(prevFindingsPath)) {
+      try {
+        previousFindings = JSON.parse(fs.readFileSync(prevFindingsPath, 'utf8'));
+      } catch (e) {}
+    }
+
+    const ghThreadList = Object.values(hydratedThreads.findingThreads || {});
+    if (previousFindings || ghThreadList.length > 0) {
+      const reReviewDocPath = path.join(skillRoot, 'references', 're-review.md');
+      const reReviewDoc = fs.existsSync(reReviewDocPath) ? fs.readFileSync(reReviewDocPath, 'utf8') : '';
+      const reviewedCommit =
+        previousFindings?.meta?.revision?.headCommit ||
+        previousFindings?.meta?.headCommit ||
+        previousFindings?.meta?.review?.head ||
+        hydratedThreads?.overviewMeta?.head ||
+        '';
+      const currentHead = prMeta?.headRefOid || '';
+      let incrementalCommits = '';
+      let incrementalDiff = '';
+      if (reviewedCommit && currentHead && reviewedCommit !== currentHead) {
+        const logRes = spawnSync('git', ['log', '--format=%h %s', `${reviewedCommit}..${currentHead}`], {
+          encoding: 'utf8',
+          timeout: 5000
+        });
+        if (logRes.status === 0 && logRes.stdout) {
+          incrementalCommits = logRes.stdout.trim();
+        }
+        const incDiffRes = spawnSync('git', ['diff', '-M', reviewedCommit, currentHead], {
+          encoding: 'utf8',
+          timeout: 5000,
+          maxBuffer: 10 * 1024 * 1024
+        });
+        if (incDiffRes.status === 0 && incDiffRes.stdout) {
+          incrementalDiff = formatLineNumberedDiff(parseUnifiedDiff(incDiffRes.stdout), 14000);
+        }
+      }
+
+      const earlierItems = (previousFindings?.issues || []).length
+        ? previousFindings.issues.map((iss) => {
+            const ghT = hydratedThreads.findingThreads?.[iss.id];
+            return {
+              id: iss.id,
+              sev: iss.sev,
+              verify: iss.verify,
+              loc: iss.loc,
+              title: iss.title,
+              impact: iss.impact,
+              fix: iss.fix,
+              ghAction: ghT?.action || null,
+              ghIsResolved: Boolean(ghT?.isResolved),
+              ghNote: ghT?.note || '',
+              ghReplies: ghT?.replies || []
+            };
+          })
+        : ghThreadList.map((ghT) => ({
+            id: ghT.id,
+            sev: ghT.meta?.sev || 'medium',
+            verify: ghT.meta?.verify || 'CONFIRMED',
+            loc: ghT.meta?.loc || `${ghT.path || ''}:${ghT.line || 1}`,
+            title: ghT.title,
+            ghAction: ghT.action,
+            ghIsResolved: Boolean(ghT.isResolved),
+            ghNote: ghT.note || '',
+            ghReplies: ghT.replies || []
+          }));
+
+      reviewPack.push(
+        '',
+        `## 8. Re-Review Mode (Earlier Findings & GitHub Threads Detected)`,
+        `- **Earlier Reviewed Commit (\`<reviewed>\`):** \`${reviewedCommit || 'unknown'}\``,
+        `- **Current Head Commit (\`<head>\`):** \`${currentHead || 'HEAD'}\``,
+        `- **IMPORTANT:** Keep every earlier finding below in \`issues\` with its exact original \`id\` (\`H1\`, \`M1\`, etc.) and set \`status: { "state": "fixed" | "partial" | "open" | "rebutted" | "dropped" | "external", "note": "...", "evidence": "<path>:<line>" }\`. Publishing in the Workbench will automatically reply to and resolve/reopen each matching GitHub PR review thread by \`id\`! Any brand-new defect introduced in \`<reviewed>..<head>\` gets \`"isNew": true\` and ID \`R1\`, \`R2\`, etc.`,
+        incrementalCommits ? `### Commits Since Last Review (\`${reviewedCommit.slice(0, 8)}..${currentHead.slice(0, 8)}\`)\n\`\`\`text\n${incrementalCommits}\n\`\`\`` : '',
+        incrementalDiff ? `### Incremental Diff (\`${reviewedCommit.slice(0, 8)}..${currentHead.slice(0, 8)}\`)\n\`\`\`diff\n${incrementalDiff}\n\`\`\`` : '',
+        `### Earlier Findings & GitHub Thread Replies`,
+        '```json',
+        JSON.stringify(earlierItems, null, 2),
+        '```',
+        reReviewDoc
+      );
+    }
+
+    fs.writeFileSync(path.join(absScratch, 'review-pack.md'), reviewPack.filter(Boolean).join('\n'));
   } catch (e) {}
 
   const totalCases = layers.testMatrix.reduce((acc, f) => acc + f.cases.length, 0);
