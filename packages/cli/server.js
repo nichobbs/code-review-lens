@@ -4,8 +4,8 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
-const vm = require('vm');
+const { spawn } = require('child_process');
+const crypto = require('crypto');
 const {
   REVIEW_THREADS_GRAPHQL_QUERY,
   hydrateFromGitHubComments,
@@ -22,82 +22,83 @@ const {
   resolveRepoConfig,
   saveDefaultRepoConfig,
   resolveAgentConfig,
-  saveDefaultAgentConfig
+  saveDefaultAgentConfig,
+  isValidRepoSlug,
+  parsePrNumber,
+  resolveTrustedAuthors,
+  foldCommentsIntoBody,
+  capComment
 } = require('../core');
+const { sanitizeReport } = require('../ui/sanitize.js');
 
 const UI_DIR = path.resolve(__dirname, '../ui');
 const DEFAULT_FIXTURE = path.resolve(__dirname, '../../fixtures/pr1230-report.json');
 
+const MAX_REPORT_BYTES = 50 * 1024 * 1024;
+
 /**
- * Extracts a report object from a Workbench `.json`, a raw `crv-code-review` `findings.json`,
- * or a `crv-code-review` `.html` file.
+ * Extracts a report object from a Workbench `.json`, a raw `findings.json`, or a standalone
+ * Workbench `.html` export (embedded `crv-findings` / `__CRV_INITIAL_REPORT__` JSON).
+ *
+ * Reports may come from a colleague, CI or an agent, so they are untrusted: HTML-bearing fields of
+ * pre-compiled reports are sanitised, and no report content is ever executed (no `vm`, no `eval`).
  */
 function loadReportFile(filePath, options = {}) {
   const resolved = path.resolve(filePath || DEFAULT_FIXTURE);
+  if (fs.statSync(resolved).size > MAX_REPORT_BYTES) {
+    throw new Error(`Report file ${path.basename(resolved)} exceeds ${MAX_REPORT_BYTES} bytes`);
+  }
   const content = fs.readFileSync(resolved, 'utf8');
   if (resolved.endsWith('.json')) {
-    const parsed = JSON.parse(content);
-    if (parsed && Array.isArray(parsed.issues) && !Array.isArray(parsed.DATA)) {
-      const dir = path.dirname(resolved);
-      let diffText = options.diffText || '';
-      if (!diffText && options.diffPath && fs.existsSync(options.diffPath)) {
-        diffText = fs.readFileSync(options.diffPath, 'utf8');
-      } else if (!diffText) {
-        const siblingDiff = path.join(dir, 'diff.patch');
-        if (fs.existsSync(siblingDiff)) {
-          diffText = fs.readFileSync(siblingDiff, 'utf8');
-        }
-      }
-      let prMeta = options.prMeta || null;
-      if (!prMeta) {
-        const siblingPrMeta = path.join(dir, 'pr-meta.json');
-        if (fs.existsSync(siblingPrMeta)) {
-          try {
-            prMeta = JSON.parse(fs.readFileSync(siblingPrMeta, 'utf8'));
-          } catch (e) {}
-        }
-      }
-      let layers = options.layers || null;
-      if (!layers) {
-        const siblingLayers = path.join(dir, 'layers.json');
-        if (fs.existsSync(siblingLayers)) {
-          try {
-            layers = JSON.parse(fs.readFileSync(siblingLayers, 'utf8'));
-          } catch (e) {}
-        }
-      }
-      const warnings = checkFindingsShape(parsed);
-      if (warnings.length) {
-        console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
-      }
-      return compileFindingsToWorkbenchReport(parsed, {
-        diffText,
-        prMeta,
-        layers,
-        outPath: options.outPath
-      });
-    }
-    return parsed;
+    return reportFromParsedJson(JSON.parse(content), resolved, options);
   }
-  // Check if HTML has embedded <script id="crv-findings"> or window.__CRV_INITIAL_REPORT__
+
   const initMatch = /window\.__CRV_INITIAL_REPORT__\s*=\s*(\{[\s\S]*?\});\s*<\/script>/.exec(content);
   if (initMatch) {
-    return JSON.parse(initMatch[1]);
+    return sanitizeReport(JSON.parse(initMatch[1]));
   }
-  // Parse crv-code-review single-file HTML report
-  const lines = content.split('\n');
-  const dataLineIdx = lines.findIndex((l) => l.startsWith('const DATA=['));
-  if (dataLineIdx === -1) {
-    throw new Error(`Could not find const DATA=[...] in ${resolved}`);
+  const findingsMatch = /<script type="application\/json" id="crv-findings">([\s\S]*?)<\/script>/.exec(content);
+  if (findingsMatch) {
+    return reportFromParsedJson(JSON.parse(findingsMatch[1]), resolved, options);
   }
-  const scriptBlock = lines.slice(dataLineIdx, dataLineIdx + 2).join('\n');
-  const sandbox = {};
-  vm.runInNewContext(
-    scriptBlock +
-      '\n;globalThis.__out = { DATA, SEV, ORDER, KEY, SUMMARY, STAT, REV, PR, XMETA, REVIEW, LENSES };',
-    sandbox
+  throw new Error(
+    `Unsupported report file ${path.basename(resolved)}: expected a Workbench/findings .json or a crv standalone .html export. ` +
+      'Legacy single-file HTML reports are no longer parsed because that required executing report content; re-export from findings.json.'
   );
-  return sandbox.__out;
+}
+
+function reportFromParsedJson(parsed, resolved, options) {
+  if (parsed && Array.isArray(parsed.issues) && !Array.isArray(parsed.DATA)) {
+    let diffText = options.diffText || '';
+    if (!diffText && options.diffPath && fs.existsSync(options.diffPath)) {
+      diffText = fs.readFileSync(options.diffPath, 'utf8');
+    } else if (!diffText) {
+      const siblingDiff = path.join(path.dirname(resolved), 'diff.patch');
+      if (fs.existsSync(siblingDiff)) {
+        diffText = fs.readFileSync(siblingDiff, 'utf8');
+      }
+    }
+    const warnings = checkFindingsShape(parsed);
+    if (warnings.length) {
+      console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
+    }
+    const dir = path.dirname(resolved);
+    const readSibling = (name, given) => {
+      if (given) return given;
+      const sibling = path.join(dir, name);
+      if (!fs.existsSync(sibling) || fs.statSync(sibling).size > MAX_REPORT_BYTES) return null;
+      try {
+        return JSON.parse(fs.readFileSync(sibling, 'utf8'));
+      } catch (e) {
+        return null;
+      }
+    };
+    const prMeta = readSibling('pr-meta.json', options.prMeta);
+    const layers = readSibling('layers.json', options.layers);
+    // The compiler escapes agent text itself, so its output is already inside the allow-list.
+    return compileFindingsToWorkbenchReport(parsed, { diffText, prMeta, layers, outPath: options.outPath });
+  }
+  return sanitizeReport(parsed);
 }
 
 /**
@@ -153,21 +154,6 @@ function extractGhErrorMessage(res) {
   return stderr || stdout || 'gh api failed';
 }
 
-/**
- * Calls `gh api` safely via spawnSync (no shell interpolation).
- */
-function runGhApi(args, inputStr) {
-  const res = spawnSync('gh', ['api', ...args], {
-    input: inputStr,
-    encoding: 'utf8',
-    maxBuffer: 20 * 1024 * 1024
-  });
-  if (res.status !== 0) {
-    throw new Error(extractGhErrorMessage(res));
-  }
-  return res.stdout;
-}
-
 async function runGhApiAsync(args, inputStr) {
   const res = await spawnGhAsync(['api', ...args], {
     input: inputStr,
@@ -211,38 +197,6 @@ function formatGhError(rawErr, repo, prNum) {
     return `${msg}\n\nHow to fix this:\n  • Authenticate GitHub CLI by running: gh auth login`;
   }
   return msg;
-}
-
-/**
- * Lists recent PRs from a GitHub repository via `gh pr list`.
- */
-function listRecentPrs(explicitRepo, limit = 10) {
-  const resolved = resolveRepoConfig({ explicitRepo });
-  if (!resolved.repo) {
-    throw new Error(
-      'No default repository configured. Enter "owner/repo" above and click "Save as Default", or run "crv repo <owner/repo>" in your terminal.'
-    );
-  }
-  const repoArgs = ['--repo', resolved.repo];
-  const res = spawnSync(
-    'gh',
-    [
-      'pr',
-      'list',
-      ...repoArgs,
-      '--state',
-      'all',
-      '--limit',
-      String(limit),
-      '--json',
-      'number,title,state,author,updatedAt,url'
-    ],
-    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
-  );
-  if (res.status !== 0) {
-    throw new Error(formatGhError(res.stderr || res.stdout || 'gh pr list failed', resolved.repo));
-  }
-  return JSON.parse(res.stdout || '[]');
 }
 
 async function listRecentPrsAsync(explicitRepo, limit = 10) {
@@ -446,8 +400,8 @@ function parsePrTargetInput(prInput, explicitRepo) {
   let repo = null;
   let prNumber = raw;
 
-  const urlMatch = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i.exec(raw);
-  const shortMatch = /^([^/]+\/[^#]+)#(\d+)$/.exec(raw);
+  const urlMatch = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[/?#].*)?$/i.exec(raw);
+  const shortMatch = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/.exec(raw);
   if (urlMatch) {
     repo = urlMatch[1];
     prNumber = urlMatch[2];
@@ -459,11 +413,14 @@ function parsePrTargetInput(prInput, explicitRepo) {
     repo = resolveRepoConfig({ explicitRepo }).repo;
   }
 
-  const prNumInt = Number(prNumber);
+  const prNumInt = parsePrNumber(prNumber);
   if (!prNumInt) {
     throw new Error(
       `Invalid PR identifier "${prInput}". Expected a PR number (e.g. 1230), owner/repo#number, or full GitHub PR URL.`
     );
+  }
+  if (repo && !isValidRepoSlug(repo)) {
+    throw new Error(`Invalid repository "${repo}". Expected "owner/repo".`);
   }
   if (!repo) {
     throw new Error(formatMissingRepoError(prNumInt));
@@ -471,80 +428,25 @@ function parsePrTargetInput(prInput, explicitRepo) {
   return { repo, prNumInt };
 }
 
+let trustedAuthorsPromise = null;
+
 /**
- * Loads any PR live from GitHub (`gh pr view` + `gh pr diff` + `gh api` comments),
- * combining existing `.crv-skills/crv-code-review/<pr>/findings.json` (if present) or
- * generating an immediate 4-Layer decomposition + automated test/thread findings.
+ * Logins whose `crv-*` markers are trusted: authenticated gh user + configured reviewers + bots.
+ * Resolved once per process (async, non-blocking). `override` lets tests/embedders inject a list.
  */
-function loadLivePrFromGitHub(prInput, explicitRepo) {
-  let { repo, prNumInt } = parsePrTargetInput(prInput, explicitRepo);
-  const repoArgs = ['--repo', repo];
-
-  const metaRes = spawnSync(
-    'gh',
-    [
-      'pr',
-      'view',
-      String(prNumInt),
-      ...repoArgs,
-      '--json',
-      'number,title,body,url,state,baseRefName,baseRefOid,headRefName,headRefOid,additions,deletions,changedFiles'
-    ],
-    { encoding: 'utf8', maxBuffer: 15 * 1024 * 1024 }
-  );
-  if (metaRes.status !== 0) {
-    throw new Error(formatGhError(metaRes.stderr || metaRes.stdout || `Failed to view PR #${prNumInt}`, repo, prNumInt));
+async function getTrustedAuthors(override) {
+  if (override) return override;
+  if (!trustedAuthorsPromise) {
+    trustedAuthorsPromise = (async () => {
+      let ghLogin = null;
+      try {
+        const res = await spawnGhAsync(['api', 'user', '--jq', '.login']);
+        if (res.status === 0) ghLogin = res.stdout.trim() || null;
+      } catch (e) {}
+      return resolveTrustedAuthors({ ghLogin }).logins;
+    })();
   }
-  const prMeta = JSON.parse(metaRes.stdout);
-  if (!repo && prMeta.url) {
-    const m = /github\.com\/([^/]+\/[^/]+)\/pull\//i.exec(prMeta.url);
-    if (m) repo = m[1];
-  }
-
-  let diffText = '';
-  try {
-    const fetchedDiff = fetchPrDiffWithFallback({
-      pr: prNumInt,
-      repo,
-      prMeta
-    });
-    diffText = fetchedDiff.diffText;
-  } catch (e) {}
-
-  let hydrated = { overviewMeta: null, findingThreads: {}, generalComments: [] };
-  try {
-    const issueComments = parsePaginatedGhJson(
-      runGhApi([`repos/${repo}/issues/${prNumInt}/comments`, '--paginate', '--slurp']) || '[]'
-    );
-    const reviewComments = parsePaginatedGhJson(
-      runGhApi([`repos/${repo}/pulls/${prNumInt}/comments`, '--paginate', '--slurp']) || '[]'
-    );
-    hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
-    const [owner, name] = String(repo).split('/');
-    if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
-      const gqlOut = runGhApi([
-        'graphql',
-        '-f',
-        `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
-        '-F',
-        `owner=${owner}`,
-        '-F',
-        `name=${name}`,
-        '-F',
-        `pr=${prNumInt}`
-      ]);
-      mergeGraphqlReviewThreads(hydrated, gqlOut);
-    }
-  } catch (e) {}
-
-  return buildLivePrReportFromFetchedData({
-    repo,
-    prNumInt,
-    prMeta,
-    diffText,
-    hydrated,
-    syncFn: syncReportWithGitHub
-  });
+  return trustedAuthorsPromise;
 }
 
 async function resolvePrDiffAsync({ repo, prNumInt, prMeta, initialDiffRes }) {
@@ -582,7 +484,7 @@ async function resolvePrDiffAsync({ repo, prNumInt, prMeta, initialDiffRes }) {
 /**
  * Async version of `loadLivePrFromGitHub` for non-blocking HTTP routes.
  */
-async function loadLivePrFromGitHubAsync(prInput, explicitRepo) {
+async function loadLivePrFromGitHubAsync(prInput, explicitRepo, ctx = {}) {
   let { repo, prNumInt } = parsePrTargetInput(prInput, explicitRepo);
   const repoArgs = ['--repo', repo];
 
@@ -619,7 +521,8 @@ async function loadLivePrFromGitHubAsync(prInput, explicitRepo) {
     ]);
     hydrated = hydrateFromGitHubComments(
       parsePaginatedGhJson(issueRaw || '[]'),
-      parsePaginatedGhJson(reviewRaw || '[]')
+      parsePaginatedGhJson(reviewRaw || '[]'),
+      { trustedAuthors: await getTrustedAuthors(ctx.trustedAuthors), currentHead: prMeta.headRefOid }
     );
   } catch (e) {}
 
@@ -628,78 +531,16 @@ async function loadLivePrFromGitHubAsync(prInput, explicitRepo) {
     prNumInt,
     prMeta,
     diffText,
-    hydrated,
-    syncFn: null
+    hydrated
   });
-  await syncReportWithGitHubAsync(compiled);
+  await syncReportWithGitHubAsync(compiled, ctx);
   return compiled;
 }
 
 /**
- * Enriches a report with live diff slices & existing GitHub PR comments using `gh`.
+ * Enriches a report with live diff slices and existing GitHub PR comments (async `gh`, never blocks the event loop).
  */
-function syncReportWithGitHub(report) {
-  const repo = report?.REVIEW?.repo;
-  const pr = report?.REVIEW?.pr;
-  if (!repo || !pr) return { synced: false, reason: 'Missing repo or PR number in report.REVIEW' };
-
-  try {
-    const issueCommentsRaw = runGhApi([`repos/${repo}/issues/${pr}/comments`, '--paginate', '--slurp']);
-    const reviewCommentsRaw = runGhApi([`repos/${repo}/pulls/${pr}/comments`, '--paginate', '--slurp']);
-    const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
-    const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
-    const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
-    try {
-      const [owner, name] = String(repo).split('/');
-      if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
-        const gqlOut = runGhApi([
-          'graphql',
-          '-f',
-          `query=${REVIEW_THREADS_GRAPHQL_QUERY}`,
-          '-F',
-          `owner=${owner}`,
-          '-F',
-          `name=${name}`,
-          '-F',
-          `pr=${pr}`
-        ]);
-        mergeGraphqlReviewThreads(hydrated, gqlOut);
-      }
-    } catch (e) {}
-
-    let diffText = '';
-    try {
-      const fetchedDiff = fetchPrDiffWithFallback({
-        pr,
-        repo,
-        prMeta: {
-          baseRefOid: report?.REVIEW?.base,
-          headRefOid: report?.REVIEW?.head
-        }
-      });
-      diffText = fetchedDiff.diffText;
-    } catch (e) {}
-
-    if (diffText) {
-      const parsedFiles = parseUnifiedDiff(diffText);
-      for (const finding of report.DATA || []) {
-        if (!finding.diffSlice && finding.loc) {
-          finding.diffSlice = extractDiffSlice(parsedFiles, finding.loc);
-        }
-      }
-    }
-
-    report.GITHUB_STATE = hydrated;
-    return { synced: true, hydrated };
-  } catch (err) {
-    return { synced: false, reason: err.message };
-  }
-}
-
-/**
- * Async version of `syncReportWithGitHub` for non-blocking HTTP routes.
- */
-async function syncReportWithGitHubAsync(report) {
+async function syncReportWithGitHubAsync(report, ctx = {}) {
   const repo = report?.REVIEW?.repo;
   const pr = report?.REVIEW?.pr;
   if (!repo || !pr) return { synced: false, reason: 'Missing repo or PR number in report.REVIEW' };
@@ -712,7 +553,10 @@ async function syncReportWithGitHubAsync(report) {
     ]);
     const issueComments = parsePaginatedGhJson(issueCommentsRaw || '[]');
     const reviewComments = parsePaginatedGhJson(reviewCommentsRaw || '[]');
-    const hydrated = hydrateFromGitHubComments(issueComments, reviewComments);
+    const hydrated = hydrateFromGitHubComments(issueComments, reviewComments, {
+      trustedAuthors: await getTrustedAuthors(ctx.trustedAuthors),
+      currentHead: report?.REVIEW?.head
+    });
     try {
       const [owner, name] = String(repo).split('/');
       if (owner && name && Object.keys(hydrated.findingThreads || {}).length > 0) {
@@ -779,16 +623,42 @@ function formatReportPageTitle(report) {
   return rawTitle || 'Agentic PR Review Workbench';
 }
 
+const CSP_META_RE = /(<meta http-equiv="Content-Security-Policy" content=")[^"]*(">)/;
+
+/** Content-Security-Policy for the Workbench. `scriptSrc` is `'self'` when served, hashes when inlined. */
+function buildCsp(scriptSrc = "'self'", { header = false } = {}) {
+  return [
+    "default-src 'none'",
+    `script-src ${scriptSrc}`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "connect-src 'self' http://127.0.0.1:* http://localhost:*",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "object-src 'none'",
+    ...(header ? ["frame-ancestors 'none'"] : [])
+  ].join('; ');
+}
+
 /**
- * Builds a single-file standalone HTML version of the upgraded 4-Layer Workbench.
+ * Builds a single-file standalone HTML version of the 4-Layer Workbench.
+ * Inline scripts are allow-listed by SHA-256 in the CSP so injected markup cannot execute.
  */
 function buildStandaloneHtml(report) {
   const css = fs.readFileSync(path.join(UI_DIR, 'workbench.css'), 'utf8');
   const mermaidJs = fs.readFileSync(path.join(UI_DIR, 'vendor/mermaid.min.js'), 'utf8');
+  const sanitizeJs = fs.readFileSync(path.join(UI_DIR, 'sanitize.js'), 'utf8');
   const workbenchJs = fs.readFileSync(path.join(UI_DIR, 'workbench.js'), 'utf8');
   const template = fs.readFileSync(path.join(UI_DIR, 'index.html'), 'utf8');
 
-  const safeJson = JSON.stringify(report).replace(/<\/script/gi, '<\\/script');
+  const escapeJsonForScript = (obj) =>
+    JSON.stringify(obj)
+      .replace(/<\/script/gi, '<\\/script')
+      .replace(/<!--/g, '<\\!--')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  const safeJson = escapeJsonForScript(report);
   const rawFindingsPayload = report.rawFindings || {
     meta: {
       title: report.XMETA?.title || '',
@@ -801,20 +671,51 @@ function buildStandaloneHtml(report) {
     },
     issues: report.DATA || []
   };
-  const safeRawFindings = JSON.stringify(rawFindingsPayload).replace(/<\/script/gi, '<\\/script');
+  const safeRawFindings = escapeJsonForScript(rawFindingsPayload);
   const safePageTitle = formatReportPageTitle(report)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-  return template
-    .replace('<title>Agentic PR Review Workbench</title>', `<title>${safePageTitle}</title>`)
-    .replace('<link rel="stylesheet" href="./workbench.css">', `<style>\n${css}\n</style>`)
+  const inlineScripts = [
+    `window.__CRV_INITIAL_REPORT__ = ${safeJson};`,
+    `\n${mermaidJs}\n`,
+    `\n${sanitizeJs}\n`,
+    `\n${workbenchJs}\n`
+  ];
+  const hashes = inlineScripts
+    .map((code) => `'sha256-${crypto.createHash('sha256').update(code, 'utf8').digest('base64')}'`)
+    .join(' ');
+
+  const html = template
+    .replace('<title>Agentic PR Review Workbench</title>', () => `<title>${safePageTitle}</title>`)
+    .replace('<link rel="stylesheet" href="./workbench.css">', () => `<style>\n${css}\n</style>`)
     .replace(
       '<script src="./vendor/mermaid.min.js"></script>',
-      `<script type="application/json" id="crv-findings">${safeRawFindings}</script>\n<script>window.__CRV_INITIAL_REPORT__ = ${safeJson};</script>\n<script>\n${mermaidJs}\n</script>`
+      () =>
+        `<script type="application/json" id="crv-findings">${safeRawFindings}</script>\n<script>${inlineScripts[0]}</script>\n<script>${inlineScripts[1]}</script>`
     )
-    .replace('<script src="./workbench.js"></script>', `<script>\n${workbenchJs}\n</script>`);
+    .replace('<script src="./sanitize.js"></script>', () => `<script>${inlineScripts[2]}</script>`)
+    .replace('<script src="./workbench.js"></script>', () => `<script>${inlineScripts[3]}</script>`);
+  return html.replace(CSP_META_RE, (_, open, close) => `${open}${buildCsp(hashes)}${close}`);
+}
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false;
+  return (
+    /^chrome-extension:\/\/[a-p]{32}$/.test(origin) ||
+    /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)
+  );
+}
+
+function applyCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (isAllowedCorsOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CRV-Token');
+  }
 }
 
 /**
@@ -883,12 +784,162 @@ function readJsonBody(req, maxBytes = 2 * 1024 * 1024) {
   });
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/**
+ * DNS-rebinding defence: only answer when the Host header names the loopback interface (and our port).
+ * A rebound attacker hostname never matches.
+ */
+function isAllowedHostHeader(hostHeader, boundPort) {
+  const raw = String(hostHeader || '');
+  const m = /^(\[[0-9a-f:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?$/i.exec(raw);
+  if (!m || !LOOPBACK_HOSTS.has(m[1].toLowerCase())) return false;
+  return !boundPort || !m[2] || Number(m[2]) === boundPort;
+}
+
+const REVIEW_EVENTS = new Set(['COMMENT', 'REQUEST_CHANGES']);
+const MAX_REVIEW_COMMENTS = 200;
+const MAX_REVIEW_BODY = 60000;
+
+/**
+ * Validates and re-builds the body POSTed to GitHub so only known fields reach the API.
+ * APPROVE is refused unless the server was started with `allowApprove`.
+ */
+function validateReviewPayload(payload, { allowApprove = false } = {}) {
+  const fail = (msg) => {
+    const err = new Error(`Invalid review payload: ${msg}`);
+    err.statusCode = 400;
+    return err;
+  };
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw fail('expected an object');
+  const event = payload.event === undefined ? 'COMMENT' : String(payload.event);
+  if (event === 'APPROVE' ? !allowApprove : !REVIEW_EVENTS.has(event)) {
+    throw fail(`event "${event}" is not allowed${event === 'APPROVE' ? ' (start with --allow-approve)' : ''}`);
+  }
+  const body = payload.body === undefined ? '' : payload.body;
+  if (typeof body !== 'string' || body.length > MAX_REVIEW_BODY) throw fail('body must be a string under 60000 chars');
+  const out = { event, body };
+  if (payload.commit_id !== undefined) {
+    if (typeof payload.commit_id !== 'string' || !/^[0-9a-f]{7,40}$/i.test(payload.commit_id)) throw fail('commit_id must be a git sha');
+    out.commit_id = payload.commit_id;
+  }
+  const comments = payload.comments === undefined ? [] : payload.comments;
+  if (!Array.isArray(comments) || comments.length > MAX_REVIEW_COMMENTS) throw fail('comments must be an array of at most 200 items');
+  out.comments = comments.map((c, i) => {
+    if (!c || typeof c !== 'object') throw fail(`comments[${i}] must be an object`);
+    if (typeof c.path !== 'string' || !c.path || c.path.length > 500 || c.path.includes('\0')) throw fail(`comments[${i}].path invalid`);
+    if (!Number.isInteger(c.line) || c.line < 1) throw fail(`comments[${i}].line invalid`);
+    if (typeof c.body !== 'string' || c.body.length > MAX_REVIEW_BODY) throw fail(`comments[${i}].body invalid`);
+    const side = c.side === 'LEFT' ? 'LEFT' : 'RIGHT';
+    return { path: c.path, line: c.line, side, body: c.body };
+  });
+  return out;
+}
+
+/**
+ * Moves inline comment lines that are outside the PR diff hunks onto a valid line (or folds them into the
+ * review body) using the report's `diffSlice` data, so GitHub does not reject the whole review with HTTP 422.
+ * Runs BEFORE `validateReviewPayload` so validation sees the final payload. Does not mutate its input.
+ */
+function alignInlineCommentsToHunks(payload, report) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const out = { ...payload };
+  if (out.commit_id !== undefined && !/^[0-9a-f]{40}$/i.test(String(out.commit_id).trim())) {
+    delete out.commit_id;
+  }
+  if (!Array.isArray(out.comments) || !Array.isArray(report?.DATA)) return out;
+  const validInline = [];
+  const foldedOut = [];
+  for (const c of out.comments) {
+    if (!c || typeof c !== 'object') {
+      validInline.push(c); // left for validateReviewPayload to reject
+      continue;
+    }
+    const matchIssue = report.DATA.find(
+      (d) =>
+        d.loc === `${c.path}:${c.line}` ||
+        (typeof c.body === 'string' && c.body.includes(`"id":"${d.id}"`)) ||
+        (d.diffSlice && d.diffSlice.path === c.path)
+    );
+    if (matchIssue && matchIssue.diffSlice && Array.isArray(matchIssue.diffSlice.lines)) {
+      const rightLines = matchIssue.diffSlice.lines.map((l) => l.newNumber).filter((n) => Number.isFinite(n));
+      if (rightLines.length === 0) foldedOut.push(c);
+      else if (rightLines.includes(c.line)) validInline.push(c);
+      else validInline.push({ ...c, line: rightLines[0] });
+    } else if (matchIssue && 'diffSlice' in matchIssue && !matchIssue.diffSlice) {
+      foldedOut.push(c);
+    } else {
+      validInline.push(c);
+    }
+  }
+  out.comments = validInline;
+  if (foldedOut.length > 0) {
+    const extra = foldedOut.map((c) => `#### \u{1F4C4} \`${c.path}:${c.line}\`\n\n${c.body}`).join('\n\n---\n\n');
+    out.body = capComment(`${out.body || ''}\n\n---\n### Findings Outside Diff Hunks\n\n${extra}`.trim());
+  }
+  return out;
+}
+
+const MAX_THREAD_UPDATES = 100;
+
+/**
+ * Thread follow-ups (reply + resolve/unresolve) are only honoured for threads that exist in the loaded report's
+ * trusted `GITHUB_STATE.findingThreads`. The comment id, thread id and target come from server state, never from
+ * the client, so a request cannot reply to or resolve arbitrary comments.
+ */
+function validateThreadUpdates(raw, report) {
+  if (!Array.isArray(raw)) return [];
+  const threads = report?.GITHUB_STATE?.findingThreads || {};
+  const out = [];
+  for (const u of raw.slice(0, MAX_THREAD_UPDATES)) {
+    if (!u || typeof u !== 'object') continue;
+    const known = Object.prototype.hasOwnProperty.call(threads, String(u.id)) ? threads[String(u.id)] : null;
+    if (!known || !Number.isSafeInteger(Number(known.commentId)) || Number(u.commentId) !== Number(known.commentId)) continue;
+    const resolutionAction = u.resolutionAction === 'resolve' || u.resolutionAction === 'unresolve' ? u.resolutionAction : null;
+    const threadId = typeof known.threadId === 'string' && /^[A-Za-z0-9_=-]{1,200}$/.test(known.threadId) ? known.threadId : null;
+    out.push({
+      id: String(u.id),
+      commentId: Number(known.commentId),
+      threadId,
+      body: typeof u.body === 'string' ? u.body.slice(0, MAX_REVIEW_BODY) : '',
+      resolutionAction,
+      state: typeof u.state === 'string' ? u.state.slice(0, 40) : undefined,
+      action: typeof u.action === 'string' ? u.action.slice(0, 40) : undefined,
+      head: typeof u.head === 'string' ? u.head.slice(0, 64) : undefined
+    });
+  }
+  return out;
+}
+
 function createWorkbenchServer(options = {}) {
   let report = options.report || loadReportFile(options.reportPath);
-  const allowLivePublish = options.dryRun ? false : options.publish !== false;
-  const lastSubmittedPath =
-    options.lastSubmittedPath || path.join(os.tmpdir(), 'crv-last-submitted-review.json');
+  // Publishing is OFF unless explicitly requested (--publish); --dry-run / --no-publish force it off.
+  const allowLivePublish = options.dryRun ? false : Boolean(options.publish);
+  const allowApprove = Boolean(options.allowApprove);
+  let lastSubmittedPath = options.lastSubmittedPath || null;
+  /** Private (0700) per-process directory: never a predictable, world-writable /tmp path. */
+  function getLastSubmittedPath() {
+    if (!lastSubmittedPath) {
+      lastSubmittedPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'crv-')), 'last-submitted-review.json');
+    }
+    return lastSubmittedPath;
+  }
+  const sessionToken = options.sessionToken || crypto.randomBytes(24).toString('hex');
+  const extensionIds = new Set(
+    (options.extensionIds || String(process.env.CRV_EXTENSION_IDS || '').split(',')).map((x) => String(x).trim()).filter(Boolean)
+  );
   const sseClients = new Set();
+
+  function hasValidToken(req, url) {
+    const supplied = Buffer.from(String(req.headers['x-crv-token'] || url.searchParams.get('token') || ''));
+    const expected = Buffer.from(sessionToken);
+    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+  }
+
+  function sendJson(res, status, payload) {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(payload));
+  }
 
   function broadcastEvent(eventName, payload) {
     const frame = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -902,12 +953,55 @@ function createWorkbenchServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    applyCorsHeaders(req, res);
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (!isAllowedHostHeader(req.headers.host, server.address() && server.address().port)) {
+      sendJson(res, 421, { ok: false, error: 'Misdirected request: unexpected Host header' });
+      return;
+    }
+    const url = new URL(req.url, `http://${req.headers.host}`);
 
     // Reject cross-origin POST requests to protect local state and GitHub credentials
     if (req.method === 'POST' && !isAllowedLocalOrigin(req)) {
-      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden cross-origin request' }));
+      sendJson(res, 403, { ok: false, error: 'Forbidden cross-origin request' });
+      return;
+    }
+
+    // Every API route except health/session needs the per-session token (Origin alone is not authentication).
+    const isApi = url.pathname.startsWith('/api/');
+    const isOpenRoute = url.pathname === '/api/health' || url.pathname === '/api/session';
+    if (isApi && !isOpenRoute && !hasValidToken(req, url)) {
+      sendJson(res, 401, { ok: false, error: 'Missing or invalid X-CRV-Token' });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/session') {
+      // Token hand-off for the browser extension only, and only for explicitly configured extension ids.
+      const m = /^chrome-extension:\/\/([a-p]{32})$/.exec(String(req.headers.origin || ''));
+      if (m && extensionIds.has(m[1])) {
+        sendJson(res, 200, { ok: true, token: sessionToken });
+      } else {
+        sendJson(res, 403, { ok: false, error: 'Set CRV_EXTENSION_IDS to the extension id to enable token hand-off' });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          status: 'online',
+          activeRepo: report?.REVIEW?.repo || null,
+          activePr: report?.REVIEW?.pr || null,
+          title: report?.XMETA?.title || null
+        })
+      );
       return;
     }
 
@@ -1022,11 +1116,16 @@ function createWorkbenchServer(options = {}) {
     if (req.method === 'POST' && url.pathname === '/api/github/load-pr') {
       try {
         const { prInput, repo } = await readJsonBody(req);
+        if (repo && !isValidRepoSlug(repo)) {
+          const err = new Error(`Invalid repository "${repo}". Expected "owner/repo".`);
+          err.statusCode = 400;
+          throw err;
+        }
         const resolved = resolveRepoConfig({
           explicitRepo: repo || options.explicitRepo,
           reportRepo: report?.REVIEW?.repo
         });
-        report = await loadLivePrFromGitHubAsync(prInput, resolved.repo);
+        report = await loadLivePrFromGitHubAsync(prInput, resolved.repo, { trustedAuthors: options.trustedAuthors });
         broadcastEvent('report-updated', { repo: report?.REVIEW?.repo, pr: report?.REVIEW?.pr });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true, report, resolvedRepo: report?.REVIEW?.repo || resolved.repo }));
@@ -1038,7 +1137,7 @@ function createWorkbenchServer(options = {}) {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/github/sync') {
-      const result = await syncReportWithGitHubAsync(report);
+      const result = await syncReportWithGitHubAsync(report, { trustedAuthors: options.trustedAuthors });
       if (result.synced) {
         broadcastEvent('report-updated', { repo: report?.REVIEW?.repo, pr: report?.REVIEW?.pr });
       }
@@ -1050,147 +1149,83 @@ function createWorkbenchServer(options = {}) {
     if (req.method === 'POST' && url.pathname === '/api/github/submit-review') {
       try {
         const { repo, pr, payload } = await readJsonBody(req);
-        if (payload && payload.commit_id && !/^[0-9a-f]{40}$/i.test(String(payload.commit_id).trim())) {
-          delete payload.commit_id;
+        const activeRepo = report?.REVIEW?.repo;
+        const activePr = report?.REVIEW?.pr;
+        if (!activeRepo || !activePr) {
+          const err = new Error('No active PR report loaded; load a PR before submitting a review.');
+          err.statusCode = 409;
+          throw err;
         }
-        // Sanitize inline comment lines against report.DATA diffSlice hunks so out-of-hunk lines don't trigger HTTP 422
-        if (payload && Array.isArray(payload.comments) && Array.isArray(report?.DATA)) {
-          const validInline = [];
-          const foldedOut = [];
-          for (const c of payload.comments) {
-            const matchIssue = report.DATA.find(
-              (d) =>
-                d.loc === `${c.path}:${c.line}` ||
-                (typeof c.body === 'string' && c.body.includes(`"id":"${d.id}"`)) ||
-                (d.diffSlice && d.diffSlice.path === c.path)
-            );
-            if (matchIssue && matchIssue.diffSlice && Array.isArray(matchIssue.diffSlice.lines)) {
-              const rightLines = matchIssue.diffSlice.lines
-                .map((l) => l.newNumber)
-                .filter((n) => Number.isFinite(n));
-              if (rightLines.length === 0) {
-                foldedOut.push(c);
-              } else if (rightLines.includes(c.line)) {
-                validInline.push(c);
-              } else {
-                validInline.push({ ...c, line: rightLines[0] });
-              }
-            } else if (matchIssue && 'diffSlice' in matchIssue && !matchIssue.diffSlice) {
-              foldedOut.push(c);
-            } else {
-              validInline.push(c);
-            }
-          }
-          payload.comments = validInline;
-          if (foldedOut.length > 0) {
-            const extra = foldedOut.map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`).join('\n\n---\n\n');
-            payload.body = `${payload.body || ''}\n\n---\n### Findings Outside Diff Hunks\n\n${extra}`.trim();
-          }
+        if (repo !== activeRepo || parsePrNumber(pr) !== Number(activePr)) {
+          const err = new Error(`Refusing to submit: target ${repo}#${pr} is not the active report (${activeRepo}#${activePr}).`);
+          err.statusCode = 409;
+          throw err;
         }
+        // 1. Align inline comment lines to the diff hunks (avoids HTTP 422), 2. then validate the FINAL payload.
+        const { threadUpdates: rawThreadUpdates, ...reviewInput } =
+          payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : { __invalid: payload };
+        const safePayload = validateReviewPayload(
+          '__invalid' in reviewInput ? payload : alignInlineCommentsToHunks(reviewInput, report),
+          { allowApprove }
+        );
+        const threadUpdates = validateThreadUpdates(rawThreadUpdates, report);
+        const savePath = getLastSubmittedPath();
         fs.writeFileSync(
-          lastSubmittedPath,
-          JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload }, null, 2)
+          savePath,
+          JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload: safePayload, threadUpdates }, null, 2),
+          { mode: 0o600 }
         );
 
-        if (allowLivePublish && repo && pr) {
-          const threadUpdates = Array.isArray(payload?.threadUpdates) ? payload.threadUpdates : [];
-          const reviewPayload = { ...payload };
-          delete reviewPayload.threadUpdates;
-
+        if (allowLivePublish) {
+          const reviewsPath = `repos/${activeRepo}/pulls/${activePr}/reviews`;
+          const post = (body) => runGhApiAsync(['--method', 'POST', reviewsPath, '--input', '-'], JSON.stringify(body));
+          const isUnprocessable = (e) => /HTTP 422|Unprocessable|could not be resolved|must be part of the diff/i.test(String((e && e.message) || ''));
           let mode = 'gh-api-live';
           let out = '{}';
-          const shouldPostReview =
-            (Array.isArray(reviewPayload.comments) && reviewPayload.comments.length > 0) ||
-            Boolean(reviewPayload.body) ||
-            threadUpdates.length === 0;
-
+          const shouldPostReview = safePayload.comments.length > 0 || Boolean(safePayload.body) || threadUpdates.length === 0;
           if (shouldPostReview) {
             try {
-              out = await runGhApiAsync(
-                ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-                JSON.stringify(reviewPayload)
-              );
+              out = await post(safePayload);
             } catch (firstErr) {
-              const msg = String(firstErr.message || '');
-              if (!/HTTP 422|Unprocessable Entity/i.test(msg)) {
-                throw firstErr;
-              }
-              // Retry 1: If event was REQUEST_CHANGES or APPROVE (e.g. reviewing own PR), downgrade to COMMENT
-              const fallbackPayload = { ...reviewPayload, event: 'COMMENT' };
-              delete fallbackPayload.commit_id;
+              if (!isUnprocessable(firstErr)) throw firstErr;
+              // Retry 1: REQUEST_CHANGES on your own PR is rejected: downgrade to COMMENT (never escalates) and drop the commit pin.
+              const downgraded = { ...safePayload, event: 'COMMENT' };
+              delete downgraded.commit_id;
               try {
-                out = await runGhApiAsync(
-                  ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-                  JSON.stringify(fallbackPayload)
-                );
+                out = await post(downgraded);
                 mode = 'gh-api-live (downgraded event to COMMENT for self-review)';
               } catch (secondErr) {
-                const msg2 = String(secondErr.message || '');
-                if (
-                  !/HTTP 422|Unprocessable Entity/i.test(msg2) ||
-                  !Array.isArray(fallbackPayload.comments) ||
-                  fallbackPayload.comments.length === 0
-                ) {
-                  throw secondErr;
-                }
-                // Retry 2: One or more inline comment lines are outside the PR diff on GitHub; fold comments into body
-                const foldedNotes = fallbackPayload.comments
-                  .map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`)
-                  .join('\n\n---\n\n');
-                const bodyOnlyPayload = {
-                  event: 'COMMENT',
-                  body: `${fallbackPayload.body || ''}\n\n---\n### Inline Findings\n\n${foldedNotes}`.trim(),
-                  comments: []
-                };
-                out = await runGhApiAsync(
-                  ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-                  JSON.stringify(bodyOnlyPayload)
-                );
-                mode = 'gh-api-live (folded out-of-hunk inline threads into review summary)';
+                if (!isUnprocessable(secondErr) || downgraded.comments.length === 0) throw secondErr;
+                // Retry 2: one inline comment outside the diff rejects the whole review: fold comments into the body.
+                out = await post(foldCommentsIntoBody(downgraded));
+                mode = 'gh-api-live-fallback-body (folded inline threads into review summary)';
               }
             }
           }
 
-          // Process follow-up replies & GraphQL thread resolve/unresolve (reopen) for existing threads
+          // Follow-up replies and GraphQL resolve/unresolve, only for threads that exist in the loaded (trusted) report.
           let repliedCount = 0;
           let resolvedCount = 0;
           let reopenedCount = 0;
           for (const upd of threadUpdates) {
-            if (!upd || !upd.commentId) continue;
             const existingThread = report?.GITHUB_STATE?.findingThreads?.[upd.id] || {};
-            const threadId = upd.threadId || existingThread.threadId || null;
             const lastUpd = existingThread.lastUpdate || null;
             const isDuplicateReply =
-              lastUpd &&
-              lastUpd.state === upd.state &&
-              lastUpd.action === upd.action &&
-              lastUpd.head &&
-              upd.head &&
-              lastUpd.head === upd.head;
+              lastUpd && lastUpd.state === upd.state && lastUpd.action === upd.action && lastUpd.head && upd.head && lastUpd.head === upd.head;
 
             if (!isDuplicateReply && upd.body) {
               try {
                 await runGhApiAsync(
-                  [
-                    '--method',
-                    'POST',
-                    `repos/${repo}/pulls/${pr}/comments/${upd.commentId}/replies`,
-                    '--input',
-                    '-'
-                  ],
+                  ['--method', 'POST', `repos/${activeRepo}/pulls/${activePr}/comments/${upd.commentId}/replies`, '--input', '-'],
                   JSON.stringify({ body: upd.body })
                 );
                 repliedCount++;
               } catch (e) {}
             }
 
-            if (threadId && (upd.resolutionAction === 'resolve' || upd.resolutionAction === 'unresolve')) {
-              const mutationName =
-                upd.resolutionAction === 'resolve' ? 'resolveReviewThread' : 'unresolveReviewThread';
-              const shouldMutate =
-                upd.resolutionAction === 'resolve'
-                  ? existingThread.isResolved !== true
-                  : existingThread.isResolved !== false;
+            if (upd.threadId && upd.resolutionAction) {
+              const mutationName = upd.resolutionAction === 'resolve' ? 'resolveReviewThread' : 'unresolveReviewThread';
+              const shouldMutate = upd.resolutionAction === 'resolve' ? existingThread.isResolved !== true : existingThread.isResolved !== false;
               if (shouldMutate) {
                 try {
                   await runGhApiAsync([
@@ -1198,7 +1233,7 @@ function createWorkbenchServer(options = {}) {
                     '-f',
                     `query=mutation($threadId: ID!) { ${mutationName}(input: { threadId: $threadId }) { thread { id isResolved } } }`,
                     '-F',
-                    `threadId=${threadId}`
+                    `threadId=${upd.threadId}`
                   ]);
                   if (upd.resolutionAction === 'resolve') resolvedCount++;
                   else reopenedCount++;
@@ -1208,11 +1243,11 @@ function createWorkbenchServer(options = {}) {
           }
 
           if (repliedCount > 0 || resolvedCount > 0 || reopenedCount > 0) {
-            const summaryBits = [];
-            if (repliedCount > 0) summaryBits.push(`${repliedCount} thread repl${repliedCount === 1 ? 'y' : 'ies'}`);
-            if (resolvedCount > 0) summaryBits.push(`${resolvedCount} resolved`);
-            if (reopenedCount > 0) summaryBits.push(`${reopenedCount} reopened`);
-            mode += ` + ${summaryBits.join(', ')}`;
+            const bits = [];
+            if (repliedCount > 0) bits.push(`${repliedCount} thread repl${repliedCount === 1 ? 'y' : 'ies'}`);
+            if (resolvedCount > 0) bits.push(`${resolvedCount} resolved`);
+            if (reopenedCount > 0) bits.push(`${reopenedCount} reopened`);
+            mode += ` + ${bits.join(', ')}`;
           }
 
           try {
@@ -1220,31 +1255,16 @@ function createWorkbenchServer(options = {}) {
             broadcastEvent('report-updated', { repo: report?.REVIEW?.repo, pr: report?.REVIEW?.pr });
           } catch (e) {}
 
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(
-            JSON.stringify({
-              ok: true,
-              mode,
-              savedTo: lastSubmittedPath,
-              repliedCount,
-              resolvedCount,
-              reopenedCount,
-              response: JSON.parse(out || '{}')
-            })
-          );
+          sendJson(res, 200, { ok: true, mode, savedTo: savePath, repliedCount, resolvedCount, reopenedCount, response: JSON.parse(out || '{}') });
         } else {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(
-            JSON.stringify({
-              ok: true,
-              mode: `dry-run (saved to ${lastSubmittedPath})`,
-              savedTo: lastSubmittedPath
-            })
-          );
+          sendJson(res, 200, {
+            ok: true,
+            mode: `dry-run (saved to ${savePath}; pass --publish for live GitHub POST)`,
+            savedTo: savePath
+          });
         }
       } catch (err) {
-        res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
+        sendJson(res, err.statusCode || 500, { ok: false, error: err.message });
       }
       return;
     }
@@ -1266,21 +1286,43 @@ function createWorkbenchServer(options = {}) {
       '.js': 'application/javascript; charset=utf-8',
       '.json': 'application/json; charset=utf-8'
     };
-    res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
+    const baseHeaders = {
+      'Content-Type': mimeTypes[ext] || 'application/octet-stream',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    };
+    if (ext === '.html') {
+      const html = fs
+        .readFileSync(filePath, 'utf8')
+        .replace(/(<meta name="crv-session-token" content=")[^"]*(">)/, (_, o, c) => `${o}${sessionToken}${c}`);
+      res.writeHead(200, {
+        ...baseHeaders,
+        'Cache-Control': 'no-store',
+        'Content-Security-Policy': buildCsp("'self'", { header: true })
+      });
+      res.end(html);
+      return;
+    }
+    res.writeHead(200, baseHeaders);
     fs.createReadStream(filePath).pipe(res);
   });
 
-  return { server, report, broadcastEvent };
+  return { server, report, broadcastEvent, sessionToken };
 }
 
 module.exports = {
   loadReportFile,
-  listRecentPrs,
   listRecentPrsAsync,
-  loadLivePrFromGitHub,
   loadLivePrFromGitHubAsync,
-  syncReportWithGitHub,
   syncReportWithGitHubAsync,
+  parsePrTargetInput,
+  formatMissingRepoError,
+  isAllowedHostHeader,
+  validateReviewPayload,
+  alignInlineCommentsToHunks,
+  validateThreadUpdates,
+  buildCsp,
   buildStandaloneHtml,
-  createWorkbenchServer
+  createWorkbenchServer,
+  isAllowedCorsOrigin
 };

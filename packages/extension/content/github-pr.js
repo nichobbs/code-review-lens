@@ -10,14 +10,59 @@
     return { repo: m[1], pr: Number(m[2]) };
   }
 
+  const ALLOWED_ACTIONS = ['block', 'comment', 'dismiss', 'pending'];
+  const ALLOWED_SEVS = ['high', 'medium', 'low', 'struct', 'nit', 'ci'];
+
+  /** Keep only typed scalar fields from marker JSON (never impact/fix/reasoning HTML). */
+  function pickFindingFields(raw) {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(raw.id)) return null;
+    const s = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+    return {
+      id: raw.id,
+      sev: ALLOWED_SEVS.includes(raw.sev) ? raw.sev : 'medium',
+      cat: s(raw.cat, 120),
+      verify: s(raw.verify, 20),
+      action: ALLOWED_ACTIONS.includes(raw.action) ? raw.action : 'comment',
+      loc: s(raw.loc, 400),
+      title: s(raw.title, 300),
+      head: /^[0-9a-f]{7,40}$/i.test(s(raw.head, 64)) ? raw.head : ''
+    };
+  }
+
+  function viewerLogin() {
+    return document.querySelector('meta[name="user-login"]')?.content || '';
+  }
+
+  function commentAuthor(el) {
+    const container = el.closest ? el.closest('.timeline-comment, .review-comment, .js-comment, .js-timeline-item') : null;
+    return container?.querySelector('a.author, .author')?.textContent?.trim() || '';
+  }
+
+  function extractPageMetadata(prInfo) {
+    const titleEl =
+      document.querySelector('.js-issue-title') ||
+      document.querySelector('bdi.markdown-title') ||
+      document.querySelector('.gh-header-title');
+    const branchEls = Array.from(document.querySelectorAll('.commit-ref'));
+    const baseBranch = branchEls[0]?.textContent?.trim() || '';
+    const headBranch = branchEls[1]?.textContent?.trim() || '';
+    return {
+      title: titleEl ? titleEl.textContent.trim() : `PR #${prInfo.pr}`,
+      url: `https://github.com/${prInfo.repo}/pull/${prInfo.pr}`,
+      baseBranch,
+      headBranch
+    };
+  }
+
   /**
    * Scans GitHub PR comment DOM nodes in batches using requestAnimationFrame
    * so we never block the main thread on large PR threads.
    */
   async function scanPageCommentsForCrvMarkers() {
     const prInfo = parsePrUrl();
-    if (!prInfo) return { repo: '', pr: 0, meta: null, findings: [] };
+    if (!prInfo) return { repo: '', pr: 0, title: '', url: '', meta: null, findings: [] };
 
+    const pageMeta = extractPageMetadata(prInfo);
     const commentElements = Array.from(
       document.querySelectorAll('.comment-body, textarea[name="comment[body]"]')
     );
@@ -40,7 +85,19 @@
             const findingMatch = FINDING_RE.exec(raw);
             if (findingMatch) {
               try {
-                findings.push(JSON.parse(findingMatch[1]));
+                const parsedFinding = pickFindingFields(JSON.parse(findingMatch[1]));
+                if (!parsedFinding) continue;
+                const headingEl = el.querySelector ? el.querySelector('h3, h4, strong') : null;
+                const textBody = (el.textContent || '').trim().slice(0, 4000);
+                const author = commentAuthor(el);
+                findings.push({
+                  ...parsedFinding,
+                  title: parsedFinding.title || (headingEl ? headingEl.textContent.trim().slice(0, 300) : ''),
+                  body: textBody,
+                  author,
+                  // Markers are plain text anyone can post: only the signed-in user's own comments are trusted.
+                  trusted: Boolean(author && viewerLogin() && author.toLowerCase() === viewerLogin().toLowerCase())
+                });
               } catch (e) {}
             }
           }
@@ -55,6 +112,7 @@
     return {
       repo: prInfo.repo,
       pr: prInfo.pr,
+      ...pageMeta,
       meta: discoveredMeta,
       findings
     };

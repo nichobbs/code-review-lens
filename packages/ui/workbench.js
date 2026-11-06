@@ -1,12 +1,47 @@
 (function () {
   'use strict';
 
+  try {
+    const meta = document.querySelector('meta[name="color-scheme"]');
+    if (meta) {
+      meta.content = localStorage.getItem('color-scheme') ?? 'light dark';
+    }
+  } catch (e) {}
+
   const OV = '__overview__';
   const CONTRACTS_VIEW = '__contracts__';
   const TESTS_VIEW = '__tests__';
   const RESOLVED_STATES = new Set(['fixed', 'external', 'dropped']);
+  const IS_EXTENSION_PAGE =
+    typeof window !== 'undefined' && window.location?.protocol === 'chrome-extension:';
+  const API_BASE = IS_EXTENSION_PAGE ? 'http://127.0.0.1:4320' : '';
 
-  let report = window.__CRV_INITIAL_REPORT__ || null;
+  function apiUrl(route) {
+    return `${API_BASE}${route}`;
+  }
+
+  const { sanitizeHtml, sanitizeReport } = window.CrvSanitize;
+
+  // Per-session API token: injected into the served index.html, or handed to a pinned extension via /api/session.
+  let sessionToken = document.querySelector('meta[name="crv-session-token"]')?.content || '';
+
+  async function ensureSessionToken() {
+    if (sessionToken || !IS_EXTENSION_PAGE) return sessionToken;
+    try {
+      const res = await fetch(apiUrl('/api/session'));
+      if (res.ok) sessionToken = (await res.json()).token || '';
+    } catch (e) {}
+    return sessionToken;
+  }
+
+  /** fetch() for crv API routes: always sends the session token. */
+  async function apiFetch(route, init = {}) {
+    await ensureSessionToken();
+    const headers = { ...(init.headers || {}), ...(sessionToken ? { 'X-CRV-Token': sessionToken } : {}) };
+    return fetch(apiUrl(route), { ...init, headers });
+  }
+
+  let report = window.__CRV_INITIAL_REPORT__ ? sanitizeReport(window.__CRV_INITIAL_REPORT__) : null;
   let activeLayer = 'findings'; // 'overview' | 'findings' | 'contracts' | 'tests'
   let activeTab = 'todo';       // 'todo' | 'triaged' | 'resolved' | 'all'
   let activeFilter = 'all';
@@ -359,10 +394,10 @@
     try {
       mermaid.initialize({
         startOnLoad: false,
-        securityLevel: 'loose',
+        securityLevel: 'strict',
         theme: isDark ? 'dark' : 'neutral',
         fontFamily: '"Open Sans", system-ui, sans-serif',
-        flowchart: { useMaxWidth: true, htmlLabels: true },
+        flowchart: { useMaxWidth: true, htmlLabels: false },
         sequence: { useMaxWidth: true },
         state: { useMaxWidth: true },
         class: { useMaxWidth: true },
@@ -383,7 +418,7 @@
         const sign = l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' ';
         const ln = l.newNumber ?? l.oldNumber ?? '';
         return `<tr class="${rowClass}">
-          <td class="ln num">${ln}</td>
+          <td class="ln num">${escapeHtml(ln)}</td>
           <td class="sign">${sign}</td>
           <td class="code">${escapeHtml(l.content)}</td>
         </tr>`;
@@ -526,7 +561,7 @@
         <h2 class="ftitle">Layer 1: Intent, Architecture & Verification Summary</h2>
       </div>
 
-      <div class="prose">${s.html || ''}</div>
+      <div class="prose">${sanitizeHtml(s.html)}</div>
 
       ${signalsHtml}
 
@@ -840,14 +875,14 @@
 
       <div class="sec">
         <h4>Impact (Breaks · Because · Reach)</h4>
-        <div class="prose">${d.impact || ''}</div>
+        <div class="prose">${sanitizeHtml(d.impact)}</div>
       </div>
 
       ${mermaidHtml}
 
       <div class="sec">
         <h4>Recommended Fix (Do · Check)</h4>
-        <div class="prose fixbox">${d.fix || ''}</div>
+        <div class="prose fixbox">${sanitizeHtml(d.fix)}</div>
         ${
           d.suggestion
             ? `<div style="margin-top:10px;padding:10px 12px;border-radius:6px;border:1px solid var(--rule);background:var(--well);">
@@ -862,7 +897,7 @@
         d.reasoning
           ? `<div class="sec">
               <h4>Verifier & Evidence</h4>
-              <div class="prose">${d.reasoning}</div>
+              <div class="prose">${sanitizeHtml(d.reasoning)}</div>
             </div>`
           : ''
       }
@@ -1492,15 +1527,172 @@
     renderPane();
   }
 
+  function buildStandaloneExtensionReport(prData) {
+    if (!prData || (!prData.repo && !prData.pr)) return null;
+    const scraped = Array.isArray(prData.findings) ? prData.findings : [];
+    // Scraped markers can be typed by anyone: only findings authored by the signed-in GitHub user are shown.
+    // (Use the local server / `gh api` flow for full, author-verified multi-reviewer state.)
+    const findings = scraped.filter((f) => f && f.trusted === true);
+    const ignoredCount = scraped.length - findings.length;
+    const mappedData = findings.map((f, index) => ({
+      id: f.id || `F${index + 1}`,
+      sev: f.sev || 'medium',
+      lens: f.lens || 'published-thread',
+      verify: f.verify || 'verified',
+      suggestedTriage: f.action === 'block' ? 'block' : f.action === 'dismiss' ? 'dismiss' : 'comment',
+      title: f.title || `${f.id || 'Finding'} (${f.loc || 'inline comment'})`,
+      loc: f.loc || '',
+      impact: f.body ? `<p>${escapeHtml(String(f.body).slice(0, 4000))}</p>` : '<p>Published PR review thread discovered on GitHub.</p>',
+      fix: '',
+      reasoning: ''
+    }));
+
+    const prTitle = prData.title
+      ? `PR #${prData.pr} — ${prData.title}`
+      : `PR #${prData.pr} (${prData.repo})`;
+    const prUrl = prData.url || `https://github.com/${prData.repo}/pull/${prData.pr}`;
+
+    return {
+      KEY: `crv-ext-${prData.repo}-${prData.pr}`,
+      PR: {
+        url: prUrl,
+        label: `${prData.repo}#${prData.pr}`
+      },
+      XMETA: {
+        title: prTitle,
+        sub: `Standalone Extension Mode · ${prData.repo}#${prData.pr}`,
+        branch:
+          prData.headBranch && prData.baseBranch
+            ? `${prData.headBranch} → ${prData.baseBranch}`
+            : ''
+      },
+      REVIEW: {
+        repo: prData.repo,
+        pr: prData.pr,
+        head: prData.meta?.head || findings[0]?.head || ''
+      },
+      SUMMARY: {
+        overview: mappedData.length
+          ? `<p>Loaded <strong>${mappedData.length}</strong> published <code>crv-finding</code> review thread(s) authored by you from the active GitHub Pull Request tab in standalone browser mode.${ignoredCount ? ` ${ignoredCount} marker(s) from other authors were ignored as unverified.` : ''}</p><p>To decompose full diffs or run the 14-lens AI review agent, run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> or import a <code>report.json</code> file using <strong>📂 Import JSON</strong> above.</p>`
+          : `<p>Connected to <strong>${escapeHtml(prData.repo)}#${escapeHtml(String(prData.pr))}</strong> in standalone Chrome Extension mode (local CLI server is offline).</p><p>Run <code>crv pr ${escapeHtml(String(prData.pr))} --repo ${escapeHtml(prData.repo)} --analyze</code> in your terminal or click <strong>📂 Import JSON</strong> in the top bar to load a compiled review report.</p>`
+      },
+      DATA: mappedData,
+      LAYERS: {
+        contracts: [],
+        flows: [],
+        testMatrix: []
+      }
+    };
+  }
+
+  async function loadExtensionStoredReport() {
+    if (typeof chrome === 'undefined' || !chrome.storage?.local) return null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const requestedKey = params.get('prKey');
+      const { lastActivePrKey } = await chrome.storage.local.get('lastActivePrKey');
+      const targetKey = requestedKey || lastActivePrKey;
+      if (!targetKey) return null;
+      const stored = await chrome.storage.local.get(targetKey);
+      const prData = stored?.[targetKey];
+      return buildStandaloneExtensionReport(prData);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function normalizeImportedJson(parsed) {
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Invalid JSON report file');
+    }
+    if (Array.isArray(parsed.DATA)) {
+      return parsed;
+    }
+    if (Array.isArray(parsed.issues)) {
+      const meta = parsed.meta || {};
+      const data = parsed.issues.map((issue, idx) => ({
+        id: issue.id || `F${idx + 1}`,
+        sev: issue.severity || issue.sev || 'medium',
+        lens: issue.lens || 'general',
+        verify: issue.verification || issue.verify || 'verified',
+        suggestedTriage:
+          (issue.severity || issue.sev) === 'high' ? 'block' : 'comment',
+        title: issue.title || `Issue ${idx + 1}`,
+        loc: issue.location || issue.loc || '',
+        impact: issue.impact || issue.description || '',
+        fix: issue.fix || issue.recommendation || '',
+        reasoning: issue.reasoning || '',
+        diff: issue.diff || '',
+        diagram: issue.diagram || ''
+      }));
+      return {
+        KEY: meta.key || `crv-import-${meta.pr || Date.now()}`,
+        PR: {
+          url: meta.url || '',
+          label: meta.repo && meta.pr ? `${meta.repo}#${meta.pr}` : 'Imported Report'
+        },
+        XMETA: {
+          title: meta.title || 'Imported Findings Report',
+          sub: meta.subtitle || ''
+        },
+        REVIEW: {
+          repo: meta.repo || '',
+          pr: meta.pr || 0,
+          head: meta.head || ''
+        },
+        SUMMARY: {
+          overview: parsed.summary?.overview || '<p>Imported from <code>findings.json</code>.</p>'
+        },
+        DATA: data,
+        LAYERS: parsed.layers || { contracts: [], flows: [], testMatrix: [] }
+      };
+    }
+    throw new Error('JSON file must contain either a Workbench "DATA" array or a findings "issues" array.');
+  }
+
   async function init() {
+    const preferExtensionStorage =
+      IS_EXTENSION_PAGE && new URLSearchParams(window.location.search).get('mode') === 'standalone';
+
+    if (!report && preferExtensionStorage) {
+      const stored = sanitizeReport(await loadExtensionStoredReport());
+      // Prefer the local server (author-verified `gh api` data) when it already holds the same PR.
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1500);
+        const res = await apiFetch('/api/report', { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          const live = sanitizeReport(await res.json());
+          if (!stored || (live?.REVIEW?.repo === stored.REVIEW?.repo && live?.REVIEW?.pr === stored.REVIEW?.pr)) {
+            report = live;
+            ghConnected = true;
+          }
+        }
+      } catch (e) {}
+      if (!report) report = stored;
+    }
+
     if (!report) {
       try {
-        const res = await fetch('/api/report');
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1500);
+        const res = await apiFetch('/api/report', { signal: controller.signal });
+        clearTimeout(timer);
         if (res.ok) {
-          report = await res.json();
+          report = sanitizeReport(await res.json());
           ghConnected = true;
         }
       } catch (e) {}
+    }
+
+    if (!report && IS_EXTENSION_PAGE) {
+      report = sanitizeReport(await loadExtensionStoredReport());
+    }
+
+    currentId = report?.DATA?.[0]?.id || OV;
+    if (!report?.DATA?.length) {
+      activeLayer = 'overview';
     }
 
     loadTriage();
@@ -1509,6 +1701,31 @@
     renderPane();
     setupDialogAndTheme();
     setupGuidePanel();
+
+    const importBtn = $('#importReportBtn');
+    const importInput = $('#importReportInput');
+    if (importBtn && importInput) {
+      importBtn.addEventListener('click', () => importInput.click());
+      importInput.addEventListener('change', async () => {
+        const file = importInput.files?.[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const parsed = JSON.parse(text);
+          report = sanitizeReport(normalizeImportedJson(parsed));
+          currentId = report?.DATA?.[0]?.id || OV;
+          activeLayer = report?.DATA?.length ? 'findings' : 'overview';
+          loadTriage();
+          renderHeader();
+          renderRack();
+          renderPane();
+        } catch (err) {
+          alert(`Could not import JSON report: ${err.message}`);
+        } finally {
+          importInput.value = '';
+        }
+      });
+    }
 
     $('#layerNav')?.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-layer]');
@@ -1594,7 +1811,7 @@
       if (!prInput) return;
       try {
         if (statusEl) statusEl.textContent = `Fetching PR ${prInput} & decomposing 4 Layers via gh...`;
-        const res = await fetch('/api/github/load-pr', {
+        const res = await apiFetch('/api/github/load-pr', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prInput, repo: explicitRepo || undefined })
@@ -1603,7 +1820,7 @@
         if (!res.ok || !data.ok) {
           throw new Error(data.error || 'Failed to load PR');
         }
-        report = data.report;
+        report = sanitizeReport(data.report);
         currentId = report?.DATA?.[0]?.id || OV;
         activeLayer = report?.DATA?.length ? 'findings' : 'overview';
         loadTriage();
@@ -1635,7 +1852,7 @@
       const sourceBadge = $('#repoSourceBadge');
       const repoLabel = $('#recentPrsRepoLabel');
       try {
-        const res = await fetch('/api/github/repo-config');
+        const res = await apiFetch('/api/github/repo-config');
         const data = await res.json();
         if (res.ok && data.ok) {
           if (repoInput && !repoInput.value) repoInput.value = data.repo || report?.REVIEW?.repo || '';
@@ -1654,7 +1871,7 @@
       const effortSelect = $('#effortSelectInput');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const aRes = await fetch('/api/github/agent-config');
+        const aRes = await apiFetch('/api/github/agent-config');
         const aData = await aRes.json();
         if (aRes.ok && aData.ok) {
           if (agentSelect && aData.agent) agentSelect.value = aData.agent;
@@ -1676,8 +1893,10 @@
       try {
         const repoParam = (explicitRepoOverride ?? $('#repoConfigInput')?.value ?? '').trim();
         listEl.innerHTML = `<div style="font-size:12px;color:var(--muted);">Loading recent PRs from GitHub via gh cli...</div>`;
-        const url = repoParam ? `/api/github/list-prs?repo=${encodeURIComponent(repoParam)}` : '/api/github/list-prs';
-        const res = await fetch(url);
+        const url = repoParam
+          ? `/api/github/list-prs?repo=${encodeURIComponent(repoParam)}`
+          : '/api/github/list-prs';
+        const res = await apiFetch(url);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Unavailable');
         if (data.repo && repoLabel) repoLabel.textContent = data.repo;
@@ -1720,7 +1939,7 @@
       const sourceBadge = $('#repoSourceBadge');
       if (!repoVal) return;
       try {
-        const res = await fetch('/api/github/repo-config', {
+        const res = await apiFetch('/api/github/repo-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ repo: repoVal })
@@ -1742,7 +1961,7 @@
       const statusEl = $('#loadPrStatus');
       const agentBadge = $('#agentSourceBadge');
       try {
-        const res = await fetch('/api/github/agent-config', {
+        const res = await apiFetch('/api/github/agent-config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1822,7 +2041,7 @@
       const payload = buildGitHubPreviewPayload();
       try {
         statusEl.textContent = 'Publishing review to GitHub via local gh bridge...';
-        const res = await fetch('/api/github/submit-review', {
+        const res = await apiFetch('/api/github/submit-review', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1844,12 +2063,12 @@
 
     if (ghConnected && typeof EventSource !== 'undefined') {
       try {
-        const es = new EventSource('/api/events');
+        const es = new EventSource(apiUrl(`/api/events?token=${encodeURIComponent(sessionToken)}`));
         es.addEventListener('report-updated', async () => {
           try {
-            const rRes = await fetch('/api/report');
+            const rRes = await apiFetch('/api/report');
             if (rRes.ok) {
-              report = await rRes.json();
+              report = sanitizeReport(await rRes.json());
               loadTriage();
               renderHeader();
               renderRack();

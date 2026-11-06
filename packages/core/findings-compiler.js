@@ -1,5 +1,7 @@
 'use strict';
 
+const { sanitizeReport } = require('../ui/sanitize.js');
+
 const { parseUnifiedDiff, extractDiffSlice, buildLayersFromParsedDiff } = require('./diff-classifier');
 
 const DEFAULT_SEV = {
@@ -170,7 +172,8 @@ function checkFindingsShape(findingsJson) {
  */
 function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
   if (findingsJson && Array.isArray(findingsJson.DATA) && findingsJson.SUMMARY) {
-    return findingsJson;
+    // Already compiled (possibly by a third party): treat its HTML fields as untrusted.
+    return sanitizeReport(findingsJson);
   }
 
   const meta = findingsJson?.meta || {};

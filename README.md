@@ -18,7 +18,7 @@ A human-in-the-loop PR Review Workbench designed for the era of AI-authored code
 - **[packages/cli](./packages/cli/bin/crv.js)**
   - [server.js](./packages/cli/server.js): Local HTTP server and `gh api` bridge that loads live PRs from GitHub, invokes AI coding agents for 14-lens reviews, and publishes curated reviews directly to GitHub.
 - **[.agents/skills/crv-code-review](./.agents/skills/crv-code-review/SKILL.md)**
-  - Bundled 14-lens AI review skill (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`) with fresh-context verification.
+  - Bundled 14-lens AI review skill (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`, `ai-harness`) with fresh-context verification.
 - **[packages/extension](./packages/extension/manifest.json)**
   - Manifest V3 Chrome Extension that injects an **🛡️ Agent Workbench** button onto `https://github.com/*/*/pull/*`, scans PR comments for `<!-- crv-finding -->` threads, and opens the Side Panel alongside GitHub.
 
@@ -63,3 +63,11 @@ crv demo
 2. Enable **Developer mode** (top right).
 3. Click **Load unpacked** and select `packages/extension`.
 4. Visit any GitHub PR (`https://github.com/*/*/pull/*`) to use the injected **🛡️ Agent Workbench** button and Side Panel.
+
+## Security
+
+PR content is untrusted input. See [docs/security.md](./docs/security.md) for the agent sandboxing guidance, marker
+authenticity rules (`CRV_TRUSTED_REVIEWERS`), local-server protections (loopback `Host`, per-session token,
+`CRV_EXTENSION_IDS`, `--allow-approve`) and the open GitHub rendering question for the extension.
+
+Development: `npm run ci` (lint, extension-sync check, tests), `npm run sync-extension` after editing `packages/ui`.

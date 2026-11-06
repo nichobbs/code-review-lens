@@ -3,13 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <meta name="crv-session-token" content="">
   <meta name="color-scheme" content="light dark">
-  <script>
-    try {
-      document.querySelector('meta[name="color-scheme"]').content =
-        localStorage.getItem("color-scheme") ?? "light dark";
-    } catch (e) {}
-  </script>
   <title>Agentic PR Review Workbench</title>
   <link rel="stylesheet" href="./workbench.css">
 </head>
@@ -22,6 +18,10 @@
       <button type="button" class="btn" id="openSwitchPrBtn" title="Switch to another PR or re-run analysis">
         🔀 Switch PR / Re-run
       </button>
+      <button type="button" class="btn" id="importReportBtn" title="Import a local report.json or findings.json file">
+        📂 Import JSON
+      </button>
+      <input type="file" id="importReportInput" accept=".json,application/json" hidden>
       <div class="spacer"></div>
       <div class="triage-summary-pills" id="triageSummaryPills"></div>
       <button type="button" class="btn" id="copyAgentPromptBtn" title="Copy curated findings as a Coding Agent prompt">
@@ -319,6 +319,7 @@
   </dialog>
 
   <script src="./vendor/mermaid.min.js"></script>
+  <script src="./sanitize.js"></script>
   <script src="./workbench.js"></script>
 </body>
 </html>

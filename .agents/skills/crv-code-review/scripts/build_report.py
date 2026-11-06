@@ -784,7 +784,7 @@ function tcode(s){return (s||'').replace(/`([^`]+)`/g,'<code>$1</code>');}
 function outsideLi(o){return '<li>'+(o.loc?'<code>'+o.loc+'</code> ':'')+o.text+(o.ticket?' <b>'+o.ticket+'.</b>':'')+'</li>';}
 function prLink(){return PR?'<a class="prlink" href="'+PR.url+'" target="_blank" rel="noopener">'+ic('link')+PR.label+'</a>':'';}
 const dark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;
-try{mermaid.initialize({startOnLoad:false,securityLevel:'loose',theme:dark?'dark':'neutral',
+try{mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:dark?'dark':'neutral',
   fontFamily:'"Open Sans",system-ui,sans-serif',flowchart:{useMaxWidth:true,htmlLabels:true},sequence:{useMaxWidth:true},state:{useMaxWidth:true}});}catch(e){}
 let done=JSON.parse(localStorage.getItem(KEY)||'{}');
 // Comments live under their own key, so a stale check-off map never carries note text and a

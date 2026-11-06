@@ -14,6 +14,9 @@
       --ink: light-dark(#131E29, #E6ECF2);
       --muted: light-dark(#6D7979, #7C8898);
       --accent: #0F8171;
+      --ok-bg: light-dark(#E6F5F1, #102B26);
+      --ok-ink: light-dark(#0B6457, #4AD4BE);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
     body {
       margin: 0;
@@ -29,15 +32,39 @@
       background: var(--well);
       margin-bottom: 12px;
     }
+    .head-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
     h1 {
       font-size: 14px;
-      margin: 0 0 6px;
+      margin: 0;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid var(--rule);
+      background: var(--bg);
+      color: var(--muted);
+    }
+    .status-pill.online {
+      background: var(--ok-bg);
+      color: var(--ok-ink);
+      border-color: var(--accent);
     }
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      padding: 6px 12px;
+      padding: 6px 11px;
       border-radius: 5px;
       border: 1px solid var(--accent);
       background: var(--accent);
@@ -48,9 +75,29 @@
       text-decoration: none;
     }
     .btn.secondary {
-      background: transparent;
+      background: var(--bg);
       color: var(--ink);
       border-color: var(--rule);
+    }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .cmd-box {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .cmd-code {
+      flex: 1;
+      padding: 6px 8px;
+      border-radius: 5px;
+      border: 1px solid var(--rule);
+      background: var(--bg);
+      font: 500 11.5px var(--mono);
+      overflow-x: auto;
+      white-space: nowrap;
     }
     .finding-item {
       padding: 8px 10px;
@@ -64,13 +111,35 @@
 </head>
 <body>
   <div class="card">
-    <h1>🛡️ Agentic PR Review Workbench</h1>
+    <div class="head-row">
+      <h1>🛡️ PR Review Workbench</h1>
+      <span id="serverStatusBadge" class="status-pill">Checking :4320...</span>
+    </div>
     <div id="prStatus" style="color:var(--muted);font-size:12px;margin-bottom:10px;">
       Checking active GitHub PR tab...
     </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button type="button" class="btn" id="openFullWorkbenchBtn">Open 4-Layer Workbench</button>
-      <button type="button" class="btn secondary" id="rescanTabBtn">Rescan PR Comments</button>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+      <button type="button" class="btn" id="openBundledWorkbenchBtn" title="Opens the bundled 4-Layer Workbench directly inside the extension (works offline)">
+        Open Bundled Workbench
+      </button>
+      <button type="button" class="btn secondary" id="openFullWorkbenchBtn" title="Loads the active PR into the local CRV server at http://127.0.0.1:4320">
+        Open in Local Server (:4320)
+      </button>
+      <button type="button" class="btn secondary" id="rescanTabBtn">Rescan PR</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <strong style="font-size:12px;">CLI / AI Agent Command</strong>
+      <span id="localServerDetail" style="font-size:11px;color:var(--muted);"></span>
+    </div>
+    <div style="font-size:11.5px;color:var(--muted);margin-top:3px;">
+      Run full 14-lens AI review + diff decomposition locally:
+    </div>
+    <div class="cmd-box">
+      <code class="cmd-code" id="cliCmdPreview">crv serve</code>
+      <button type="button" class="btn secondary" id="copyCliCmdBtn">Copy</button>
     </div>
   </div>
 

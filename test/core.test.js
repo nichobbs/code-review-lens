@@ -35,7 +35,13 @@ const {
   saveDefaultAgentConfig
 } = require('../packages/core');
 
-const { loadReportFile, buildStandaloneHtml, createWorkbenchServer } = require('../packages/cli/server');
+const {
+  loadReportFile,
+  buildStandaloneHtml,
+  createWorkbenchServer,
+  isAllowedCorsOrigin
+} = require('../packages/cli/server');
+const { syncExtensionWorkbench } = require('../scripts/sync-extension-workbench');
 const { execFileSync } = require('node:child_process');
 const os = require('node:os');
 
@@ -130,7 +136,8 @@ test('GitHub sticky overview comment round-trips crv-meta & hydrateFromGitHubCom
         user: { login: 'author' },
         created_at: '2026-10-30T03:00:00Z'
       }
-    ]
+    ],
+    { trustedAuthors: ['reviewer'] }
   );
 
   assert.equal(hydrated.overviewMeta.commentId, 101);
@@ -424,11 +431,75 @@ test('Generic repo-config resolution chain (CLI/UI -> env -> .env -> .crvrc.json
   assert.equal(resolvedOverride.model, 'sonnet');
 });
 
+test('Chrome Extension standalone workbench bundle, MV3 CSP compliance, and local server CORS / health API', async () => {
+  // 1. CORS allowlist allows chrome-extension:// and localhost, blocks arbitrary origins
+  assert.equal(isAllowedCorsOrigin('chrome-extension://abcdefghijklmnopabcdefghijklmnop'), true);
+  assert.equal(isAllowedCorsOrigin('http://127.0.0.1:4320'), true);
+  assert.equal(isAllowedCorsOrigin('http://localhost:4320'), true);
+  assert.equal(isAllowedCorsOrigin('https://evil.example.com'), false);
+  assert.equal(isAllowedCorsOrigin('chrome-extension://invalid-id'), false);
+
+  // 2. Bundled extension workbench is an exact, in-sync copy of packages/ui & MV3 CSP compliant (no inline <script>)
+  const syncRes = syncExtensionWorkbench({ check: true });
+  assert.deepEqual(syncRes.drifted, [], 'run `npm run sync-extension` to regenerate packages/extension/workbench');
+  for (const fileName of syncRes.files) {
+    assert.ok(fs.existsSync(path.join(syncRes.targetDir, fileName)));
+  }
+  const extIndexHtml = fs.readFileSync(path.join(syncRes.targetDir, 'index.html'), 'utf8');
+  assert.doesNotMatch(extIndexHtml, /<script>\s*\S/);
+  assert.match(extIndexHtml, /<script src="\.\/workbench\.js"><\/script>/);
+
+  // 3. Verify /api/health endpoint & CORS headers on createWorkbenchServer
+  const { server } = createWorkbenchServer();
+  const invokeServer = (method, url, origin) => {
+    let statusCode = 200;
+    const headers = {};
+    let body = '';
+    const req = {
+      method,
+      url,
+      headers: { host: '127.0.0.1:4320', ...(origin ? { origin } : {}) }
+    };
+    const res = {
+      setHeader(k, v) {
+        headers[k.toLowerCase()] = v;
+      },
+      writeHead(code, hdrs = {}) {
+        statusCode = code;
+        for (const [k, v] of Object.entries(hdrs)) {
+          headers[k.toLowerCase()] = v;
+        }
+      },
+      end(chunk = '') {
+        body += chunk;
+      }
+    };
+    server.emit('request', req, res);
+    return { statusCode, headers, body };
+  };
+
+  const extOrigin = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
+  const healthRes = invokeServer('GET', '/api/health', extOrigin);
+  assert.equal(healthRes.statusCode, 200);
+  assert.equal(healthRes.headers['access-control-allow-origin'], extOrigin);
+  const parsedHealth = JSON.parse(healthRes.body);
+  assert.equal(parsedHealth.ok, true);
+  assert.equal(parsedHealth.status, 'online');
+
+  const preflightRes = invokeServer('OPTIONS', '/api/github/load-pr', extOrigin);
+  assert.equal(preflightRes.statusCode, 204);
+  assert.equal(preflightRes.headers['access-control-allow-origin'], extOrigin);
+
+  const evilRes = invokeServer('GET', '/api/health', 'https://evil.example.com');
+  assert.equal(evilRes.headers['access-control-allow-origin'], undefined);
+});
+
 test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prevents static path traversal', async () => {
   const { PassThrough } = require('node:stream');
   const report = loadReportFile(path.join(__dirname, '../fixtures/pr1230-report.json'));
   const tmpSubmitPath = path.join(os.tmpdir(), `crv-test-submit-${Date.now()}.json`);
-  const { server } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath, dryRun: true });
+  const { server, sessionToken } = createWorkbenchServer({ report, lastSubmittedPath: tmpSubmitPath, dryRun: true });
+  const auth = { 'x-crv-token': sessionToken };
 
   function invokeServer({ method = 'GET', url = '/', headers = {}, body = null }) {
     return new Promise((resolve, reject) => {
@@ -440,6 +511,9 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
       const res = new PassThrough();
       res.statusCode = 200;
       res.headers = {};
+      res.setHeader = (k, v) => {
+        res.headers[k.toLowerCase()] = v;
+      };
       res.writeHead = (statusCode, hdrs = {}) => {
         res.statusCode = statusCode;
         res.headers = { ...res.headers, ...hdrs };
@@ -468,7 +542,8 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
 
   try {
     // 1. GET /api/report
-    const repRes = await invokeServer({ method: 'GET', url: '/api/report' });
+    assert.equal((await invokeServer({ method: 'GET', url: '/api/report' })).status, 401); // token required
+    const repRes = await invokeServer({ method: 'GET', url: '/api/report', headers: auth });
     assert.equal(repRes.status, 200);
     const repData = await repRes.json();
     assert.equal(repData.REVIEW.pr, 1230);
@@ -478,10 +553,11 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
       method: 'POST',
       url: '/api/github/submit-review',
       headers: {
+        ...auth,
         'content-type': 'application/json',
         origin: 'https://evil.example.com'
       },
-      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: {} })
+      body: JSON.stringify({ repo: 'acme/loyalty-platform', pr: 1230, payload: {} })
     });
     assert.equal(csrfRes.status, 403);
 
@@ -490,10 +566,11 @@ test('createWorkbenchServer serves API, blocks cross-origin CSRF POSTs, and prev
       method: 'POST',
       url: '/api/github/submit-review',
       headers: {
+        ...auth,
         'content-type': 'application/json',
         origin: 'chrome-extension://abcdefghijklmnop'
       },
-      body: JSON.stringify({ repo: 'acme/repo', pr: 1230, payload: { event: 'COMMENT' } })
+      body: JSON.stringify({ repo: 'acme/loyalty-platform', pr: 1230, payload: { event: 'COMMENT' } })
     });
     assert.equal(extRes.status, 200);
     const extJson = await extRes.json();
@@ -919,7 +996,9 @@ test('Re-review (r2) replies to existing GitHub threads, resolves fixed threads,
         body: h2CommentBody,
         html_url: 'https://github.com/acme/repo/pull/42#discussion_r9002'
       }
-    ]
+    ],
+    // crv markers are only honoured from trusted authors (deny-by-default)
+    { trustedAuthors: ['reviewer'] }
   );
 
   // Merge GraphQL reviewThreads (H1 still open on GH, H2 prematurely marked resolved by author on GH)
