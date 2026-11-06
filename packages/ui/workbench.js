@@ -848,7 +848,9 @@
       document.querySelector('input[name="ghReviewEvent"]:checked')?.value || 'REQUEST_CHANGES';
     const summaryNote = $('#ghSummaryNote')?.value || '';
 
-    const inlineComments = published.map((d) => {
+    const inlineComments = [];
+    const outOfHunkBodies = [];
+    for (const d of published) {
       const t = getTriage(d.id);
       const locMatch = /^(.+):(\d+)(?:-(\d+))?$/.exec(String(d.loc || '').trim());
       const filePath = locMatch ? locMatch[1] : String(d.loc || '').trim();
@@ -897,13 +899,33 @@
         );
       }
 
-      return {
-        path: filePath,
-        line: lineNum || 1,
-        side: 'RIGHT',
-        body: bodyParts.filter(Boolean).join('\n')
-      };
-    });
+      const fullBody = bodyParts.filter(Boolean).join('\n');
+      let targetLine = lineNum || 1;
+      let canPostInline = Boolean(filePath);
+      if (d.diffSlice && Array.isArray(d.diffSlice.lines)) {
+        const rightLines = d.diffSlice.lines
+          .map((l) => l.newNumber)
+          .filter((n) => Number.isFinite(n));
+        if (rightLines.length === 0) {
+          canPostInline = false;
+        } else if (!rightLines.includes(targetLine)) {
+          targetLine = rightLines[0];
+        }
+      } else if ('diffSlice' in d && !d.diffSlice) {
+        canPostInline = false;
+      }
+
+      if (canPostInline) {
+        inlineComments.push({
+          path: filePath,
+          line: targetLine,
+          side: 'RIGHT',
+          body: fullBody
+        });
+      } else {
+        outOfHunkBodies.push(fullBody);
+      }
+    }
 
     const counts = { block: 0, comment: 0, dismiss: 0, pending: 0 };
     for (const d of issues) {
@@ -935,12 +957,19 @@
       `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`
     ].filter(Boolean);
 
+    if (outOfHunkBodies.length > 0) {
+      overviewLines.push('', '---', '### Findings Outside Diff Hunks', '', outOfHunkBodies.join('\n\n---\n\n'));
+    }
+
+    const rawHead = String(report?.REVIEW?.head || '').trim();
     const reviewPayload = {
-      commit_id: report?.REVIEW?.head,
       event: selectedEvent,
       body: overviewLines.join('\n').trim(),
       comments: inlineComments
     };
+    if (/^[0-9a-f]{40}$/i.test(rawHead)) {
+      reviewPayload.commit_id = rawHead;
+    }
 
     return reviewPayload;
   }
@@ -1125,6 +1154,10 @@
     });
 
     $('#openGhModalBtn')?.addEventListener('click', () => {
+      const hasBlocker = (report?.DATA || []).some((d) => getTriage(d.id).action === 'block');
+      const defaultEvent = hasBlocker ? 'REQUEST_CHANGES' : 'COMMENT';
+      const radio = document.querySelector(`input[name="ghReviewEvent"][value="${defaultEvent}"]`);
+      if (radio) radio.checked = true;
       updateModalPreview();
       $('#ghReviewDialog')?.showModal();
     });

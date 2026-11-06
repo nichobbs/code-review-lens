@@ -131,6 +131,26 @@ function spawnGhAsync(args, options = {}) {
   });
 }
 
+function extractGhErrorMessage(res) {
+  const stderr = (res.stderr || '').trim();
+  const stdout = (res.stdout || '').trim();
+  if (stdout) {
+    try {
+      const parsed = JSON.parse(stdout);
+      const details = Array.isArray(parsed.errors)
+        ? parsed.errors.map((e) => (typeof e === 'string' ? e : e.message || JSON.stringify(e))).join('; ')
+        : '';
+      if (details) {
+        return `${stderr || parsed.message || 'gh api error'}: ${details}`;
+      }
+      if (parsed.message && !stderr.includes(parsed.message)) {
+        return `${stderr} (${parsed.message})`.trim();
+      }
+    } catch (e) {}
+  }
+  return stderr || stdout || 'gh api failed';
+}
+
 /**
  * Calls `gh api` safely via spawnSync (no shell interpolation).
  */
@@ -141,7 +161,7 @@ function runGhApi(args, inputStr) {
     maxBuffer: 20 * 1024 * 1024
   });
   if (res.status !== 0) {
-    throw new Error((res.stderr || res.stdout || 'gh api failed').trim());
+    throw new Error(extractGhErrorMessage(res));
   }
   return res.stdout;
 }
@@ -152,7 +172,7 @@ async function runGhApiAsync(args, inputStr) {
     maxBuffer: 20 * 1024 * 1024
   });
   if (res.status !== 0) {
-    throw new Error((res.stderr || res.stdout || 'gh api failed').trim());
+    throw new Error(extractGhErrorMessage(res));
   }
   return res.stdout;
 }
@@ -941,18 +961,97 @@ function createWorkbenchServer(options = {}) {
     if (req.method === 'POST' && url.pathname === '/api/github/submit-review') {
       try {
         const { repo, pr, payload } = await readJsonBody(req);
+        if (payload && payload.commit_id && !/^[0-9a-f]{40}$/i.test(String(payload.commit_id).trim())) {
+          delete payload.commit_id;
+        }
+        // Sanitize inline comment lines against report.DATA diffSlice hunks so out-of-hunk lines don't trigger HTTP 422
+        if (payload && Array.isArray(payload.comments) && Array.isArray(report?.DATA)) {
+          const validInline = [];
+          const foldedOut = [];
+          for (const c of payload.comments) {
+            const matchIssue = report.DATA.find(
+              (d) =>
+                d.loc === `${c.path}:${c.line}` ||
+                (typeof c.body === 'string' && c.body.includes(`"id":"${d.id}"`)) ||
+                (d.diffSlice && d.diffSlice.path === c.path)
+            );
+            if (matchIssue && matchIssue.diffSlice && Array.isArray(matchIssue.diffSlice.lines)) {
+              const rightLines = matchIssue.diffSlice.lines
+                .map((l) => l.newNumber)
+                .filter((n) => Number.isFinite(n));
+              if (rightLines.length === 0) {
+                foldedOut.push(c);
+              } else if (rightLines.includes(c.line)) {
+                validInline.push(c);
+              } else {
+                validInline.push({ ...c, line: rightLines[0] });
+              }
+            } else if (matchIssue && 'diffSlice' in matchIssue && !matchIssue.diffSlice) {
+              foldedOut.push(c);
+            } else {
+              validInline.push(c);
+            }
+          }
+          payload.comments = validInline;
+          if (foldedOut.length > 0) {
+            const extra = foldedOut.map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`).join('\n\n---\n\n');
+            payload.body = `${payload.body || ''}\n\n---\n### Findings Outside Diff Hunks\n\n${extra}`.trim();
+          }
+        }
         fs.writeFileSync(
           lastSubmittedPath,
           JSON.stringify({ repo, pr, submittedAt: new Date().toISOString(), payload }, null, 2)
         );
 
         if (allowLivePublish && repo && pr) {
-          const out = await runGhApiAsync(
-            ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
-            JSON.stringify(payload)
-          );
+          let mode = 'gh-api-live';
+          let out;
+          try {
+            out = await runGhApiAsync(
+              ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+              JSON.stringify(payload)
+            );
+          } catch (firstErr) {
+            const msg = String(firstErr.message || '');
+            if (!/HTTP 422|Unprocessable Entity/i.test(msg)) {
+              throw firstErr;
+            }
+            // Retry 1: If event was REQUEST_CHANGES or APPROVE (e.g. reviewing own PR), downgrade to COMMENT
+            const fallbackPayload = { ...payload, event: 'COMMENT' };
+            delete fallbackPayload.commit_id;
+            try {
+              out = await runGhApiAsync(
+                ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+                JSON.stringify(fallbackPayload)
+              );
+              mode = 'gh-api-live (downgraded event to COMMENT for self-review)';
+            } catch (secondErr) {
+              const msg2 = String(secondErr.message || '');
+              if (
+                !/HTTP 422|Unprocessable Entity/i.test(msg2) ||
+                !Array.isArray(fallbackPayload.comments) ||
+                fallbackPayload.comments.length === 0
+              ) {
+                throw secondErr;
+              }
+              // Retry 2: One or more inline comment lines are outside the PR diff on GitHub; fold comments into body
+              const foldedNotes = fallbackPayload.comments
+                .map((c) => `#### 📄 \`${c.path}:${c.line}\`\n\n${c.body}`)
+                .join('\n\n---\n\n');
+              const bodyOnlyPayload = {
+                event: 'COMMENT',
+                body: `${fallbackPayload.body || ''}\n\n---\n### Inline Findings\n\n${foldedNotes}`.trim(),
+                comments: []
+              };
+              out = await runGhApiAsync(
+                ['--method', 'POST', `repos/${repo}/pulls/${pr}/reviews`, '--input', '-'],
+                JSON.stringify(bodyOnlyPayload)
+              );
+              mode = 'gh-api-live (folded out-of-hunk inline threads into review summary)';
+            }
+          }
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, mode: 'gh-api-live', response: JSON.parse(out) }));
+          res.end(JSON.stringify({ ok: true, mode, response: JSON.parse(out) }));
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(

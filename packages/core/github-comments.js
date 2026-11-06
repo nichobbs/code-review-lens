@@ -262,30 +262,54 @@ function buildGitHubReviewPayload(report, triageMap = {}, options = {}) {
 
   const hasBlocker = published.some((d) => triageMap[d.id]?.action === 'block');
   const event = options.event || (hasBlocker ? 'REQUEST_CHANGES' : 'COMMENT');
-  const commitId = report.REVIEW?.head || report.XMETA?.head || undefined;
+  const rawCommitId = String(report.REVIEW?.head || report.XMETA?.head || '').trim();
+  const commitId = /^[0-9a-f]{40}$/i.test(rawCommitId) ? rawCommitId : undefined;
 
   const inlineComments = [];
+  const outOfDiffNotes = [];
   for (const finding of published) {
     const { path, line } = parseLoc(finding.loc);
     const body = serializeFindingComment(finding, triageMap[finding.id], report.REVIEW || {});
     if (path && line) {
-      inlineComments.push({
-        path,
-        line,
-        side: 'RIGHT',
-        body
-      });
+      let targetLine = line;
+      let canPostInline = true;
+      if (finding.diffSlice && Array.isArray(finding.diffSlice.lines)) {
+        const rightLines = finding.diffSlice.lines
+          .map((l) => l.newNumber)
+          .filter((n) => Number.isFinite(n));
+        if (rightLines.length === 0) {
+          canPostInline = false;
+        } else if (!rightLines.includes(line)) {
+          targetLine = rightLines[0];
+        }
+      }
+      if (canPostInline) {
+        inlineComments.push({
+          path,
+          line: targetLine,
+          side: 'RIGHT',
+          body
+        });
+      } else {
+        outOfDiffNotes.push(body);
+      }
     }
   }
 
-  const body = serializeOverviewComment(report, triageMap, options.summaryNote || '');
+  let body = serializeOverviewComment(report, triageMap, options.summaryNote || '');
+  if (outOfDiffNotes.length > 0) {
+    body += `\n\n---\n### Additional Findings (Outside Diff Hunks)\n\n${outOfDiffNotes.join('\n\n---\n\n')}`;
+  }
 
-  return {
-    commit_id: commitId,
+  const payload = {
     event,
     body,
     comments: inlineComments
   };
+  if (commitId) {
+    payload.commit_id = commitId;
+  }
+  return payload;
 }
 
 /**
