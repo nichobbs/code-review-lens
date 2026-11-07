@@ -37,6 +37,7 @@ USAGE:
   crv effort [low|medium|high|xhigh|max|default] [-g]   Inspect or set the default reasoning effort
   crv install-skill [--global | --dir <path>]           Install the 14-lens crv-code-review AI skill
   crv demo [options]                                    Launch Workbench with bundled demo fixture
+  crv ci-comment|ci-analyze|ci-review <pr> --repo o/r   Non-interactive CI steps (see docs/ci.md)
 
 OPTIONS:
   --repo <owner/repo>     Override target GitHub repository for this command
@@ -259,6 +260,13 @@ function runAgentAnalysisOnPr(targetPr, flags) {
 }
 
 async function main() {
+  // Non-interactive CI subcommands (see docs/ci.md) have their own argument parser and never start the server.
+  const rawArgs = process.argv.slice(2);
+  const { isCiCommand, runCiCommand } = require('../ci');
+  if (isCiCommand(rawArgs[0])) {
+    process.exitCode = await runCiCommand(rawArgs[0], rawArgs.slice(1));
+    return;
+  }
   const { cmd, flags } = parseArgs(process.argv);
 
   if (flags.version) {

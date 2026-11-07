@@ -19,6 +19,8 @@ A human-in-the-loop PR Review Workbench designed for the era of AI-authored code
   - [server.js](./packages/cli/server.js): Local HTTP server and `gh api` bridge that loads live PRs from GitHub, invokes AI coding agents for 14-lens reviews, and publishes curated reviews directly to GitHub.
 - **[.agents/skills/crv-code-review](./.agents/skills/crv-code-review/SKILL.md)**
   - Bundled 14-lens AI review skill (`correctness`, `adversarial`, `security`, `data`, `contract`, `infra`, `performance`, `tests`, `standards`, `operability`, `docs`, `structure`, `architecture`, `ai-harness`) with fresh-context verification.
+- **[docs/ci.md](./docs/ci.md)**
+  - Reusable GitHub Actions workflow that runs crv on every internal PR: a deterministic pre-scan with one sticky comment, plus an opt-in AI review posted as non-blocking `COMMENT` reviews.
 - **[packages/extension](./packages/extension/manifest.json)**
   - Manifest V3 Chrome Extension that injects an **🛡️ Agent Workbench** button onto `https://github.com/*/*/pull/*`, scans PR comments for `<!-- crv-finding -->` threads, and opens the Side Panel alongside GitHub.
 
