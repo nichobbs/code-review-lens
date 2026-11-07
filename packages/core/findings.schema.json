@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "crv findings.json (see .agents/skills/crv-code-review/references/findings.md)",
+  "type": "object",
+  "required": ["meta", "issues"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "summary": { "type": "string" },
+        "review": { "type": "object" }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "sev", "loc", "title", "impact", "fix"],
+        "properties": {
+          "id": { "type": "string" },
+          "sev": { "type": "string", "enum": ["high", "medium", "low", "nit", "struct"] },
+          "verify": { "type": "string", "enum": ["CONFIRMED", "PLAUSIBLE"] },
+          "cat": { "type": "string" },
+          "loc": { "type": "string" },
+          "title": { "type": "string" },
+          "impact": { "type": "string" },
+          "fix": { "type": "string" },
+          "reasoning": { "type": "string" },
+          "suggestion": { "type": "string" },
+          "fixPrompt": { "type": "string" },
+          "mermaid": { "type": "string" },
+          "leanSavedLines": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

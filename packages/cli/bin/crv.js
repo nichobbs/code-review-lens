@@ -20,6 +20,8 @@ const {
   resolveAgentConfig,
   saveDefaultAgentConfig,
   buildReviewSkillPrompt,
+  headlessReturnsFindings,
+  runHeadlessAgent,
   getScratchDir
 } = require('../../core');
 
@@ -236,6 +238,10 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   }
 
   const useHeadless = Boolean(flags.headless || (flags.analyze && !flags.interactive));
+  const effectiveEffort = flags.effort || (flags.fast ? 'low' : agentCfg.effort || (useHeadless ? 'medium' : null));
+  const modelOpts = { model: agentCfg.model, effort: effectiveEffort, scratchDir };
+  // Read-only headless runs (agy --mode plan) cannot write findings.json: crv captures the response and writes it.
+  const returnsFindings = useHeadless && headlessReturnsFindings(agentCfg.spec, modelOpts);
   const prompt = buildReviewSkillPrompt({
     repo,
     pr: prNum,
@@ -243,11 +249,9 @@ function runAgentAnalysisOnPr(targetPr, flags) {
     skillDir,
     headless: useHeadless,
     agentName: agentCfg.spec.name,
-    modelName: agentCfg.model || undefined
+    modelName: agentCfg.model || undefined,
+    returnFindings: returnsFindings
   });
-
-  const effectiveEffort = flags.effort || (flags.fast ? 'low' : agentCfg.effort || (useHeadless ? 'medium' : null));
-  const modelOpts = { model: agentCfg.model, effort: effectiveEffort, scratchDir };
   const agentArgs = useHeadless
     ? agentCfg.spec.buildHeadlessArgs(prompt, skillDir, modelOpts)
     : agentCfg.spec.buildInteractiveArgs(prompt, skillDir, modelOpts);
@@ -255,8 +259,14 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   const modelBadge = agentCfg.model ? `, model: ${agentCfg.model}` : '';
   const effortBadge = effectiveEffort ? `, effort: ${effectiveEffort}` : '';
   console.log(
-    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}) to run 14-lens crv-code-review skill...\n`
+    `\n2/2 Launching ${agentCfg.spec.name} (${agentCfg.source}${modelBadge}${effortBadge}${returnsFindings ? ', read-only' : ''}) to run 14-lens crv-code-review skill...\n`
   );
+  if (returnsFindings) {
+    const outcome = runHeadlessAgent({ spec: agentCfg.spec, args: agentArgs, scratchDir, env: process.env, returnsFindings: true });
+    if (!outcome.ok) throw new Error(`Read-only agent run failed: ${outcome.error}`);
+    console.log(`crv: wrote ${path.join(scratchDir, 'findings.json')} (${outcome.issueCount} finding(s)) from the agent's response.`);
+    return;
+  }
   spawnSync(agentCfg.spec.bin, agentArgs, { stdio: 'inherit' });
 }
 

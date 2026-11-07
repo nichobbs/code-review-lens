@@ -10,7 +10,8 @@ The agent reads attacker-controllable text, so prompt injection must be assumed 
 | Agent | Headless (`--headless` / default with `--analyze`) | Interactive (`--interactive`) |
 | --- | --- | --- |
 | `claude` | Allowed. Tool list is least-privilege: `Read, Glob, Grep`, `Bash(git show/grep/log/diff/cat-file:*)`, the skill's `scripts/*`, and `Write/Edit` only inside `.crv-skills/crv-code-review/<pr>/`. No general Bash, no network tools. | Agent prompts for each approval. |
-| `agy`, `gemini`, `codex` | **Refused** unless `CRV_ALLOW_UNRESTRICTED_HEADLESS=1` (they cannot be tool-restricted from the CLI). | Agent prompts for approvals. |
+| `agy` | Allowed **read-only**: `--mode plan --sandbox --disable-slash-commands`, JSON output validated against `packages/core/findings.schema.json`; crv writes `findings.json` itself, so the agent never needs write access. `--mode accept-edits` / `auto` (set `CRV_AGY_MODE`) are **refused** unless `CRV_ALLOW_UNRESTRICTED_HEADLESS=1`. | Agent prompts for approvals. |
+| `gemini`, `codex` | **Refused** unless `CRV_ALLOW_UNRESTRICTED_HEADLESS=1` (they cannot be tool-restricted from the CLI). | Agent prompts for approvals. |
 
 Recommended hardening, in order of value:
 
