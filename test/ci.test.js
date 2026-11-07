@@ -353,3 +353,25 @@ test('the AI setup seam reports "not configured" (10) instead of inventing crede
   const bad = spawnSync('bash', ['-c', `. "${script}"; CRV_AI_RUNNER=wat crv_ai_setup; echo rc=$?`], { encoding: 'utf8' });
   assert.match(bad.stdout, /rc=1/);
 });
+
+/* ---------- CI bootstrap guards (an older crv must never hang a runner) ---------- */
+
+test('an unknown ci-* command fails fast instead of falling through to the interactive Workbench server', () => {
+  const { spawnSync } = require('child_process');
+  const res = spawnSync(process.execPath, [path.join(__dirname, '../packages/cli/bin/crv.js'), 'ci-bogus', '11'], {
+    encoding: 'utf8',
+    timeout: 15000
+  });
+  assert.equal(res.error, undefined, 'must exit on its own, not time out');
+  assert.equal(res.status, 2);
+  assert.match(res.stderr, /Unknown CI command "ci-bogus"/);
+  assert.ok(!/running at http/.test(res.stdout), 'must not start the Workbench server');
+});
+
+test('the reusable workflow checks the pinned tooling has the ci-* commands before using them', () => {
+  const text = wf('crv-review.yml');
+  assert.match(text, /id: tooling[\s\S]*?crv-tool\/packages\/cli\/ci\.js/);
+  assert.match(text, /tooling_ready: \$\{\{ steps\.tooling\.outputs\.ready \}\}/);
+  assert.match(text, /Post or update the sticky overview comment\s*\n\s+if: steps\.tooling\.outputs\.ready == 'true'\s*\n\s+timeout-minutes: 3/);
+  assert.match(text, /needs\.tier1\.outputs\.tooling_ready == 'true'/);
+});

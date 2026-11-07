@@ -85,6 +85,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       skip_ai: ${{ steps.size.outputs.skip_ai }}
+      tooling_ready: ${{ steps.tooling.outputs.ready }}
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -114,6 +115,20 @@ jobs:
         with:
           node-version: '20'
 
+      # The tooling at `crv-ref` may predate the `ci-*` commands (for example crv reviewing the very PR that adds
+      # them, with tooling pinned to the base branch). Without this check an older crv would treat `ci-comment` as a
+      # PR shorthand and start the interactive Workbench server, which never exits.
+      - name: Check that the pinned tooling supports the CI commands
+        id: tooling
+        run: |
+          set -euo pipefail
+          if [ -f crv-tool/packages/cli/ci.js ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=crv::the crv tooling at crv-ref has no ci-* commands yet (expected on the PR that introduces them); the pre-scan comment is skipped until the tooling is updated."
+          fi
+
       - name: Stage PR and run the 4-layer pre-scan
         working-directory: target
         run: |
@@ -136,6 +151,8 @@ jobs:
           echo "diff_bytes=${bytes}" >> "$GITHUB_OUTPUT"
 
       - name: Post or update the sticky overview comment
+        if: steps.tooling.outputs.ready == 'true'
+        timeout-minutes: 3
         working-directory: target
         env:
           AI_RUNNER: ${{ inputs.ai-runner }}
@@ -153,7 +170,7 @@ jobs:
   tier2:
     name: crv AI review (advisory)
     needs: tier1
-    if: inputs.ai-runner != 'none' && needs.tier1.outputs.skip_ai != 'true'
+    if: inputs.ai-runner != 'none' && needs.tier1.outputs.skip_ai != 'true' && needs.tier1.outputs.tooling_ready == 'true'
     runs-on: ${{ inputs.ai-runs-on }}
     timeout-minutes: 30
     # Advisory: an AI failure must never fail the PR's checks.

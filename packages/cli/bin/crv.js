@@ -267,6 +267,12 @@ async function main() {
     process.exitCode = await runCiCommand(rawArgs[0], rawArgs.slice(1));
     return;
   }
+  if (/^ci-/.test(String(rawArgs[0] || ''))) {
+    // Never fall through to the interactive Workbench for a mistyped or unsupported CI command.
+    console.error(`Unknown CI command "${rawArgs[0]}". Supported: ci-comment, ci-analyze, ci-review (see docs/ci.md).`);
+    process.exitCode = 2;
+    return;
+  }
   const { cmd, flags } = parseArgs(process.argv);
 
   if (flags.version) {
@@ -396,6 +402,12 @@ async function main() {
 
   const resolvedRepo = resolveRepoConfig({ explicitRepo: flags.repo, reportRepo: report?.REVIEW?.repo });
 
+  if (process.env.GITHUB_ACTIONS === 'true' && process.env.CRV_ALLOW_SERVER_IN_CI !== '1') {
+    // A hung interactive server wastes a runner until its timeout; CI uses the non-interactive ci-* commands.
+    console.error('Refusing to start the interactive Workbench server inside GitHub Actions (use crv ci-comment / ci-analyze / ci-review).');
+    process.exitCode = 2;
+    return;
+  }
   const { server } = createWorkbenchServer({
     report,
     publish: flags.publish,
