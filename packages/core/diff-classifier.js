@@ -332,6 +332,28 @@ function extractAddedSymbolsFromHunks(filePath, hunks) {
 }
 
 /**
+ * Returns the trailing `//` or `#` comment of a source line, ignoring delimiters inside
+ * single-, double- or backtick-quoted strings (so `"http://x" // TODO: y` yields `// TODO: y`).
+ */
+function findTrailingComment(line) {
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+    } else if ((ch === '/' && line[i + 1] === '/') || ch === '#') {
+      return line.slice(i);
+    }
+  }
+  return null;
+}
+
+/**
  * Extracts deliberate shortcut (`shortcut:` / `ponytail:`) and deferral (`TODO:` / `FIXME:`)
  * comments added in diff hunks. Distinguishes bounded shortcuts with an explicit ceiling + upgrade
  * path (`hasTrigger: true`) from unbounded deferrals (`rotRisk: true`).
@@ -353,13 +375,14 @@ function extractShortcutsFromHunks(filePath, hunks) {
   const shortcuts = [];
   // Match full-line comments or trailing comments not enclosed in quotes or backticks
   const fullLineCommentRe = /^\s*(?:\/\/|#|\/\*+|\*)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)(?:\*\/)?$/i;
-  const trailingCommentRe = /^[^'"`]*?(?:\/\/|#)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)$/i;
+  const commentBodyRe = /^(?:\/\/|#)\s*(shortcut|ponytail|todo|fixme)\s*:\s*(.+?)$/i;
 
   for (const hunk of hunks || []) {
     for (const l of hunk.lines || []) {
       if (l.type !== 'add') continue;
       const text = String(l.content || '').trim();
-      const m = fullLineCommentRe.exec(text) || trailingCommentRe.exec(text);
+      const trailing = findTrailingComment(text);
+      const m = fullLineCommentRe.exec(text) || (trailing ? commentBodyRe.exec(trailing) : null);
       if (!m) continue;
 
       const marker = m[1].toLowerCase();
@@ -369,7 +392,7 @@ function extractShortcutsFromHunks(filePath, hunks) {
       let hasTrigger = false;
 
       if (marker === 'shortcut' || marker === 'ponytail') {
-        const splitMatch = /^([^,;—–-]+?)(?:\s*(?:,|;|->|→|—|–|\bwhen\b|\buntil\b|\bbefore\b)\s*)(.+)$/i.exec(body);
+        const splitMatch = /^([^,;—–]+?)(?:\s*(?:,|;|->|→|—|–|\bwhen\b|\buntil\b|\bbefore\b)\s*)(.+)$/i.exec(body);
         if (splitMatch && splitMatch[1].trim().length >= 3 && splitMatch[2].trim().length >= 3) {
           ceiling = splitMatch[1].trim();
           upgrade = splitMatch[2].trim();
@@ -422,9 +445,11 @@ function parseCodeowners(codeownersText) {
     const escaped = clean
       .replace(/[.+^${}()|[\]\\]/g, '\\$&')
       .replace(/\?/g, '[^/]')
+      .replace(/^\*\*\//, '__LEADING_DOUBLE_STAR_SLASH__')
       .replace(/\/\*\*\//g, '__SLASH_DOUBLE_STAR_SLASH__')
       .replace(/\*\*/g, '__DOUBLE_STAR__')
       .replace(/\*/g, '[^/]*')
+      .replace(/__LEADING_DOUBLE_STAR_SLASH__/g, '(?:.*/)?')
       .replace(/__SLASH_DOUBLE_STAR_SLASH__/g, '(?:/.*)?/')
       .replace(/__DOUBLE_STAR__/g, '.*');
 
@@ -504,10 +529,10 @@ function analyzeSpecAlignment(parsedFiles = [], prMeta = null) {
       const bullet = /^[-*]\s+(.+)$/.exec(line) || /^\d+\.\s+(.+)$/.exec(line);
       const itemText = bullet ? bullet[1].trim() : line;
 
-      if (section === 'out-of-scope' && bullet) {
+      if (section === 'out-of-scope') {
         outOfScope.push(itemText);
         continue;
-      } else if (section === 'precedent' && bullet) {
+      } else if (section === 'precedent') {
         repoPrecedents.push(itemText);
         continue;
       }
@@ -544,7 +569,12 @@ function analyzeSpecAlignment(parsedFiles = [], prMeta = null) {
           .filter(isPathLike);
         const candidates = [...new Set([...backticks, ...pathTokens])];
         const matchedToken = candidates.find((c) => {
-          const esc = c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+          // `**` crosses directories, `*` stays inside one path segment (gitignore-style).
+          const esc = c
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*\*/g, '__DOUBLE_STAR__')
+            .replace(/\*/g, '[^/]*')
+            .replace(/__DOUBLE_STAR__/g, '.*');
           return new RegExp(`(?:^|/)${esc}(?:/|$)`).test(normPath);
         });
         if (matchedToken) {
@@ -815,7 +845,23 @@ function analyzeAttentionSignals(parsedFiles = [], options = {}) {
     }
   }
 
-  const specAlignment = analyzeSpecAlignment(parsedFiles, prMeta);
+  let specAlignment = analyzeSpecAlignment(parsedFiles, prMeta);
+  const seededSpec = options.specAlignment;
+  if (
+    seededSpec &&
+    typeof seededSpec === 'object' &&
+    specAlignment.outOfScope.length === 0 &&
+    specAlignment.specClauses.length === 0 &&
+    specAlignment.repoPrecedents.length === 0
+  ) {
+    // No PR body to parse here: keep what an earlier prepare step extracted, and let it drive the focus prompts.
+    specAlignment = {
+      outOfScope: seededSpec.outOfScope || [],
+      repoPrecedents: seededSpec.repoPrecedents || [],
+      negativeSpaceViolations: seededSpec.negativeSpaceViolations || [],
+      specClauses: seededSpec.specClauses || []
+    };
+  }
   const rotRiskShortcuts = shortcuts.filter((s) => s.rotRisk);
   const uncoveredClauses = (specAlignment.specClauses || []).filter((c) => !c.covered);
 
