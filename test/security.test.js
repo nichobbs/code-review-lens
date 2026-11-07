@@ -39,10 +39,12 @@ test('headless mode for agents that cannot restrict tools requires an explicit o
   const prev = process.env.CRV_ALLOW_UNRESTRICTED_HEADLESS;
   delete process.env.CRV_ALLOW_UNRESTRICTED_HEADLESS;
   try {
-    for (const id of ['agy', 'gemini', 'codex']) {
+    // agy is read-only by default (--mode plan + --sandbox, see test/agy.test.js); gemini and codex still need the opt-in.
+    for (const id of ['gemini', 'codex']) {
       assert.throws(() => core.KNOWN_AGENTS[id].buildHeadlessArgs('p', '/skill', {}), /cannot be restricted/);
     }
-    assert.doesNotThrow(() => core.KNOWN_AGENTS.agy.buildHeadlessArgs('p', '/skill', { allowUnrestricted: true }));
+    assert.doesNotThrow(() => core.KNOWN_AGENTS.agy.buildHeadlessArgs('p', '/skill', {}));
+    assert.doesNotThrow(() => core.KNOWN_AGENTS.gemini.buildHeadlessArgs('p', '/skill', { allowUnrestricted: true }));
     process.env.CRV_ALLOW_UNRESTRICTED_HEADLESS = '1';
     assert.doesNotThrow(() => core.KNOWN_AGENTS.codex.buildHeadlessArgs('p', '/skill', {}));
   } finally {

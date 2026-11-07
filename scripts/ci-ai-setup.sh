@@ -3,6 +3,10 @@
 #
 # Return codes: 0 = harness ready, 10 = harness not available/authenticated here (caller skips cleanly), other = error.
 #
+# For agy the run itself is read-only (`--mode plan` + `--sandbox`, verified flags from `agy --help`; the semantics of
+# plan mode are assumed, see docs/ci.md "Verified vs assumed"). That limits what a prompt-injected agent can do; it
+# does not remove the need for a narrow, short-lived, non-personal credential.
+#
 # IMPORTANT: no credential mechanics are invented here. How the team's harness (agy / gemini-argon-4) authenticates
 # in CI is an open question for the platform team; see docs/ci.md "agy auth options". Until the TODO(platform-team)
 # markers below are filled in, tier 2 reports "skipped" and the PR still gets the tier 1 pre-scan.

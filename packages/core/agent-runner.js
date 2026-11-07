@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
+const { FINDINGS_SCHEMA_PATH, writeFindingsFromAgentOutput } = require('./agent-output');
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,63}$/;
 const EFFORT_VALUES = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -13,8 +14,54 @@ function isValidModelName(value) {
   return typeof value === 'string' && MODEL_RE.test(value);
 }
 
-function isValidEffort(value) {
-  return typeof value === 'string' && EFFORT_VALUES.has(value.toLowerCase());
+/**
+ * Effort values per agent. `agy` is VERIFIED from `agy --help` (`--effort` low|medium|high|xhigh|max).
+ * `claude` is assumed to take the same set. `gemini` and `codex` have no effort flag wired up in crv, so any
+ * configured effort is accepted (it is one global setting) but never passed to them.
+ */
+const AGENT_EFFORTS = {
+  agy: ['low', 'medium', 'high', 'xhigh', 'max'],
+  claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+  gemini: [],
+  codex: []
+};
+
+function isValidEffort(value, agentId) {
+  if (typeof value !== 'string' || !EFFORT_VALUES.has(value.toLowerCase())) return false;
+  if (agentId && AGENT_EFFORTS[agentId] && AGENT_EFFORTS[agentId].length) {
+    return AGENT_EFFORTS[agentId].includes(value.toLowerCase());
+  }
+  return true;
+}
+
+/** `agy --mode` values, VERIFIED from `agy --help`. `plan` is the read-only profile (assumed, see docs/ci.md). */
+const AGY_MODES = ['plan', 'accept-edits', 'auto'];
+const AGY_READONLY_MODE = 'plan';
+
+function allowsUnrestricted(opts = {}) {
+  const env = opts.env || process.env;
+  return Boolean(opts.allowUnrestricted) || env.CRV_ALLOW_UNRESTRICTED_HEADLESS === '1';
+}
+
+/** Resolves the `agy` headless mode: explicit option, then `CRV_AGY_MODE`, then read-only `plan`. */
+function resolveAgyHeadlessMode(opts = {}) {
+  const env = opts.env || process.env;
+  const mode = String(opts.agyMode || env.CRV_AGY_MODE || AGY_READONLY_MODE).trim().toLowerCase();
+  if (!AGY_MODES.includes(mode)) {
+    throw new Error(`Invalid agy mode "${mode}". Expected one of: ${AGY_MODES.join(', ')}`);
+  }
+  if (mode !== AGY_READONLY_MODE && !allowsUnrestricted(opts)) {
+    throw new Error(
+      `agy --mode ${mode} lets the agent edit files and run commands, and the PR under review is untrusted input (prompt injection can use that). ` +
+        `Use the default read-only "${AGY_READONLY_MODE}" mode, or set CRV_ALLOW_UNRESTRICTED_HEADLESS=1 inside a disposable, credential-free sandbox.`
+    );
+  }
+  return mode;
+}
+
+function agySandboxEnabled(opts = {}) {
+  const env = opts.env || process.env;
+  return opts.sandbox !== false && env.CRV_AGY_SANDBOX !== '0';
 }
 
 /**
@@ -39,9 +86,9 @@ function pushModel(args, opts) {
   args.push('--model', opts.model);
 }
 
-function pushEffort(args, opts) {
+function pushEffort(args, opts, agentId) {
   if (!opts.effort) return;
-  if (!isValidEffort(opts.effort)) {
+  if (!isValidEffort(opts.effort, agentId)) {
     throw new Error(`Invalid effort "${opts.effort}". Expected one of: ${[...EFFORT_VALUES].join(', ')}`);
   }
   args.push('--effort', String(opts.effort).toLowerCase());
@@ -52,19 +99,38 @@ const KNOWN_AGENTS = {
     id: 'agy',
     name: 'Antigravity CLI (agy)',
     bin: 'agy',
-    restrictsHeadlessTools: false,
-    exampleModels: ['claude-opus-4-6', 'claude-sonnet-4-6', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    // Headless agy runs read-only (`--mode plan` + `--sandbox`) unless the unrestricted opt-in is set.
+    restrictsHeadlessTools: true,
+    exampleModels: ['gemini-argon-4', 'claude-opus-4-6', 'claude-sonnet-4-6', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    /** True when the headless run cannot write files, so crv must write findings.json from the agent's response. */
+    headlessReturnsFindings: (opts = {}) => resolveAgyHeadlessMode(opts) === AGY_READONLY_MODE,
     buildInteractiveArgs: (prompt, skillDir, opts = {}) => {
       const args = ['--add-dir', skillDir];
       pushModel(args, opts);
-      pushEffort(args, opts);
+      pushEffort(args, opts, 'agy');
       args.push('-i', prompt);
       return args;
     },
     buildHeadlessArgs: (prompt, skillDir, opts = {}) => {
-      const args = ['--add-dir', skillDir, '--mode', 'accept-edits'];
+      const mode = resolveAgyHeadlessMode(opts);
+      const args = ['--add-dir', skillDir];
+      if (opts.scratchDir) args.push('--add-dir', path.resolve(opts.scratchDir));
+      args.push('--mode', mode);
+      if (agySandboxEnabled(opts)) args.push('--sandbox');
+      args.push('--disable-slash-commands');
+      if (opts.printTimeoutMinutes) {
+        const minutes = Number(opts.printTimeoutMinutes);
+        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) {
+          throw new Error(`Invalid print timeout "${opts.printTimeoutMinutes}" (whole minutes, 1-240)`);
+        }
+        args.push('--print-timeout', `${minutes}m`);
+      }
       pushModel(args, opts);
-      pushEffort(args, opts);
+      pushEffort(args, opts, 'agy');
+      const env = opts.env || process.env;
+      if (mode === AGY_READONLY_MODE && opts.jsonSchema !== false && env.CRV_AGY_JSON_SCHEMA !== '0') {
+        args.push('--output-format', 'json', '--json-schema', FINDINGS_SCHEMA_PATH);
+      }
       args.push('-p', prompt);
       return args;
     }
@@ -78,7 +144,7 @@ const KNOWN_AGENTS = {
     buildInteractiveArgs: (prompt, skillDir, opts = {}) => {
       const args = ['--add-dir', skillDir];
       pushModel(args, opts);
-      pushEffort(args, opts);
+      pushEffort(args, opts, 'claude');
       args.push(prompt);
       return args;
     },
@@ -88,7 +154,7 @@ const KNOWN_AGENTS = {
         '--allowedTools', buildClaudeHeadlessAllowedTools({ scratchDir: opts.scratchDir, skillDir }).join(',')
       ];
       pushModel(args, opts);
-      pushEffort(args, opts);
+      pushEffort(args, opts, 'claude');
       args.push('-p', prompt);
       return args;
     }
@@ -134,8 +200,8 @@ const KNOWN_AGENTS = {
 };
 
 /**
- * Only the Claude Code adapter can restrict a headless agent to read-only tools.
- * Other agents would run with edit/shell rights over untrusted PR content, so headless mode
+ * Claude Code (tool allow-list) and agy (`--mode plan` + `--sandbox`, gated inside its own builder) can run headless
+ * read-only. The other agents would run with edit/shell rights over untrusted PR content, so their headless mode
  * requires an explicit opt-in (`CRV_ALLOW_UNRESTRICTED_HEADLESS=1` or `opts.allowUnrestricted`).
  */
 for (const spec of Object.values(KNOWN_AGENTS)) {
@@ -150,6 +216,39 @@ for (const spec of Object.values(KNOWN_AGENTS)) {
     }
     return original(prompt, skillDir, opts);
   };
+}
+
+/** True when the headless run of `spec` returns the findings JSON in its response instead of writing the file. */
+function headlessReturnsFindings(spec, opts = {}) {
+  return Boolean(spec && typeof spec.headlessReturnsFindings === 'function' && spec.headlessReturnsFindings(opts));
+}
+
+/**
+ * Runs a headless agent process. When the run is read-only (`returnsFindings`), stdout is captured and crv writes the
+ * validated `findings.json` itself; otherwise the agent writes it. `spawn` is injectable for tests.
+ * Returns `{ ok, error?, problems? }`.
+ */
+function runHeadlessAgent({ spec, args, scratchDir, env, timeoutMs, returnsFindings, spawn = spawnSync }) {
+  const run = spawn(spec.bin, args, {
+    stdio: returnsFindings ? ['ignore', 'pipe', 'inherit'] : 'inherit',
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    env,
+    timeout: timeoutMs
+  });
+  if (run.error || run.status !== 0) {
+    return { ok: false, error: `agent did not finish cleanly (${run.error ? run.error.message : `exit ${run.status}`})` };
+  }
+  if (!returnsFindings) {
+    return fs.existsSync(path.join(scratchDir, 'findings.json'))
+      ? { ok: true }
+      : { ok: false, error: 'agent finished but wrote no findings.json' };
+  }
+  const written = writeFindingsFromAgentOutput(run.stdout, scratchDir);
+  if (!written.written) {
+    return { ok: false, error: `agent output was not usable findings JSON: ${written.problems.slice(0, 5).join('; ')}`, problems: written.problems };
+  }
+  return { ok: true, issueCount: written.issueCount, problems: written.problems };
 }
 
 function isBinaryOnPath(bin) {
@@ -413,7 +512,7 @@ function saveDefaultAgentConfig(agentId, options = {}) {
   };
 }
 
-function buildReviewSkillPrompt({ repo, pr, scratchDir, skillDir, headless, agentName, modelName }) {
+function buildReviewSkillPrompt({ repo, pr, scratchDir, skillDir, headless, agentName, modelName, returnFindings }) {
   const skillMdPath = path.join(skillDir, 'SKILL.md');
   const findingsPath = path.join(scratchDir, 'findings.json');
   const reviewPackPath = path.join(scratchDir, 'review-pack.md');
@@ -432,7 +531,11 @@ function buildReviewSkillPrompt({ repo, pr, scratchDir, skillDir, headless, agen
 1. Read ${reviewPackPath} (it contains everything needed for this review: PR metadata, standards scan, 4-Layer summary, triggered lenses, output schema, and line-numbered diff; if the diff is large and truncated, read the remaining lines of ${reviewPackPath}).
 2. DO NOT run git fetch, git ls-tree, git log, or git show to count line numbers (every added and context line in ${reviewPackPath} already has its exact <head> line number prefixed as L<num>). Only run git show/grep if a high-severity finding requires verifying an untouched caller file outside the diff.
 3. DO NOT call invoke_subagent or spawn background tasks, DO NOT write intermediate lens-<name>.json files, and DO NOT run crv export-html or crv review (the outer CLI compiles and launches the Workbench automatically as soon as you exit).
-4. Evaluate all triggered lenses in a single pass, verify high/medium findings against the line-numbered diff, write the final ${findingsPath} in a single write_file call, and exit immediately.`
+4. ${
+        returnFindings
+          ? `You are running read-only and cannot write files. Evaluate all triggered lenses in a single pass, verify high/medium findings against the line-numbered diff, then reply with ONLY the findings JSON object (the exact schema in findings.md: {"meta":{...},"issues":[...]}) as your final response, with no prose and no code fence. crv validates it and writes ${findingsPath} itself.`
+          : `Evaluate all triggered lenses in a single pass, verify high/medium findings against the line-numbered diff, write the final ${findingsPath} in a single write_file call, and exit immediately.`
+      }`
       : `Follow ${skillMdPath} starting at Step 2 using the pre-computed ${reviewPackPath} (or ${bundlePath}) in ${scratchDir}, show the pre-computed lens pick table, and write ${findingsPath}.`
   ].filter(Boolean);
   return lines.join('\n');
@@ -440,6 +543,11 @@ function buildReviewSkillPrompt({ repo, pr, scratchDir, skillDir, headless, agen
 
 module.exports = {
   KNOWN_AGENTS,
+  AGENT_EFFORTS,
+  AGY_MODES,
+  resolveAgyHeadlessMode,
+  headlessReturnsFindings,
+  runHeadlessAgent,
   isValidModelName,
   isValidEffort,
   buildClaudeHeadlessAllowedTools,

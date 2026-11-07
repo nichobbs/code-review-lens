@@ -7,6 +7,8 @@
  *       Tier 1. Posts/updates ONE sticky crv-meta comment from the staged pre-scan (and tier 2 results if present).
  *   crv ci-analyze <pr> --repo o/r --agent <agy|claude|gemini|codex> [--model m] [--effort e] [--fast] [--scratch dir]
  *       Tier 2a. Stages the PR and runs the headless skill. Never starts the Workbench server.
+ *       agy runs read-only (--mode plan --sandbox) and returns the findings in its response; crv validates them and
+ *       writes findings.json itself. Other agents write it themselves (claude: scoped tools; gemini/codex: opt-in).
  *   crv ci-review  <pr> --repo o/r [--scratch dir] [--min-severity medium] [--max-findings 15] [--dry-run]
  *       Tier 2b. Posts one COMMENT-only review from the agent's findings.json.
  *
@@ -279,11 +281,21 @@ async function ciAnalyze(argv, deps = {}) {
   const gi = path.join(path.dirname(path.dirname(scratch)), '.gitignore');
   if (!fs.existsSync(gi)) fs.writeFileSync(gi, '*\n');
 
-  const prep = spawnSync('node', [path.join(skillDir, 'scripts', 'prepare_pr.mjs'), String(prNum), scratch, '--repo', flags.repo], {
-    stdio: 'inherit'
-  });
+  const stage = deps.stage || (() => spawnSync('node', [path.join(skillDir, 'scripts', 'prepare_pr.mjs'), String(prNum), scratch, '--repo', flags.repo], { stdio: 'inherit' }));
+  const prep = stage({ skillDir, prNum, scratch, repo: flags.repo });
   if (prep.status !== 0) throw new Error(`Failed to stage PR #${prNum} via prepare_pr.mjs`);
 
+  const effort = flags.effort || (flags.fast ? 'low' : agentCfg.effort || 'medium');
+  // agy runs read-only (--mode plan + --sandbox) and returns the findings in its response; crv writes findings.json.
+  // CRV_ALLOW_UNRESTRICTED_HEADLESS=1 + CRV_AGY_MODE=accept-edits|auto restores the old write-it-yourself behaviour.
+  const agentOpts = {
+    model: agentCfg.model,
+    effort,
+    scratchDir: scratch,
+    env,
+    printTimeoutMinutes: Math.max(1, flags.timeoutMinutes - 1)
+  };
+  const returnsFindings = core.headlessReturnsFindings(agentCfg.spec, agentOpts);
   const prompt = core.buildReviewSkillPrompt({
     repo: flags.repo,
     pr: String(prNum),
@@ -291,24 +303,29 @@ async function ciAnalyze(argv, deps = {}) {
     skillDir,
     headless: true,
     agentName: agentCfg.spec.name,
-    modelName: agentCfg.model || undefined
+    modelName: agentCfg.model || undefined,
+    returnFindings: returnsFindings
   });
-  const effort = flags.effort || (flags.fast ? 'low' : agentCfg.effort || 'medium');
-  const args = agentCfg.spec.buildHeadlessArgs(prompt, skillDir, { model: agentCfg.model, effort, scratchDir: scratch });
-  console.log(`crv ci-analyze: running ${agentCfg.spec.name}${agentCfg.model ? ` (model ${agentCfg.model})` : ''}, effort ${effort}.`);
+  const args = agentCfg.spec.buildHeadlessArgs(prompt, skillDir, agentOpts);
+  console.log(
+    `crv ci-analyze: running ${agentCfg.spec.name}${agentCfg.model ? ` (model ${agentCfg.model})` : ''}, effort ${effort}${returnsFindings ? ', read-only' : ''}.`
+  );
 
-  const run = spawnSync(agentCfg.spec.bin, args, {
-    stdio: 'inherit',
+  const outcome = core.runHeadlessAgent({
+    spec: agentCfg.spec,
+    args,
+    scratchDir: scratch,
     env: scrubAgentEnv(env),
-    timeout: Math.max(1, flags.timeoutMinutes) * 60 * 1000
+    timeoutMs: Math.max(1, flags.timeoutMinutes) * 60 * 1000,
+    returnsFindings,
+    spawn: deps.spawn
   });
-  if (run.error || run.status !== 0) {
-    console.error(`crv ci-analyze: agent did not finish cleanly (${run.error ? run.error.message : `exit ${run.status}`}).`);
+  if (!outcome.ok) {
+    console.error(`crv ci-analyze: ${outcome.error}.`);
     return 2;
   }
-  if (!fs.existsSync(path.join(scratch, 'findings.json'))) {
-    console.error('crv ci-analyze: agent finished but wrote no findings.json.');
-    return 2;
+  if (outcome.problems && outcome.problems.length) {
+    console.warn(`crv ci-analyze: ${outcome.problems.length} finding(s) dropped as invalid:\n  ${outcome.problems.slice(0, 10).join('\n  ')}`);
   }
   return 0;
 }

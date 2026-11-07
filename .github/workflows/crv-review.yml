@@ -234,9 +234,10 @@ jobs:
           if [ "$setup_rc" -eq 10 ]; then skip "the $CRV_AI_RUNNER harness is not installed or authenticated on this runner"; fi
           if [ "$setup_rc" -ne 0 ]; then exit "$setup_rc"; fi
 
-          # agy/gemini/codex cannot restrict their tools, so crv refuses headless runs for them unless this opt-in is set.
-          # It is set only here, inside the ephemeral CI container (see docs/ci.md "Why the opt-in is acceptable").
-          case "$CRV_AI_RUNNER" in agy|gemini|codex) export CRV_ALLOW_UNRESTRICTED_HEADLESS=1 ;; esac
+          # agy runs read-only (--mode plan + --sandbox) and crv writes findings.json from its response, so it needs no
+          # opt-in. gemini/codex cannot restrict their tools, so crv refuses headless runs for them unless this opt-in
+          # is set; it is set only here, inside the ephemeral CI container (see docs/ci.md "Headless safety per agent").
+          case "$CRV_AI_RUNNER" in gemini|codex) export CRV_ALLOW_UNRESTRICTED_HEADLESS=1 ;; esac
 
           analyze=(--agent "$CRV_AI_RUNNER" --effort "$CRV_AI_EFFORT")
           if [ -n "$CRV_AI_MODEL" ]; then analyze+=(--model "$CRV_AI_MODEL"); fi
