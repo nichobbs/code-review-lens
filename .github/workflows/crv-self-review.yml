@@ -1,0 +1,21 @@
+# crv reviews its own pull requests. Other repositories call the reusable workflow the same way (docs/ci.md).
+name: crv self-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: ./.github/workflows/crv-review.yml
+    with:
+      crv-repository: ${{ github.repository }}
+      # The tooling is the base branch's, so a PR cannot change the code that reviews it.
+      crv-ref: ${{ github.event.pull_request.base.sha }}
+      # ai-runner: none   # tier 2 stays off until the AI harness can authenticate in CI (docs/ci.md)
+    secrets:
+      AI_RUNNER_TOKEN: ${{ secrets.AI_RUNNER_TOKEN }}

@@ -1,0 +1,252 @@
+# Reusable crv workflow: automated PR review in two tiers. See docs/ci.md.
+#
+#   Tier 1 (always): deterministic 4-layer pre-scan -> ONE sticky `<!-- crv-meta -->` comment. No LLM, no AI secret.
+#   Tier 2 (opt-in): headless AI review -> ONE `COMMENT` review (never REQUEST_CHANGES / APPROVE). Advisory only.
+#
+# Security rules enforced here (and checked by test/ci.test.js):
+#   - `pull_request` only; fork PRs, drafts and Dependabot are skipped.
+#   - least-privilege token; actions pinned to SHAs; tool code comes from `crv-ref`, never from the PR.
+#   - PR-controlled strings are never interpolated into shell: values reach scripts through `env:` only.
+name: crv review (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      crv-repository:
+        description: Repository that holds the crv tooling
+        type: string
+        default: nichobbs/code-review-lens
+      crv-ref:
+        description: Ref (pin a SHA) of the crv tooling to run. Never the PR head.
+        type: string
+        default: main
+      ai-runner:
+        description: "Tier 2 harness: none | agy | claude | gemini | codex"
+        type: string
+        default: none
+      ai-model:
+        description: Model for the harness (empty = harness default; agy defaults to gemini-argon-4)
+        type: string
+        default: ''
+      ai-runs-on:
+        description: Runner labels for the tier 2 job (e.g. a self-hosted label)
+        type: string
+        default: ubuntu-latest
+      ai-auth-mode:
+        description: "token = require the AI_RUNNER_TOKEN secret; ambient = runner is already authenticated"
+        type: string
+        default: token
+      effort:
+        type: string
+        default: low
+      fast:
+        type: boolean
+        default: true
+      min-severity:
+        description: Lowest severity that is posted (high | medium | low | struct | nit)
+        type: string
+        default: medium
+      max-findings:
+        type: number
+        default: 15
+      max-diff-bytes:
+        description: Skip tier 2 above this diff size
+        type: number
+        default: 200000
+      fail-on-hard-rules:
+        description: Fail the check on deterministic hard rules (e.g. hollow tests). Never on AI findings.
+        type: boolean
+        default: false
+    secrets:
+      CRV_TOOL_TOKEN:
+        description: Token able to read crv-repository (only needed if it is private and not this repo)
+        required: false
+      AI_RUNNER_TOKEN:
+        description: Credential for the tier 2 harness (mechanism TODO, see docs/ci.md)
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: crv-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  tier1:
+    name: crv pre-scan
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      skip_ai: ${{ steps.size.outputs.skip_ai }}
+      tooling_ready: ${{ steps.tooling.outputs.ready }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Scratch directory
+        run: echo "SCRATCH=$RUNNER_TEMP/crv/scratch" >> "$GITHUB_ENV"
+
+      - name: Checkout PR (data only; nothing from it is executed)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout crv tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.crv-repository }}
+          ref: ${{ inputs.crv-ref }}
+          token: ${{ secrets.CRV_TOOL_TOKEN || github.token }}
+          path: crv-tool
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+
+      # The tooling at `crv-ref` may predate the `ci-*` commands (for example crv reviewing the very PR that adds
+      # them, with tooling pinned to the base branch). Without this check an older crv would treat `ci-comment` as a
+      # PR shorthand and start the interactive Workbench server, which never exits.
+      - name: Check that the pinned tooling supports the CI commands
+        id: tooling
+        run: |
+          set -euo pipefail
+          if [ -f crv-tool/packages/cli/ci.js ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=crv::the crv tooling at crv-ref has no ci-* commands yet (expected on the PR that introduces them); the pre-scan comment is skipped until the tooling is updated."
+          fi
+
+      - name: Stage PR and run the 4-layer pre-scan
+        working-directory: target
+        run: |
+          set -euo pipefail
+          node "$GITHUB_WORKSPACE/crv-tool/.agents/skills/crv-code-review/scripts/prepare_pr.mjs" "$PR_NUMBER" "$SCRATCH" --repo "$REPO"
+
+      - name: Check diff size against the tier 2 limit
+        id: size
+        env:
+          MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+        run: |
+          set -euo pipefail
+          bytes=$(wc -c < "$SCRATCH/diff.patch")
+          if [ "$bytes" -gt "$MAX_DIFF_BYTES" ]; then
+            echo "skip_ai=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=crv::diff is ${bytes} bytes (limit ${MAX_DIFF_BYTES}); AI review skipped."
+          else
+            echo "skip_ai=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "diff_bytes=${bytes}" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update the sticky overview comment
+        if: steps.tooling.outputs.ready == 'true'
+        timeout-minutes: 3
+        working-directory: target
+        env:
+          AI_RUNNER: ${{ inputs.ai-runner }}
+          SKIP_AI: ${{ steps.size.outputs.skip_ai }}
+          FAIL_ON_HARD_RULES: ${{ inputs.fail-on-hard-rules }}
+        run: |
+          set -euo pipefail
+          if [ "$AI_RUNNER" = "none" ]; then status="not enabled (no AI runner configured for this repository)"
+          elif [ "$SKIP_AI" = "true" ]; then status="skipped (diff larger than the configured limit)"
+          else status="queued"; fi
+          args=()
+          if [ "$FAIL_ON_HARD_RULES" = "true" ]; then args+=(--fail-on-hard-rules); fi
+          node "$GITHUB_WORKSPACE/crv-tool/packages/cli/bin/crv.js" ci-comment "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH" --ai-status "$status" "${args[@]}"
+
+  tier2:
+    name: crv AI review (advisory)
+    needs: tier1
+    if: inputs.ai-runner != 'none' && needs.tier1.outputs.skip_ai != 'true' && needs.tier1.outputs.tooling_ready == 'true'
+    runs-on: ${{ inputs.ai-runs-on }}
+    timeout-minutes: 30
+    # Advisory: an AI failure must never fail the PR's checks.
+    continue-on-error: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Scratch directory
+        run: echo "SCRATCH=$RUNNER_TEMP/crv/scratch" >> "$GITHUB_ENV"
+
+      - name: Checkout PR (data only; nothing from it is executed)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout crv tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.crv-repository }}
+          ref: ${{ inputs.crv-ref }}
+          token: ${{ secrets.CRV_TOOL_TOKEN || github.token }}
+          path: crv-tool
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+
+      - name: Run the AI review (skips cleanly when the runner or credentials are not available)
+        working-directory: target
+        env:
+          CRV_AI_RUNNER: ${{ inputs.ai-runner }}
+          CRV_AI_AUTH_MODE: ${{ inputs.ai-auth-mode }}
+          CRV_AI_MODEL: ${{ inputs.ai-model }}
+          CRV_AI_EFFORT: ${{ inputs.effort }}
+          CRV_AI_FAST: ${{ inputs.fast }}
+          CRV_MIN_SEVERITY: ${{ inputs.min-severity }}
+          CRV_MAX_FINDINGS: ${{ inputs.max-findings }}
+          CRV_AI_TOKEN: ${{ secrets.AI_RUNNER_TOKEN }}
+        run: |
+          set -euo pipefail
+          crv="$GITHUB_WORKSPACE/crv-tool/packages/cli/bin/crv.js"
+          skip() {
+            echo "::notice title=crv AI review skipped::$1"
+            node "$crv" ci-comment "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH" --ai-status "skipped ($1)"
+            exit 0
+          }
+
+          if [ "$CRV_AI_AUTH_MODE" = "token" ] && [ -z "${CRV_AI_TOKEN:-}" ]; then
+            skip "no AI_RUNNER_TOKEN secret is configured"
+          fi
+
+          # Install/auth seam: see scripts/ci-ai-setup.sh and docs/ci.md. Return code 10 = not configured here.
+          . "$GITHUB_WORKSPACE/crv-tool/scripts/ci-ai-setup.sh"
+          set +e; crv_ai_setup; setup_rc=$?; set -e
+          if [ "$setup_rc" -eq 10 ]; then skip "the $CRV_AI_RUNNER harness is not installed or authenticated on this runner"; fi
+          if [ "$setup_rc" -ne 0 ]; then exit "$setup_rc"; fi
+
+          # agy/gemini/codex cannot restrict their tools, so crv refuses headless runs for them unless this opt-in is set.
+          # It is set only here, inside the ephemeral CI container (see docs/ci.md "Why the opt-in is acceptable").
+          case "$CRV_AI_RUNNER" in agy|gemini|codex) export CRV_ALLOW_UNRESTRICTED_HEADLESS=1 ;; esac
+
+          analyze=(--agent "$CRV_AI_RUNNER" --effort "$CRV_AI_EFFORT")
+          if [ -n "$CRV_AI_MODEL" ]; then analyze+=(--model "$CRV_AI_MODEL"); fi
+          if [ "$CRV_AI_FAST" = "true" ]; then analyze+=(--fast); fi
+
+          set +e
+          node "$crv" ci-analyze "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH" "${analyze[@]}"
+          analyze_rc=$?
+          set -e
+          if [ "$analyze_rc" -ne 0 ]; then skip "the agent did not produce findings"; fi
+
+          node "$crv" ci-review "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH" --min-severity "$CRV_MIN_SEVERITY" --max-findings "$CRV_MAX_FINDINGS"
+          node "$crv" ci-comment "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH"

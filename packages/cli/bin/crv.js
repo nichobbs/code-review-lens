@@ -38,6 +38,7 @@ USAGE:
   crv effort [low|medium|high|xhigh|max|default] [-g]   Inspect or set the default reasoning effort
   crv install-skill [--global | --dir <path>]           Install the 14-lens crv-code-review AI skill
   crv demo [options]                                    Launch Workbench with bundled demo fixture
+  crv ci-comment|ci-analyze|ci-review <pr> --repo o/r   Non-interactive CI steps (see docs/ci.md)
 
 OPTIONS:
   --repo <owner/repo>     Override target GitHub repository for this command
@@ -260,6 +261,19 @@ function runAgentAnalysisOnPr(targetPr, flags) {
 }
 
 async function main() {
+  // Non-interactive CI subcommands (see docs/ci.md) have their own argument parser and never start the server.
+  const rawArgs = process.argv.slice(2);
+  const { isCiCommand, runCiCommand } = require('../ci');
+  if (isCiCommand(rawArgs[0])) {
+    process.exitCode = await runCiCommand(rawArgs[0], rawArgs.slice(1));
+    return;
+  }
+  if (/^ci-/.test(String(rawArgs[0] || ''))) {
+    // Never fall through to the interactive Workbench for a mistyped or unsupported CI command.
+    console.error(`Unknown CI command "${rawArgs[0]}". Supported: ci-comment, ci-analyze, ci-review (see docs/ci.md).`);
+    process.exitCode = 2;
+    return;
+  }
   const { cmd, flags } = parseArgs(process.argv);
 
   if (flags.version) {
@@ -389,6 +403,12 @@ async function main() {
 
   const resolvedRepo = resolveRepoConfig({ explicitRepo: flags.repo, reportRepo: report?.REVIEW?.repo });
 
+  if (process.env.GITHUB_ACTIONS === 'true' && process.env.CRV_ALLOW_SERVER_IN_CI !== '1') {
+    // A hung interactive server wastes a runner until its timeout; CI uses the non-interactive ci-* commands.
+    console.error('Refusing to start the interactive Workbench server inside GitHub Actions (use crv ci-comment / ci-analyze / ci-review).');
+    process.exitCode = 2;
+    return;
+  }
   const { server } = createWorkbenchServer({
     report,
     publish: flags.publish,

@@ -5,6 +5,7 @@ const diffClassifier = require('./diff-classifier');
 const findingsCompiler = require('./findings-compiler');
 const repoConfig = require('./repo-config');
 const agentRunner = require('./agent-runner');
+const ci = require('./ci');
 const scratch = require('./scratch');
 
 module.exports = {
@@ -13,5 +14,6 @@ module.exports = {
   ...findingsCompiler,
   ...repoConfig,
   ...agentRunner,
+  ...ci,
   ...scratch
 };
