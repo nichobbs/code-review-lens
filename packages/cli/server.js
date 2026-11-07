@@ -20,6 +20,8 @@ const {
   checkFindingsShape,
   compileFindingsToWorkbenchReport,
   resolveRepoConfig,
+  loadScratchArtifacts,
+  readJsonFileSafe,
   saveDefaultRepoConfig,
   resolveAgentConfig,
   saveDefaultAgentConfig,
@@ -83,16 +85,7 @@ function reportFromParsedJson(parsed, resolved, options) {
       console.warn(`SHAPE: ${warnings.length} problem(s) in ${path.basename(resolved)}:\n  ${warnings.join('\n  ')}`);
     }
     const dir = path.dirname(resolved);
-    const readSibling = (name, given) => {
-      if (given) return given;
-      const sibling = path.join(dir, name);
-      if (!fs.existsSync(sibling) || fs.statSync(sibling).size > MAX_REPORT_BYTES) return null;
-      try {
-        return JSON.parse(fs.readFileSync(sibling, 'utf8'));
-      } catch (e) {
-        return null;
-      }
-    };
+    const readSibling = (name, given) => given || readJsonFileSafe(path.join(dir, name), MAX_REPORT_BYTES);
     const prMeta = readSibling('pr-meta.json', options.prMeta);
     const layers = readSibling('layers.json', options.layers);
     // The compiler escapes agent text itself, so its output is already inside the allow-list.
@@ -228,39 +221,19 @@ async function listRecentPrsAsync(explicitRepo, limit = 10) {
 }
 
 function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hydrated }) {
-  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
-  if (!diffText) {
-    const diffCandidates = [
-      path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}/diff.patch`)
-    ];
-    const stagedDiffPath = diffCandidates.find((p) => fs.existsSync(p));
-    if (stagedDiffPath) {
-      diffText = fs.readFileSync(stagedDiffPath, 'utf8');
-    }
-  }
+  // Staged artifacts are trusted only for the repository they were staged for (same PR number, other repo = ignored).
+  const staged = loadScratchArtifacts(prNumInt, { repo });
+  if (!diffText) diffText = staged.diffText;
+  const stagedLayers = staged.layers;
 
-  // Check if we have a saved findings.json in .crv-skills/crv-code-review/<pr>/findings.json matching this repo
-  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNumInt}`);
-  const scratchFindingsPath = path.join(scratchDir, 'findings.json');
-  const scratchLayersPath = path.join(scratchDir, 'layers.json');
-  let stagedLayers = null;
-  if (fs.existsSync(scratchLayersPath)) {
-    try {
-      stagedLayers = JSON.parse(fs.readFileSync(scratchLayersPath, 'utf8'));
-    } catch (e) {}
-  }
-  if (fs.existsSync(scratchFindingsPath)) {
-    const findingsJson = JSON.parse(fs.readFileSync(scratchFindingsPath, 'utf8'));
-    const findingsRepo = findingsJson?.meta?.review?.repo || findingsJson?.REVIEW?.repo || '';
-    if (!findingsRepo || !repo || String(findingsRepo).toLowerCase() === String(repo).toLowerCase()) {
-      const compiled = compileFindingsToWorkbenchReport(findingsJson, {
-        diffText,
-        prMeta,
-        layers: stagedLayers
-      });
-      compiled.GITHUB_STATE = hydrated;
-      return compiled;
-    }
+  if (staged.findings) {
+    const compiled = compileFindingsToWorkbenchReport(staged.findings, {
+      diffText,
+      prMeta,
+      layers: stagedLayers
+    });
+    compiled.GITHUB_STATE = hydrated;
+    return compiled;
   }
 
   // If loading the bundled demo fixture PR and its repo matches, enrich and return it
@@ -1323,6 +1296,7 @@ module.exports = {
   validateThreadUpdates,
   buildCsp,
   buildStandaloneHtml,
+  buildLivePrReportFromFetchedData,
   createWorkbenchServer,
   isAllowedCorsOrigin
 };

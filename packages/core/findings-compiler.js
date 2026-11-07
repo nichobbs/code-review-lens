@@ -272,6 +272,8 @@ function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
     }
     layers = buildLayersFromParsedDiff(parsedFiles, rawIssues, {
       prMeta: options.prMeta || meta,
+      reuseCandidates: options.reuseCandidates || precomputedLayers?.attentionSignals?.reuseCandidates,
+      specAlignment: precomputedLayers?.attentionSignals?.specAlignment,
       codeownersText: options.codeownersText,
       codeownersRules: options.codeownersRules,
       callerBlastRadius: options.callerBlastRadius || preCallerMap
@@ -283,21 +285,6 @@ function compileFindingsToWorkbenchReport(findingsJson, options = {}) {
       for (const c of layers.contracts || []) {
         if ((!c.owners || c.owners.length === 0) && preOwnersByPath.has(c.path)) {
           c.owners = preOwnersByPath.get(c.path);
-        }
-      }
-      if (precomputedLayers.attentionSignals) {
-        const preSig = precomputedLayers.attentionSignals;
-        const curSig = layers.attentionSignals || {};
-        if ((!curSig.reuseCandidates || curSig.reuseCandidates.length === 0) && Array.isArray(preSig.reuseCandidates)) {
-          curSig.reuseCandidates = preSig.reuseCandidates;
-        }
-        if (
-          (!curSig.specAlignment ||
-            ((curSig.specAlignment.outOfScope || []).length === 0 &&
-              (curSig.specAlignment.specClauses || []).length === 0)) &&
-          preSig.specAlignment
-        ) {
-          curSig.specAlignment = preSig.specAlignment;
         }
       }
     }

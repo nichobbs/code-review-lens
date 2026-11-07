@@ -19,7 +19,8 @@ const {
   saveDefaultRepoConfig,
   resolveAgentConfig,
   saveDefaultAgentConfig,
-  buildReviewSkillPrompt
+  buildReviewSkillPrompt,
+  getScratchDir
 } = require('../../core');
 
 function printHelp() {
@@ -63,8 +64,9 @@ OPTIONS:
 DEFAULT REPO RESOLUTION ORDER:
   1. --repo <owner/repo> flag or owner/repo#number
   2. CRV_DEFAULT_REPO or GH_REPO environment variable (or .env file)
-  3. .crvrc.json in current directory or ~/.config/crv/config.json
+  3. .crvrc.json or crv.config.json in the current directory
   4. git remote origin of the current working directory
+  5. ~/.config/crv/config.json (global default)
 `.trim());
 }
 
@@ -220,9 +222,8 @@ function runAgentAnalysisOnPr(targetPr, flags) {
   const { repo, prNumInt } = parsePrTargetInput(targetPr, resolvedRepo.repo);
   const prNum = String(prNumInt);
 
-  // Avoid nesting .crv-skills/crv-code-review/.crv-skills/crv-code-review if invoked inside .crv-skills
-  const baseCwd = process.cwd().replace(/[\\/]\.crv-skills(?:[\\/]crv-code-review(?:[\\/][^\\/]+)?)?$/, '');
-  const scratchDir = path.resolve(baseCwd, `.crv-skills/crv-code-review/${prNum}`);
+  // Never nests .crv-skills/crv-code-review/.crv-skills/... when invoked inside the scratch tree
+  const scratchDir = getScratchDir(prNum);
   const skillDir = path.resolve(__dirname, '../../../.agents/skills/crv-code-review');
   const prepScript = path.join(skillDir, 'scripts', 'prepare_pr.mjs');
 

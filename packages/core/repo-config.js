@@ -114,9 +114,10 @@ function detectGitRemoteRepo(cwd) {
  * 1. Explicit `options.explicitRepo` (`--repo` CLI flag or UI override)
  * 2. Environment variable (`CRV_DEFAULT_REPO` or `GH_REPO`)
  * 3. `.env` file in working directory (`CRV_DEFAULT_REPO` or `GH_REPO`)
- * 4. Local config file (`.crvrc.json`, `crv.config.json`, or `~/.config/crv/config.json`)
+ * 4. Local config file in the working directory (`.crvrc.json` or `crv.config.json`)
  * 5. Git remote of the current working directory (`git config --get remote.origin.url`)
- * 6. Report metadata fallback (`options.reportRepo`)
+ * 6. Global config file (`~/.config/crv/config.json`)
+ * 7. Report metadata fallback (`options.reportRepo`)
  */
 function resolveRepoConfig(options = {}) {
   const cwd = options.cwd || process.cwd();

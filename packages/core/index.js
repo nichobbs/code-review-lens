@@ -6,6 +6,7 @@ const findingsCompiler = require('./findings-compiler');
 const repoConfig = require('./repo-config');
 const agentRunner = require('./agent-runner');
 const ci = require('./ci');
+const scratch = require('./scratch');
 
 module.exports = {
   ...githubComments,
@@ -13,5 +14,6 @@ module.exports = {
   ...findingsCompiler,
   ...repoConfig,
   ...agentRunner,
-  ...ci
+  ...ci,
+  ...scratch
 };
