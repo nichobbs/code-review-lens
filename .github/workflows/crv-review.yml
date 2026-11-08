@@ -57,6 +57,14 @@ on:
         description: Fail the check on deterministic hard rules (e.g. hollow tests). Never on AI findings.
         type: boolean
         default: false
+      scenarios-file:
+        description: "Optional path (relative to the PR checkout) of a JSON file listing the story's agreed scenarios; adds a 'Scenarios covered' row. See docs/ci.md."
+        type: string
+        default: ''
+      fail-on-uncovered-scenarios:
+        description: Fail the check when a listed scenario has no tagged test among the tests changed in this PR (needs scenarios-file). Off by default.
+        type: boolean
+        default: false
     secrets:
       CRV_TOOL_TOKEN:
         description: Token able to read crv-repository (only needed if it is private and not this repo)
@@ -158,6 +166,8 @@ jobs:
           AI_RUNNER: ${{ inputs.ai-runner }}
           SKIP_AI: ${{ steps.size.outputs.skip_ai }}
           FAIL_ON_HARD_RULES: ${{ inputs.fail-on-hard-rules }}
+          SCENARIOS_FILE: ${{ inputs.scenarios-file }}
+          FAIL_ON_UNCOVERED: ${{ inputs.fail-on-uncovered-scenarios }}
         run: |
           set -euo pipefail
           if [ "$AI_RUNNER" = "none" ]; then status="not enabled (no AI runner configured for this repository)"
@@ -165,6 +175,8 @@ jobs:
           else status="queued"; fi
           args=()
           if [ "$FAIL_ON_HARD_RULES" = "true" ]; then args+=(--fail-on-hard-rules); fi
+          if [ -n "$SCENARIOS_FILE" ]; then args+=(--scenarios "$SCENARIOS_FILE"); fi
+          if [ "$FAIL_ON_UNCOVERED" = "true" ]; then args+=(--fail-on-uncovered-scenarios); fi
           node "$GITHUB_WORKSPACE/crv-tool/packages/cli/bin/crv.js" ci-comment "$PR_NUMBER" --repo "$REPO" --scratch "$SCRATCH" --ai-status "$status" "${args[@]}"
 
   tier2:
@@ -179,6 +191,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
+      # ci-comment reads this so the scenario row survives the refresh after the AI review.
+      CRV_SCENARIOS_FILE: ${{ inputs.scenarios-file }}
     steps:
       - name: Scratch directory
         run: echo "SCRATCH=$RUNNER_TEMP/crv/scratch" >> "$GITHUB_ENV"

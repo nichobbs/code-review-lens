@@ -3,7 +3,8 @@
 /**
  * `crv ci-*` subcommands: non-interactive entry points for the reusable GitHub Actions workflow.
  *
- *   crv ci-comment <pr> --repo o/r [--scratch dir] [--ai-status text] [--fail-on-hard-rules] [--dry-run]
+ *   crv ci-comment <pr> --repo o/r [--scratch dir] [--ai-status text] [--fail-on-hard-rules]
+ *                  [--scenarios scenarios.json] [--fail-on-uncovered-scenarios] [--dry-run]
  *       Tier 1. Posts/updates ONE sticky crv-meta comment from the staged pre-scan (and tier 2 results if present).
  *   crv ci-analyze <pr> --repo o/r --agent <agy|claude|gemini|codex> [--model m] [--effort e] [--fast] [--scratch dir]
  *       Tier 2a. Stages the PR and runs the headless skill. Never starts the Workbench server.
@@ -30,6 +31,8 @@ function parseCiArgs(argv) {
     scratch: null,
     aiStatus: '',
     failOnHardRules: false,
+    scenarios: null,
+    failOnUncoveredScenarios: false,
     dryRun: false,
     minSeverity: 'medium',
     maxFindings: 15,
@@ -46,6 +49,8 @@ function parseCiArgs(argv) {
     else if (a === '--scratch') flags.scratch = next();
     else if (a === '--ai-status') flags.aiStatus = next() || '';
     else if (a === '--fail-on-hard-rules') flags.failOnHardRules = true;
+    else if (a === '--scenarios') flags.scenarios = next();
+    else if (a === '--fail-on-uncovered-scenarios') flags.failOnUncoveredScenarios = true;
     else if (a === '--dry-run') flags.dryRun = true;
     else if (a === '--min-severity') flags.minSeverity = next();
     else if (a === '--max-findings') flags.maxFindings = Number(next());
@@ -56,6 +61,12 @@ function parseCiArgs(argv) {
     else if (a === '--timeout-minutes') flags.timeoutMinutes = Number(next());
     else if (!a.startsWith('-') && !flags.pr) flags.pr = a;
     else throw new Error(`Unknown or incomplete argument: ${a}`);
+  }
+  if (flags.scenarios !== null && (!flags.scenarios || flags.scenarios.startsWith('-'))) {
+    throw new Error('--scenarios needs a path to a JSON file');
+  }
+  if (flags.failOnUncoveredScenarios && !flags.scenarios) {
+    throw new Error('--fail-on-uncovered-scenarios needs --scenarios <file.json>');
   }
   if (!['high', 'medium', 'low', 'struct', 'nit'].includes(flags.minSeverity)) {
     throw new Error(`--min-severity must be one of high, medium, low, struct, nit (got "${flags.minSeverity}")`);
@@ -157,6 +168,15 @@ async function ciComment(argv, deps = {}) {
   const s = loadScratch(scratch);
   const hard = core.hardRuleFindings(s.layers);
 
+  // Optional scenario coverage: the scenarios file is data supplied by the workflow (flag, or CRV_SCENARIOS_FILE so
+  // later steps of the same job keep the row when they refresh the comment). No file = no row.
+  const scenariosPath = flags.scenarios || (deps.env || process.env).CRV_SCENARIOS_FILE || '';
+  let scenarioCoverage = null;
+  if (scenariosPath) {
+    scenarioCoverage = core.matchScenarioCoverage(core.loadScenarioFile(scenariosPath), s.layers && s.layers.testMatrix);
+    if (flags.failOnUncoveredScenarios) hard.push(...core.uncoveredScenarioFindings(scenarioCoverage));
+  }
+
   // Tier 2 results (if a previous ci-review ran in this scratch dir) feed the sticky comment's counts.
   let findings = [];
   let posted = null;
@@ -186,16 +206,28 @@ async function ciComment(argv, deps = {}) {
   for (const f of findings) triage[f.id] = { action: 'comment', note: '' };
   const body = core.renderStickyBody(
     report,
-    core.renderTier1Summary({ layers: s.layers, hard, aiStatus: flags.aiStatus, posted, headSha: s.prMeta.headRefOid }),
+    core.renderTier1Summary({
+      layers: s.layers,
+      hard,
+      aiStatus: flags.aiStatus,
+      posted,
+      headSha: s.prMeta.headRefOid,
+      scenarioCoverage
+    }),
     triage
   );
 
   const res = await core.upsertStickyComment({ gh, repo: flags.repo, pr: prNum, body, dryRun: flags.dryRun });
   appendGithubOutput('hard_findings', hard.length, deps.env);
+  if (scenarioCoverage) appendGithubOutput('uncovered_scenarios', scenarioCoverage.uncovered.length, deps.env);
   console.log(`crv ci-comment: sticky comment ${res.action}; ${hard.length} hard-rule finding(s).`);
   if (flags.dryRun) console.log(body);
-  if (flags.failOnHardRules && hard.length) {
-    console.error(`crv ci-comment: failing because ${hard.length} hard-rule finding(s) exist (--fail-on-hard-rules).`);
+  if (flags.failOnHardRules && hard.some((h) => h.rule !== 'uncovered-scenario')) {
+    console.error(`crv ci-comment: failing because hard-rule finding(s) exist (--fail-on-hard-rules).`);
+    return 1;
+  }
+  if (flags.failOnUncoveredScenarios && scenarioCoverage && scenarioCoverage.uncovered.length) {
+    console.error(`crv ci-comment: failing because ${scenarioCoverage.uncovered.length} scenario(s) have no tagged test in this PR (--fail-on-uncovered-scenarios).`);
     return 1;
   }
   return 0;
