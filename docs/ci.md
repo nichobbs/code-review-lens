@@ -60,6 +60,8 @@ Notes for callers in other repositories (for example `cx-integration-hub` or `on
 | `max-findings` | `15` | Cap on posted findings. |
 | `max-diff-bytes` | `200000` | Tier 2 is skipped above this diff size. |
 | `fail-on-hard-rules` | `false` | Fail the check on deterministic hard rules. Never on AI findings. |
+| `scenarios-file` | empty | Optional path (relative to the PR checkout) of a JSON file of the story's agreed scenarios. Adds a "Scenarios covered" row. See [Scenario coverage](#scenario-coverage). |
+| `fail-on-uncovered-scenarios` | `false` | Fail the check when a listed scenario has no tagged test among the tests changed in this PR. Needs `scenarios-file`. |
 
 ## What runs
 
@@ -75,6 +77,10 @@ pull_request (same-repo, not draft, not Dependabot)
 ```
 
 The `crv ci-*` commands can also be run locally with `--dry-run` to preview the output without posting.
+
+The sticky comment shows the human triage table and the "Architecture & Coverage Summary" block only when they have real
+content (for example after an AI review posts findings). A pre-scan-only comment is just the layer table, hard-rule
+result, scenario row (if any) and AI status. The `crv-meta` marker is unchanged, so trusted hydration still works.
 
 ### Re-reviews on new pushes
 
@@ -151,6 +157,49 @@ If plan mode turns out to block even the reads the review needs, set `CRV_AGY_MO
 5. Timeout: `crv ci-analyze <pr> --repo owner/name --agent agy --timeout-minutes 2` on a large PR stops with a clear
    "did not finish cleanly" message, and no partial `findings.json` is left.
 6. Effort: `--effort xhigh` and `--effort max` are accepted (`crv analyze ... --effort max`).
+
+## Scenario coverage
+
+crv can compare a story's agreed Given/When/Then scenarios with the tests in the PR. It is optional: without
+`scenarios-file` there is no row and nothing changes.
+
+**How tests link to scenarios.** Put a tag in the test (or suite) name: `[LUP-204-SC-1] member sees the offline barcode`.
+These spellings are all understood and normalised to `LUP-204-SC-1`: `[LUP-204-SC-1]`, `LUP-204-SC-1`,
+`[lup-204_sc-1]`, `[LUP-204 SC-1]` and `[LUP-204-SC1]`.
+
+**The scenarios file** is data, not code. Any of these shapes works:
+
+```json
+{ "storyKey": "LUP-204", "scenarios": ["SC-1", "SC-2", { "id": "SC-3", "title": "Timeout shows retry" }] }
+```
+
+```json
+{ "stories": [ { "key": "LUP-204", "scenarios": ["SC-1"] }, { "key": "LUP-205", "scenarios": ["SC-1"] } ] }
+```
+
+```json
+[ "LUP-204-SC-1", { "storyKey": "LUP-204", "id": "SC-2" } ]
+```
+
+Limits: 1 MB, 500 scenarios. A file that is not valid JSON, or has no usable scenario, fails the step loudly rather
+than silently dropping the row. Unusable entries and duplicate ids are reported in the comment.
+
+**Producing the file.** crv does not look scenarios up in JIRA. Write the file in an earlier step of the caller's
+workflow from a source you trust (for example the story's scenarios as shown by One Lens, or a file committed
+next to the code). Do not generate it from text in the PR itself if you do not trust the PR author. One Lens does not yet
+export this file (a follow-up).
+
+**What the comment says.** A row `Scenarios | covered by tagged tests changed in this PR | n of m`, the scenarios with no
+tagged test (and those whose only tests have zero assertions), and any tagged tests whose scenario is not in the list.
+A scenario counts as covered when at least one tagged test is not hollow.
+
+**Scope caveat.** Only the test files **changed in this PR** are examined. A story delivered in several PRs (backend,
+iOS, Android) will look partly uncovered in each. That is why `fail-on-uncovered-scenarios` is off by default; turn it on
+only for repositories that ship a story's scenarios in one PR. When it is on, the comment is still posted and the check
+fails. `fail-on-hard-rules` is independent and never trips on uncovered scenarios.
+
+Local use: `crv ci-comment 7 --repo owner/repo --scenarios scenarios.json --dry-run`. Later steps of the same job read
+`CRV_SCENARIOS_FILE`, so the row survives when the comment is refreshed after the AI review.
 
 ## Cost and noise controls
 

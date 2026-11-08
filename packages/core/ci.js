@@ -57,6 +57,15 @@ function hardRuleFindings(layers) {
   return out;
 }
 
+/** Opt-in hard rule: scenarios with no (non-hollow) tagged test among the tests changed in this PR. */
+function uncoveredScenarioFindings(scenarioCoverage) {
+  return ((scenarioCoverage && scenarioCoverage.uncovered) || []).map((u) => ({
+    rule: 'uncovered-scenario',
+    file: '',
+    detail: `${u.tag} has ${u.reason === 'hollow-only' ? 'only zero-assertion tests' : 'no tagged test'}`
+  }));
+}
+
 function countOf(x) {
   return Array.isArray(x) ? x.length : 0;
 }
@@ -79,7 +88,7 @@ function oneLine(s, max = 200) {
 }
 
 /** Markdown body for the Tier 1 section of the sticky comment. All dynamic text is escaped/length-capped. */
-function renderTier1Summary({ layers, hard = [], aiStatus = '', posted = null, headSha = '' }) {
+function renderTier1Summary({ layers, hard = [], aiStatus = '', posted = null, headSha = '', scenarioCoverage = null }) {
   const s = summarizeLayers(layers);
   const lines = [
     '**Automated pre-scan** (deterministic, no LLM). The AI review, when enabled, is advisory; a human triages every finding in the Workbench.',
@@ -91,9 +100,31 @@ function renderTier1Summary({ layers, hard = [], aiStatus = '', posted = null, h
     `| Tests | test files in the behavioural matrix | ${s.testFiles} |`,
     `| Attention | removed guards / stealth changes | ${s.removedGuards} / ${s.stealthChanges} |`,
     `| Attention | deliberate shortcuts | ${s.shortcuts} |`,
-    `| Spec | negative-space violations | ${s.negativeSpaceViolations} |`,
-    ''
+    `| Spec | negative-space violations | ${s.negativeSpaceViolations} |`
   ];
+  if (scenarioCoverage) {
+    lines.push(`| Scenarios | covered by tagged tests changed in this PR | ${scenarioCoverage.covered.length} of ${scenarioCoverage.total} |`);
+  }
+  lines.push('');
+
+  if (scenarioCoverage) {
+    const gaps = scenarioCoverage.uncovered;
+    if (gaps.length) {
+      lines.push(`**Scenarios without a tagged test in this PR (${gaps.length}):**`, '');
+      for (const g of gaps.slice(0, 20)) {
+        lines.push(`- \`${mdCell(g.tag)}\`${g.reason === 'hollow-only' ? ' (only zero-assertion tests)' : ''}`);
+      }
+      if (gaps.length > 20) lines.push(`- ...and ${gaps.length - 20} more`);
+      lines.push('', '<sub>A story delivered in several PRs (backend, iOS, Android) is expected to look partly uncovered in each one.</sub>', '');
+    }
+    if (scenarioCoverage.unknownTags.length) {
+      const tags = [...new Set(scenarioCoverage.unknownTags.map((u) => u.tag))];
+      lines.push(`**Tests tagged with scenarios that are not in the supplied list (${tags.length}):** ${tags.slice(0, 10).map((t) => `\`${mdCell(t)}\``).join(', ')}${tags.length > 10 ? ', ...' : ''}`, '');
+    }
+    if (scenarioCoverage.invalid.length || scenarioCoverage.duplicates.length) {
+      lines.push(`<sub>Scenario input: ${scenarioCoverage.invalid.length} unusable entr${scenarioCoverage.invalid.length === 1 ? 'y' : 'ies'}, ${scenarioCoverage.duplicates.length} duplicate id(s) ignored.</sub>`, '');
+    }
+  }
 
   if (hard.length) {
     lines.push(`### Hard-rule findings (${hard.length})`, '');
@@ -136,7 +167,7 @@ function buildCiReport({ repo, pr, prMeta = {}, findings = [], agent = 'crv CI',
 }
 
 function renderStickyBody(report, summaryMd, triage = {}) {
-  return capComment(serializeOverviewComment(report, triage, summaryMd));
+  return capComment(serializeOverviewComment(report, triage, summaryMd, { omitEmpty: true }));
 }
 
 /* ---------- Sticky comment: find + idempotent upsert ---------- */
@@ -238,6 +269,7 @@ module.exports = {
   SEVERITY_RANK,
   severityRank,
   hardRuleFindings,
+  uncoveredScenarioFindings,
   summarizeLayers,
   renderTier1Summary,
   buildCiReport,

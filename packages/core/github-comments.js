@@ -273,7 +273,10 @@ function parseFindingComment(commentBody) {
 /**
  * Serializes the sticky PR Overview / Summary comment with `<!-- crv-meta: {...} -->`.
  */
-function serializeOverviewComment(report, triageMap = {}, reviewerSummary = '') {
+function serializeOverviewComment(report, triageMap = {}, reviewerSummary = '', options = {}) {
+  // omitEmpty (used by the CI pre-scan comment): leave out the human triage table and the summary block when they
+  // would be empty. The crv-meta marker is identical either way. Workbench publishing keeps the full layout.
+  const omitEmpty = Boolean(options && options.omitEmpty);
   const issues = report.DATA || [];
   const counts = { block: 0, comment: 0, dismiss: 0, pending: 0 };
   const triagedState = {};
@@ -323,15 +326,18 @@ function serializeOverviewComment(report, triageMap = {}, reviewerSummary = '') 
       lines.push(reviewerSummary.trim(), '');
     }
 
-    lines.push(
-      `| Triage Status | Count | Description |`,
-      `| :--- | :---: | :--- |`,
-      `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
-      `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
-      `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
-      `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`,
-      ''
-    );
+    const hasTriage = counts.block + counts.comment + counts.dismiss + counts.pending > 0;
+    if (!omitEmpty || hasTriage) {
+      lines.push(
+        `| Triage Status | Count | Description |`,
+        `| :--- | :---: | :--- |`,
+        `| 🚫 **Blocking** | **${counts.block}** | Must be resolved before merge |`,
+        `| 💬 **Comment / Nit** | **${counts.comment}** | Non-blocking suggestions & design candidates |`,
+        `| 🔇 **Dismissed** | **${counts.dismiss}** | Filtered out by human reviewer |`,
+        `| ⏳ **Pending Triage** | **${counts.pending}** | Awaiting human review |`,
+        ''
+      );
+    }
 
     if (publishedIssues.length > 0) {
       lines.push(
@@ -351,12 +357,13 @@ function serializeOverviewComment(report, triageMap = {}, reviewerSummary = '') 
       lines.push('');
     }
 
-    if (withDetails) {
+    const summaryMd = stripHtmlToMarkdown(report.SUMMARY?.html || '');
+    if (withDetails && (!omitEmpty || summaryMd.trim())) {
       lines.push(
         `<details>`,
         `<summary><strong>Architecture & Coverage Summary</strong> ( Head: <code>${escapeHtmlText((metaPayload.head || '').slice(0, 8))}</code> · Model: <code>${escapeHtmlText(metaPayload.model || 'Agent')}</code> )</summary>`,
         '',
-        stripHtmlToMarkdown(report.SUMMARY?.html || ''),
+        summaryMd,
         '</details>'
       );
     }

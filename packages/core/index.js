@@ -8,6 +8,7 @@ const agentRunner = require('./agent-runner');
 const agentOutput = require('./agent-output');
 const ci = require('./ci');
 const scratch = require('./scratch');
+const scenarios = require('./scenarios');
 
 module.exports = {
   ...githubComments,
@@ -17,5 +18,6 @@ module.exports = {
   ...agentRunner,
   ...agentOutput,
   ...ci,
-  ...scratch
+  ...scratch,
+  ...scenarios
 };
