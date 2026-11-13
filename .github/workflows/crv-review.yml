@@ -103,14 +103,14 @@ jobs:
         run: echo "SCRATCH=$RUNNER_TEMP/crv/scratch" >> "$GITHUB_ENV"
 
       - name: Checkout PR (data only; nothing from it is executed)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: target
           fetch-depth: 0
           persist-credentials: false
 
       - name: Checkout crv tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.crv-repository }}
           ref: ${{ inputs.crv-ref }}
@@ -198,14 +198,14 @@ jobs:
         run: echo "SCRATCH=$RUNNER_TEMP/crv/scratch" >> "$GITHUB_ENV"
 
       - name: Checkout PR (data only; nothing from it is executed)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: target
           fetch-depth: 0
           persist-credentials: false
 
       - name: Checkout crv tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.crv-repository }}
           ref: ${{ inputs.crv-ref }}
