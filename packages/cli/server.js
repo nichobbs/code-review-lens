@@ -371,14 +371,16 @@ function buildLivePrReportFromFetchedData({ repo, prNumInt, prMeta, diffText, hy
   for (const tm of preLayers.testMatrix) {
     for (const c of tm.cases) {
       if (c.hollow || c.mockOnly) {
-        const loc = `${tm.file}:1`;
+        const loc = `${tm.file}:${c.line || 1}`;
+        const shortBehavior =
+          c.behavior.length > 90 ? `${c.behavior.slice(0, 87)}...` : c.behavior;
         autoIssues.push({
           id: `T${testIdx++}`,
           sev: 'low',
           cat: 'tests',
           verify: 'CONFIRMED',
           loc,
-          title: `${c.hollow ? 'Zero-assertion (hollow)' : 'Mock-only'} test: "${c.behavior.slice(0, 55)}"`,
+          title: `${c.hollow ? 'Zero-assertion (hollow)' : 'Mock-only'} test: "${shortBehavior}"`,
           impact: `**Breaks:** Test case \`${c.behavior}\` in \`${tm.file}\` ${c.hollow ? 'contains 0 assertions' : 'only asserts mock calls (toHaveBeenCalled*)'}.\n\n**Because:** Automated Layer 4 Behavioral Test Matrix scan detected \`assertions: ${c.assertions}\`.\n\n**Reach:** Suite \`${tm.suite}\`.`,
           fix: `**Do:** Assert the returned value or state transition rather than ${c.hollow ? 'ignoring the result' : 'only checking mock invocation'}.\n\n**Check:** Reverting the production branch in the tested module causes this test to fail.`
         });

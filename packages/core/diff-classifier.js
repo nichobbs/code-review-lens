@@ -627,11 +627,110 @@ function extractInternalMocksFromHunks(hunks) {
   return mocks;
 }
 
+function extractLeadingStringLiteral(str) {
+  const first = /^\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/.exec(str);
+  if (!first) return null;
+  let result = first[2].replace(/\\(['"`])/g, '$1').replace(/\s+/g, ' ').trim();
+  let rest = str.slice(first[0].length);
+  while (true) {
+    const nextPart = /^\s*\+\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/.exec(rest);
+    if (!nextPart) break;
+    result = `${result} ${nextPart[2].replace(/\\(['"`])/g, '$1').replace(/\s+/g, ' ').trim()}`.trim();
+    rest = rest.slice(nextPart[0].length);
+  }
+  return result;
+}
+
+function advanceTestBlockDepth(state, lineText, startIndex = 0) {
+  const len = lineText.length;
+  for (let i = startIndex; i < len; i++) {
+    const ch = lineText[i];
+    const next = i + 1 < len ? lineText[i + 1] : '';
+
+    if (state.inBlockComment) {
+      if (ch === '*' && next === '/') {
+        state.inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (state.inString) {
+      if (ch === '\\') {
+        i++;
+        continue;
+      }
+      if (ch === state.inString) {
+        state.inString = null;
+      }
+      continue;
+    }
+
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      break;
+    }
+    if (ch === '/' && next === '*') {
+      state.inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      state.inString = ch;
+      continue;
+    }
+
+    if (ch === '(') {
+      state.parenDepth++;
+    } else if (ch === ')') {
+      if (state.parenDepth > 0) state.parenDepth--;
+      if (
+        (state.seenBodyBrace || state.seenCallback) &&
+        state.parenDepth === 0 &&
+        state.braceDepth === 0
+      ) {
+        state.closed = true;
+        return;
+      }
+    } else if (ch === '{') {
+      state.braceDepth++;
+      if (state.parenDepth >= 1) {
+        state.seenBodyBrace = true;
+      }
+    } else if (ch === '}') {
+      if (state.braceDepth > 0) state.braceDepth--;
+      if (
+        state.seenBodyBrace &&
+        state.braceDepth === 0 &&
+        (state.parenDepth === 0 || /^\s*\)/.test(lineText.slice(i + 1)))
+      ) {
+        state.closed = true;
+        return;
+      }
+    } else if (ch === '=' && next === '>' && state.parenDepth >= 1) {
+      state.seenCallback = true;
+      i++;
+    }
+  }
+  if (state.inString === "'" || state.inString === '"') {
+    state.inString = null;
+  }
+}
+
 /**
  * Extracts a Behavioral Test Matrix from test file diff hunks:
  * finds `describe(...)`, `it(...)`, `test(...)` blocks and counts `expect(...)` / `assert` calls,
  * flagging hollow tests (`assertions === 0`), mock-only tests (`mockOnly`), oracle tautologies (`tautology`),
  * and internal seam mocks (`internalMock`).
+ *
+ * Rules to prevent false positives from diff hunk context lines:
+ * 1. Only extract `it(...)` / `test(...)` blocks that were added or modified in the diff (`hasChanges === true`).
+ *    Unchanged neighbor tests appearing only in leading/trailing context lines (`ctx`) are skipped.
+ * 2. Track brace/paren depth within the hunk and require the test block's closing `});` to be reached
+ *    (`closed === true`) before flagging `hollow: true`, `mockOnly: true`, or `tautology: true`.
  */
 function extractTestCasesFromHunks(filePath, hunks) {
   const cases = [];
@@ -641,32 +740,100 @@ function extractTestCasesFromHunks(filePath, hunks) {
 
   const literalTautologyRe =
     /\bexpect\s*\(\s*(true|false|null|undefined|\d+|'[^']*'|"[^"]*")\s*\)\s*\.\s*(?:toBe|toEqual|toStrictEqual|toBeTruthy|toBeFalsy)\s*\(\s*\1?\s*\)|\bassert(?:\.strictEqual|\.equal)?\s*\(\s*(true|false|\d+|'[^']*'|"[^"]*")\s*(?:,\s*\2)?\s*\)/;
+  const descOpenRe =
+    /(?:^|[;{])\s*describe(?:\.(?:only|skip|concurrent|sequential))?(?:\.each\s*\([^)]*\))?\s*\(/;
+  const itOpenRe =
+    /(?:^|[;{])\s*(?:it|test)(?:\.(?:only|skip|concurrent|sequential))?(?:\.each\s*\([^)]*\))?\s*\(/;
 
-  for (const hunk of hunks) {
-    for (const l of hunk.lines) {
-      if (l.type === 'del') continue;
+  const finalizeCase = (tc) => {
+    if (!tc || !tc.hasChanges) return;
+    cases.push({
+      suite: tc.suite,
+      behavior: tc.behavior,
+      line: tc.line,
+      assertions: tc.assertions,
+      mockAssertions: tc.mockAssertions,
+      tautologyAssertions: tc.tautologyAssertions,
+      verifiedTargets: tc.verifiedTargets,
+      closed: Boolean(tc._depthState && tc._depthState.closed)
+    });
+  };
+
+  for (const hunk of hunks || []) {
+    if (hunk.context) {
+      const ctxDesc = /\bdescribe\s*\(\s*(['"`])((?:\\.|(?!\1)[\s\S])*)\1/.exec(hunk.context);
+      if (ctxDesc) {
+        currentSuite = ctxDesc[2];
+      }
+    }
+
+    const lines = hunk.lines || [];
+    for (let idx = 0; idx < lines.length; idx++) {
+      const l = lines[idx];
+      if (l.type === 'del') {
+        if (currentCase) {
+          currentCase.hasChanges = true;
+        }
+        continue;
+      }
       const text = l.content;
 
-      const descMatch = /\bdescribe\s*\(\s*(['"`])([\s\S]*?)\1/.exec(text);
+      const descMatch = descOpenRe.exec(text);
       if (descMatch) {
-        currentSuite = descMatch[2];
+        const descOpenParenIdx = descMatch.index + descMatch[0].length - 1;
+        let descWindow = text.slice(descOpenParenIdx + 1);
+        for (let k = idx + 1; k < lines.length && k <= idx + 3; k++) {
+          if (lines[k].type !== 'del') {
+            descWindow += '\n' + lines[k].content;
+          }
+        }
+        const parsedSuite = extractLeadingStringLiteral(descWindow);
+        if (parsedSuite) {
+          currentSuite = parsedSuite;
+        }
       }
 
-      const itMatch = /\b(?:it|test)\s*\(\s*(['"`])([\s\S]*?)\1/.exec(text);
+      let depthStartIdx = 0;
+      const itMatch = itOpenRe.exec(text);
       if (itMatch) {
-        if (currentCase) cases.push(currentCase);
-        currentCase = {
-          suite: currentSuite || inferSuiteFromPath(filePath),
-          behavior: itMatch[2],
-          line: l.newNumber,
-          assertions: 0,
-          mockAssertions: 0,
-          tautologyAssertions: 0,
-          verifiedTargets: []
-        };
+        const openParenIdx = itMatch.index + itMatch[0].length - 1;
+        let headerWindow = text.slice(openParenIdx + 1);
+        for (let k = idx + 1; k < lines.length && k <= idx + 4; k++) {
+          if (lines[k].type !== 'del') {
+            headerWindow += '\n' + lines[k].content;
+          }
+        }
+        const behavior = extractLeadingStringLiteral(headerWindow);
+        if (behavior !== null) {
+          if (currentCase) finalizeCase(currentCase);
+          currentCase = {
+            suite: currentSuite || inferSuiteFromPath(filePath),
+            behavior,
+            line: l.newNumber || l.oldNumber || hunk.newStart || 1,
+            assertions: 0,
+            mockAssertions: 0,
+            tautologyAssertions: 0,
+            verifiedTargets: [],
+            headerAdded: l.type === 'add',
+            hasChanges: l.type === 'add',
+            _depthState: {
+              parenDepth: 0,
+              braceDepth: 0,
+              inString: null,
+              inBlockComment: false,
+              seenCallback: false,
+              seenBodyBrace: false,
+              closed: false
+            }
+          };
+          depthStartIdx = openParenIdx;
+        }
       }
 
       if (currentCase) {
+        if (l.type === 'add') {
+          currentCase.hasChanges = true;
+        }
         const expectMatches = text.match(/\b(?:expect|assert(?:\.[a-zA-Z]+)?)\s*\(/g);
         if (expectMatches) {
           currentCase.assertions += expectMatches.length;
@@ -681,17 +848,32 @@ function extractTestCasesFromHunks(filePath, hunks) {
         if (targetMatch && !currentCase.verifiedTargets.includes(targetMatch[1])) {
           currentCase.verifiedTargets.push(targetMatch[1]);
         }
+
+        advanceTestBlockDepth(currentCase._depthState, text, depthStartIdx);
+        if (currentCase._depthState.closed) {
+          finalizeCase(currentCase);
+          currentCase = null;
+        }
       }
     }
+
+    if (currentCase) {
+      finalizeCase(currentCase);
+      currentCase = null;
+    }
   }
-  if (currentCase) cases.push(currentCase);
+
   return cases.map((c) => {
-    const hollow = c.assertions === 0;
-    const mockOnly = c.assertions > 0 && c.mockAssertions === c.assertions;
-    const tautology = c.assertions > 0 && c.tautologyAssertions === c.assertions;
-    const internalMock = internalMocks.length > 0 && (mockOnly || c.mockAssertions > 0);
+    const closed = Boolean(c.closed);
+    const truncated = !closed;
+    const hollow = closed && c.assertions === 0;
+    const mockOnly = closed && c.assertions > 0 && c.mockAssertions === c.assertions;
+    const tautology = closed && c.assertions > 0 && c.tautologyAssertions === c.assertions;
+    const internalMock = closed && internalMocks.length > 0 && (mockOnly || c.mockAssertions > 0);
     return {
       ...c,
+      closed,
+      truncated,
       hollow,
       mockOnly,
       tautology,
@@ -962,12 +1144,17 @@ function buildLayersFromParsedDiff(parsedFiles, issues = [], options = {}) {
               ? `Mocks internal relative seam (${(c.internalMockPaths || internalMocks).join(', ')})`
               : c.mockOnly
                 ? `Mock-only assertions (${(c.verifiedTargets || []).join(', ') || 'spies'})`
-                : (c.verifiedTargets || []).length
-                  ? `Targets: ${c.verifiedTargets.join(', ')}`
-                  : '';
+                : c.truncated && c.assertions === 0
+                  ? 'Partial diff hunk (assertions outside diff window)'
+                  : (c.verifiedTargets || []).length
+                    ? `Targets: ${c.verifiedTargets.join(', ')}`
+                    : '';
         return {
           behavior: c.behavior,
+          line: c.line,
           assertions: c.assertions,
+          closed: Boolean(c.closed),
+          truncated: Boolean(c.truncated),
           hollow: c.hollow,
           mockOnly: c.mockOnly,
           tautology: Boolean(c.tautology),

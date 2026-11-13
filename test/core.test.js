@@ -1046,3 +1046,94 @@ test('Re-review (r2) replies to existing GitHub threads, resolves fixed threads,
   assert.match(updH2.body, /refresh token path at line 41/);
 });
 
+test('Layer 4 Test Matrix skips unchanged diff-hunk context tests and never flags truncated hunks as hollow/mockOnly', () => {
+  // 1. Exact bug scenario: adding a new test in the middle of a describe block where 3 trailing context
+  //    lines contain the opening of the next unchanged `it(...)` test (plus a multi-line `it(\n "...",` context tail in hunk 2)
+  const hunkContextDiff = [
+    'diff --git a/services/hubspot/test/service-handler.test.ts b/services/hubspot/test/service-handler.test.ts',
+    '@@ -98,6 +98,19 @@ describe("ServiceHandler", () => {',
+    '     expect(mockUpdateEmail).not.toHaveBeenCalled();',
+    '   });',
+    ' ',
+    '+  it("should skip HubSpot Partner Account status update when status_changed event source is onboard-endpoint", async () => {',
+    '+    const msg = generatePubSubValidatedEvent("partner_account_status_changed", {',
+    '+      ...MOCK_ACTIVATED_EVENT,',
+    '+      source: "onboard-endpoint",',
+    '+    });',
+    '+',
+    '+    const result = await handler.execute(msg);',
+    '+',
+    '+    expect(result).toEqual({ body: {} });',
+    '+    expect(mockGetPartnerAcctStatus).not.toHaveBeenCalled();',
+    '+    expect(mockUpdatePartnerAcctStatus).not.toHaveBeenCalled();',
+    '+  });',
+    '+',
+    '   it("should update Partner Account status to \'SUSPENDED\' on status_changed event with suspended status", async () => {',
+    '     const msg = generatePubSubValidatedEvent(',
+    '       "partner_account_status_changed",',
+    '@@ -210,7 +223,8 @@ describe("ServiceHandler", () => {',
+    '   it("long existing test edited only at the top of its setup", async () => {',
+    '-    const payload = buildOldPayload();',
+    '+    const payload = buildNewPayload();',
+    '+    const extraFlag = true;',
+    '     const stepOne = prepareStep(payload, extraFlag);',
+    '     const stepTwo = transformStep(stepOne);',
+    '@@ -310,6 +324,14 @@ describe("ServiceHandler", () => {',
+    '   it("compact unchanged leading-context test", () => { expect(1).toBe(1); });',
+    ' ',
+    '+  it(',
+    '+    "multi-line added test header with \'QUOTED\' token",',
+    '+    async () => {',
+    '+      const out = await handler.execute({});',
+    '+      expect(out.ok).toBe(true);',
+    '+    }',
+    '+  );',
+    ' ',
+    '   it(',
+    '     "unchanged multi-line context test at tail of hunk",'
+  ].join('\n');
+
+  const parsed = parseUnifiedDiff(hunkContextDiff);
+  assert.equal(parsed.length, 1);
+  const cases = parsed[0].testMatrix;
+
+  // Only the 3 added/modified tests should be extracted; the 3 unchanged context tests (trailing single-line,
+  // leading compact, and trailing multi-line) must be skipped completely.
+  assert.equal(cases.length, 3);
+
+  // Case 1: Newly added test in hunk 1 -> closed: true, assertions: 3, hollow: false, mockOnly: false
+  assert.equal(
+    cases[0].behavior,
+    'should skip HubSpot Partner Account status update when status_changed event source is onboard-endpoint'
+  );
+  assert.equal(cases[0].suite, 'ServiceHandler');
+  assert.equal(cases[0].closed, true);
+  assert.equal(cases[0].truncated, false);
+  assert.equal(cases[0].assertions, 3);
+  assert.equal(cases[0].hollow, false);
+  assert.equal(cases[0].mockOnly, false);
+
+  // Case 2: Existing test modified at the top of hunk 2 whose closing `});` and assertions are below the hunk window
+  // -> extracted because it was modified (`hasChanges: true`), but `closed: false` (`truncated: true`), so NEVER flagged hollow!
+  assert.equal(cases[1].behavior, 'long existing test edited only at the top of its setup');
+  assert.equal(cases[1].closed, false);
+  assert.equal(cases[1].truncated, true);
+  assert.equal(cases[1].assertions, 0);
+  assert.equal(cases[1].hollow, false);
+  assert.equal(cases[1].mockOnly, false);
+
+  // Case 3: Multi-line `it(\n "...",\n async () => {` added test in hunk 3 -> full behavior extracted & closed: true
+  assert.equal(cases[2].behavior, "multi-line added test header with 'QUOTED' token");
+  assert.equal(cases[2].closed, true);
+  assert.equal(cases[2].truncated, false);
+  assert.equal(cases[2].assertions, 1);
+  assert.equal(cases[2].hollow, false);
+
+  const layers = buildLayersFromParsedDiff(parsed, []);
+  assert.equal(layers.testMatrix.length, 1);
+  assert.equal(layers.testMatrix[0].status, 'solid');
+  assert.equal(layers.testMatrix[0].cases[1].status, 'solid');
+  assert.match(layers.testMatrix[0].cases[1].note, /Partial diff hunk/);
+});
+
+
